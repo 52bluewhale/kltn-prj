@@ -1,0 +1,156 @@
+# YOLOv8 Quantization-Aware Training Configuration
+
+# Basic training settings
+training:
+  epochs: 10
+  batch_size: 16
+  learning_rate: 0.0001
+  weight_decay: 0.0001 # L2 regularization strength
+  optimizer: adamw
+  lr_scheduler: cosine
+  warmup_epochs: 1
+  dropout: 0.0
+
+# Data augmentation settings
+augmentation:
+  enabled: true
+  mosaic: 0.5
+  mixup: 0.1
+  degree: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
+  flip_ud: 0.0
+  flip_lr: 0.5
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  
+# Quantization settings
+quantization:
+  # Overall quantization scheme
+  scheme: per_channel  # Quantization granularity scheme, Options: per_tensor, per_channel, mixed
+  bit_width: 8         # Quantization bit-width (typically 8)
+  symmetric: true      # Whether to use symmetric quantization
+  
+  # Activation quantization
+  activation:
+    enabled: true
+    dtype: quint8     # Unsigned int8 for activations
+    observer: moving_average_minmax  # Options: minmax, moving_average_minmax, histogram
+    symmetric: false  # Typically asymmetric for activations
+    qscheme: per_tensor_affine
+    
+  # Weight quantization
+  weight:
+    enabled: true
+    dtype: qint8      # Signed int8 for weights
+    observer: minmax  # Observer type for weight statistics (minmax), Options: minmax, moving_average_minmax, histogram
+    symmetric: true   # Typically symmetric for weights
+    qscheme: per_channel_symmetric
+    
+  # Calibration settings
+  calibration:
+    method: percentile  # Options: minmax, percentile, entropy
+    num_batches: 100    # Number of batches to use for calibration
+    percentile: 99.99   # Percentile for calibration (if method is percentile)
+    
+  # Layer-specific quantization settings, based on regex patterns
+  layer_configs:
+    # Detection head layers - more precision 
+    - pattern: "model\\.24\\..*"  # Regex pattern to match layer names
+      config:
+        activation:
+          observer: histogram
+          symmetric: false
+        weight:
+          observer: minmax
+          symmetric: true
+    
+    # First convolutional layer
+    - pattern: "model\\.0\\.conv"
+      config:
+        activation:
+          observer: histogram
+        weight:
+          observer: minmax
+          
+    # Concat layers 
+    - pattern: "model\\.\\d+\\.m\\.\\d+\\.cv3"
+      config:
+        activation:
+          observer: histogram
+          symmetric: false
+        weight:
+          observer: minmax
+    
+    # YOLO detection layers
+    - pattern: "model\\.\\d+\\.dfl\\.conv"
+      config:
+        weight:
+          observer: histogram
+          symmetric: true
+          
+  # Layers to exclude from quantization, Skip quantization for these layers/operations
+  skip_layers:
+    - pattern: "model\\.\\d+\\.forward"  # Skip forward method quantization
+    - pattern: "model\\.\\d+\\.detect"   # Special handling for detection layers
+    
+  # Fusion patterns, Defines patterns of operations to fuse 
+  fusion_patterns:
+    # Conv + BatchNorm + SiLU
+    - modules: ["conv", "bn", "silu"]
+      pattern: ["conv", "bn", "silu"]
+      fuser_method: "fuse_conv_bn_silu"
+      
+    # Conv + BatchNorm
+    - modules: ["conv", "bn"]
+      pattern: ["conv", "bn"]
+      fuser_method: "fuse_conv_bn"
+
+# Post-training optimization
+post_training:
+  # Weight clustering
+  clustering:
+    enabled: false
+    num_clusters: 16
+    
+  # Weight pruning
+  pruning:
+    enabled: false
+    method: magnitude
+    sparsity: 0.5
+    
+  # Knowledge distillation
+  distillation:
+    enabled: false
+    teacher_model: null
+    temperature: 4.0
+    alpha: 0.5  # Weight between distillation and task loss
+
+# Export settings
+export:
+  format: onnx
+  opset_version: 13
+  dynamic_batch: true
+  simplify: true
+  half_precision: false
+  int8: true
+  save_fp32: true
+  save_quantized: true
+  
+# Debugging and analysis
+debug:
+  log_histograms: true
+  per_layer_metrics: true
+  visualize_activations: false
+  measure_latency: true
+  compare_with_fp32: true
+  save_quantization_error_map: true
+
+# Hardware-specific settings (for deployment)
+hardware:
+  target: general  # Options: general, nvidia, snapdragon, intel, etc.
+  optimize_memory: true
+  optimize_for_inference: true

@@ -1,0 +1,1108 @@
+// __init__.py
+"""
+Data utilities for YOLOv8 QAT training.
+
+This module provides data loading, preprocessing, and augmentation
+functionalities specifically designed for Quantization-Aware Training.
+"""
+
+from .dataloader import (
+    create_dataloader,
+    create_qat_dataloader,
+    get_dataset_from_yaml
+)
+from .augmentation import (
+    get_training_transforms,
+    get_validation_transforms, 
+    get_qat_specific_transforms,
+    QATMosaic,
+    PreserveDetailAugmentation
+)
+from .preprocessing import (
+    prepare_image, 
+    preprocess_batch,
+    quantization_preprocessing,
+    normalize_for_quantization
+)
+
+__all__ = [
+    # Dataloader functions
+    'create_dataloader',
+    'create_qat_dataloader',
+    'get_dataset_from_yaml',
+    
+    # Augmentation functions and classes
+    'get_training_transforms',
+    'get_validation_transforms',
+    'get_qat_specific_transforms',
+    'QATMosaic',
+    'PreserveDetailAugmentation',
+    
+    # Preprocessing functions
+    'prepare_image',
+    'preprocess_batch',
+    'quantization_preprocessing',
+    'normalize_for_quantization'
+]
+
+// augmentation.py
+"""
+Augmentation utilities for YOLOv8 QAT training.
+
+This module provides specialized augmentation techniques that are
+compatible with quantization-aware training, ensuring that the
+augmentations don't introduce unexpected statistical shifts.
+"""
+
+import numpy as np
+import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from typing import Dict, List, Optional, Tuple, Union, Callable
+
+import torch
+from torch.nn import functional as F
+from ultralytics.yolo.data.augment import Albumentations as YoloAlbumentations
+
+
+class QATMosaic:
+    """
+    QAT-friendly mosaic augmentation.
+    
+    This implementation of mosaic augmentation is designed to maintain
+    tensor statistics suitable for quantization by controlling value ranges.
+    """
+    
+    def __init__(
+        self,
+        img_size: int = 640,
+        mosaic_prob: float = 0.5,
+        mosaic_scale: Tuple[float, float] = (0.5, 1.5)
+    ):
+        self.img_size = img_size
+        self.mosaic_prob = mosaic_prob
+        self.mosaic_scale = mosaic_scale
+        
+    def __call__(
+        self, 
+        images: List[np.ndarray], 
+        labels: List[np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply QAT-friendly mosaic augmentation to a batch of images.
+        
+        Args:
+            images: List of input images as numpy arrays
+            labels: List of labels corresponding to the images
+            
+        Returns:
+            Tuple of (mosaic_image, mosaic_labels)
+        """
+        if np.random.rand() > self.mosaic_prob or len(images) < 4:
+            # Return the first image if mosaic isn't applied
+            return images[0], labels[0]
+        
+        # Select 4 images for mosaic
+        indices = np.random.choice(len(images), 4, replace=False)
+        selected_images = [images[i] for i in indices]
+        selected_labels = [labels[i] for i in indices]
+        
+        # Create mosaic
+        result_img, result_labels = self._create_mosaic(selected_images, selected_labels)
+        
+        return result_img, result_labels
+    
+    def _create_mosaic(
+        self, 
+        images: List[np.ndarray], 
+        labels: List[np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a mosaic from 4 images with QAT-friendly value distribution.
+        
+        Args:
+            images: List of 4 input images
+            labels: List of 4 corresponding label sets
+            
+        Returns:
+            Tuple of (mosaic_image, combined_labels)
+        """
+        # Initialize output image and labels
+        output_img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        combined_labels = []
+        
+        # Center point of mosaic
+        cx, cy = self.img_size // 2, self.img_size // 2
+        
+        # Random scaling factor
+        scale = np.random.uniform(*self.mosaic_scale)
+        
+        # Apply for each position (top-left, top-right, bottom-left, bottom-right)
+        for i, (img, img_labels) in enumerate(zip(images, labels)):
+            # Original dimensions
+            h, w = img.shape[:2]
+            
+            # Place images in 4 positions
+            if i == 0:  # top-left
+                x1a, y1a, x2a, y2a = 0, 0, cx, cy
+                x1b, y1b, x2b, y2b = w - cx, h - cy, w, h
+            elif i == 1:  # top-right
+                x1a, y1a, x2a, y2a = cx, 0, self.img_size, cy
+                x1b, y1b, x2b, y2b = 0, h - cy, cx, h
+            elif i == 2:  # bottom-left
+                x1a, y1a, x2a, y2a = 0, cy, cx, self.img_size
+                x1b, y1b, x2b, y2b = w - cx, 0, w, cy
+            elif i == 3:  # bottom-right
+                x1a, y1a, x2a, y2a = cx, cy, self.img_size, self.img_size
+                x1b, y1b, x2b, y2b = 0, 0, cx, cy
+            
+            # Copy part of the image
+            output_img[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+            
+            # Adjust labels
+            if len(img_labels):
+                # Clone labels
+                adjusted_labels = img_labels.copy()
+                
+                # Adjust box coordinates
+                if i == 0:  # top-left
+                    adjusted_labels[:, 1] = (adjusted_labels[:, 1] * w - (w - cx)) / cx
+                    adjusted_labels[:, 2] = (adjusted_labels[:, 2] * h - (h - cy)) / cy
+                elif i == 1:  # top-right
+                    adjusted_labels[:, 1] = adjusted_labels[:, 1] * w / cx
+                    adjusted_labels[:, 2] = (adjusted_labels[:, 2] * h - (h - cy)) / cy
+                elif i == 2:  # bottom-left
+                    adjusted_labels[:, 1] = (adjusted_labels[:, 1] * w - (w - cx)) / cx
+                    adjusted_labels[:, 2] = adjusted_labels[:, 2] * h / cy
+                elif i == 3:  # bottom-right
+                    adjusted_labels[:, 1] = adjusted_labels[:, 1] * w / cx
+                    adjusted_labels[:, 2] = adjusted_labels[:, 2] * h / cy
+                
+                # Filter out boxes with invalid coordinates
+                valid_indices = (
+                    (0 <= adjusted_labels[:, 1]) & 
+                    (adjusted_labels[:, 1] <= 1) & 
+                    (0 <= adjusted_labels[:, 2]) & 
+                    (adjusted_labels[:, 2] <= 1)
+                )
+                if valid_indices.any():
+                    combined_labels.append(adjusted_labels[valid_indices])
+        
+        # Combine all valid labels
+        if combined_labels:
+            combined_labels = np.concatenate(combined_labels, axis=0)
+        else:
+            combined_labels = np.zeros((0, 5))  # Empty array with label format
+        
+        return output_img, combined_labels
+
+
+class PreserveDetailAugmentation:
+    """
+    Augmentation that preserves details important for quantization.
+    
+    This class provides augmentations that avoid destroying fine details
+    that are important for maintaining good quantization behavior.
+    """
+    
+    def __init__(self, img_size: int = 640, preserve_prob: float = 0.5):
+        self.img_size = img_size
+        self.preserve_prob = preserve_prob
+        self.transform = A.Compose([
+            # Geometric transforms that preserve details
+            A.ShiftScaleRotate(
+                shift_limit=0.1, 
+                scale_limit=0.2, 
+                rotate_limit=15, 
+                border_mode=cv2.BORDER_CONSTANT,
+                p=0.7
+            ),
+            # Color transforms that are quantization-friendly
+            A.OneOf([
+                A.RGBShift(r_shift_limit=10, g_shift_limit=10, b_shift_limit=10, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.5),
+            ], p=0.7),
+            # Noise that mimics quantization noise
+            A.OneOf([
+                A.GaussNoise(var_limit=(5, 15), p=0.5),
+                A.MultiplicativeNoise(multiplier=(0.95, 1.05), p=0.5),
+            ], p=0.3),
+        ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.3))
+        
+    def __call__(
+        self, 
+        image: np.ndarray, 
+        labels: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Apply detail-preserving augmentation.
+        
+        Args:
+            image: Input image
+            labels: Optional bounding box labels
+            
+        Returns:
+            Tuple of (augmented_image, augmented_labels)
+        """
+        if np.random.rand() > self.preserve_prob:
+            return image, labels
+        
+        if labels is not None and len(labels):
+            # Convert labels to the format expected by albumentations
+            boxes = labels[:, 1:5].copy()  # YOLO format: class, x, y, w, h
+            transformed = self.transform(image=image, bboxes=boxes, class_labels=labels[:, 0])
+            
+            # Recombine labels
+            if transformed['bboxes']:
+                transformed_boxes = np.array(transformed['bboxes'])
+                transformed_classes = np.array(transformed['class_labels']).reshape(-1, 1)
+                transformed_labels = np.hstack([transformed_classes, transformed_boxes])
+            else:
+                transformed_labels = np.zeros((0, 5))
+                
+            return transformed['image'], transformed_labels
+        else:
+            transformed = self.transform(image=image)
+            return transformed['image'], labels
+
+
+def get_training_transforms(img_size: int = 640) -> A.Compose:
+    """
+    Get standard training augmentations for YOLOv8.
+    
+    Args:
+        img_size: Target image size
+        
+    Returns:
+        Albumentations Compose object with training transforms
+    """
+    return A.Compose([
+        A.RandomResizedCrop(
+            height=img_size, 
+            width=img_size, 
+            scale=(0.8, 1.0), 
+            ratio=(0.9, 1.1), 
+            p=0.5
+        ),
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.OneOf([
+            A.MotionBlur(blur_limit=7, p=0.2),
+            A.MedianBlur(blur_limit=7, p=0.2),
+            A.GaussianBlur(blur_limit=7, p=0.2),
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+        ], p=0.2),
+        A.OneOf([
+            A.OpticalDistortion(p=0.3),
+            A.GridDistortion(p=0.3),
+            A.PiecewiseAffine(p=0.3),
+        ], p=0.2),
+        # Additional augmentations
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
+
+
+def get_validation_transforms(img_size: int = 640) -> A.Compose:
+    """
+    Get validation transforms for YOLOv8.
+    
+    Args:
+        img_size: Target image size
+        
+    Returns:
+        Albumentations Compose object with validation transforms
+    """
+    return A.Compose([
+        A.Resize(height=img_size, width=img_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
+
+
+def get_qat_specific_transforms(img_size: int = 640) -> A.Compose:
+    """
+    Get transforms specifically designed for QAT training.
+    
+    These transforms avoid introducing extreme values that could affect
+    quantization statistics, while still providing good augmentation.
+    
+    Args:
+        img_size: Target image size
+        
+    Returns:
+        Albumentations Compose object with QAT-friendly transforms
+    """
+    return A.Compose([
+        # Moderate geometric transforms
+        A.Resize(height=img_size, width=img_size),
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(
+            shift_limit=0.1,
+            scale_limit=0.2,
+            rotate_limit=15,
+            border_mode=cv2.BORDER_CONSTANT,
+            p=0.5
+        ),
+        # Conservative color transforms that don't alter statistics too much
+        A.OneOf([
+            A.RGBShift(r_shift_limit=10, g_shift_limit=10, b_shift_limit=10, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.5),
+        ], p=0.5),
+        # Add some quantization-like noise to make model more robust
+        A.OneOf([
+            A.GaussNoise(var_limit=(5, 15), p=0.5),
+            A.MultiplicativeNoise(multiplier=(0.95, 1.05), p=0.5),
+        ], p=0.3),
+        # Normalize with standard ImageNet values
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.1, label_fields=['class_labels']))
+
+
+class YOLOv8QATAugmentations:
+    """
+    Collection of YOLOv8-specific augmentations adapted for QAT.
+    
+    This class wraps common YOLOv8 augmentations but modifies them to be
+    more compatible with quantization-aware training.
+    """
+    
+    def __init__(
+        self,
+        img_size: int = 640,
+        mosaic_prob: float = 0.3,
+        mixup_prob: float = 0.15,
+        copy_paste_prob: float = 0.1
+    ):
+        self.img_size = img_size
+        self.mosaic_prob = mosaic_prob
+        self.mixup_prob = mixup_prob
+        self.copy_paste_prob = copy_paste_prob
+        
+        # Initialize QAT-friendly mosaic
+        self.mosaic = QATMosaic(img_size=img_size, mosaic_prob=mosaic_prob)
+        self.preserve_detail = PreserveDetailAugmentation(img_size=img_size)
+        
+        # Other base augmentations
+        self.yolo_albumentation = YoloAlbumentations()
+        
+    def __call__(
+        self, 
+        images: Union[np.ndarray, List[np.ndarray]], 
+        labels: Union[np.ndarray, List[np.ndarray]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply a set of QAT-friendly augmentations to images and labels.
+        
+        Args:
+            images: Input images or batch of images
+            labels: Corresponding labels
+            
+        Returns:
+            Tuple of (augmented_images, augmented_labels)
+        """
+        # Convert single image to list for consistent handling
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images]
+            labels = [labels]
+            is_single = True
+        else:
+            is_single = False
+            
+        # Apply mosaic augmentation with probability
+        if len(images) >= 4 and np.random.rand() < self.mosaic_prob:
+            img, label = self.mosaic(images, labels)
+        else:
+            # Use the first image if mosaic is not applied
+            img, label = images[0], labels[0]
+            
+        # Apply additional detail-preserving augmentations
+        img, label = self.preserve_detail(img, label)
+        
+        # Apply standard YOLOv8 augmentations but with controlled parameters
+        if np.random.rand() < 0.5:
+            img, label = self.yolo_albumentation(img, label)
+        
+        # Return single image or batch depending on input
+        if is_single:
+            return img, label
+        else:
+            # Create a batch with the single processed image
+            return np.array([img]), np.array([label])
+
+// dataloader.py
+"""
+Dataloader utilities for YOLOv8 QAT training.
+
+This module provides specialized dataloaders for training and quantization-aware training 
+that integrate with the YOLOv8 ecosystem.
+"""
+
+import os
+import yaml
+import torch
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from ultralytics.yolo.data.dataset import YOLODataset
+from typing import Dict, List, Optional, Tuple, Union, Callable
+
+from .augmentation import get_training_transforms, get_validation_transforms, get_qat_specific_transforms
+from .preprocessing import preprocess_batch, quantization_preprocessing
+
+
+def get_dataset_from_yaml(yaml_path: str) -> Dict:
+    """
+    Load dataset configuration from YAML file.
+    
+    Args:
+        yaml_path: Path to the dataset YAML file
+        
+    Returns:
+        Dict containing dataset configuration
+    """
+    with open(yaml_path, 'r') as f:
+        data_config = yaml.safe_load(f)
+    
+    # Convert relative paths to absolute if needed
+    base_dir = os.path.dirname(yaml_path)
+    for split in ['train', 'val', 'test']:
+        if split in data_config and not os.path.isabs(data_config[split]):
+            data_config[split] = os.path.normpath(
+                os.path.join(base_dir, data_config[split])
+            )
+    
+    return data_config
+
+
+class QATDataset(YOLODataset):
+    """
+    Extended YOLODataset with quantization-specific features.
+    
+    This dataset adds specific functionality for quantization-aware training,
+    including specialized preprocessing and transformations.
+    """
+    
+    def __init__(
+        self,
+        img_path: str,
+        label_path: Optional[str] = None,
+        img_size: int = 640,
+        batch_size: int = 16,
+        augment: bool = False,
+        hyp: Optional[Dict] = None,
+        rect: bool = False,
+        cache: bool = False,
+        single_cls: bool = False,
+        stride: int = 32,
+        pad: float = 0.0,
+        prefix: str = "",
+        use_qat_transforms: bool = False,
+        quantization_preprocessing: Optional[Callable] = None
+    ):
+        # Initialize with parent class
+        super().__init__(
+            img_path=img_path,
+            label_path=label_path,
+            img_size=img_size,
+            batch_size=batch_size,
+            augment=augment,
+            hyp=hyp,
+            rect=rect,
+            cache=cache,
+            single_cls=single_cls,
+            stride=stride,
+            pad=pad,
+            prefix=prefix
+        )
+        
+        # QAT-specific attributes
+        self.use_qat_transforms = use_qat_transforms
+        self.quantization_preprocessing = quantization_preprocessing
+        
+    def __getitem__(self, index):
+        """Override getitem to add quantization-specific preprocessing."""
+        # Get standard item from parent class
+        img, labels, img_path, shapes = super().__getitem__(index)
+        
+        # Apply QAT-specific processing if needed
+        if self.use_qat_transforms and self.quantization_preprocessing:
+            img = self.quantization_preprocessing(img)
+            
+        return img, labels, img_path, shapes
+
+
+def create_dataloader(
+    dataset_yaml: str,
+    batch_size: int = 16,
+    img_size: int = 640,
+    augment: bool = True,
+    shuffle: bool = True,
+    workers: int = 8,
+    mode: str = 'train',
+    rect: bool = False,
+    cache: bool = False,
+    single_cls: bool = False,
+    hyp: Optional[Dict] = None
+) -> Tuple[DataLoader, Dataset]:
+    """
+    Create a standard dataloader for YOLOv8 training.
+    
+    Args:
+        dataset_yaml: Path to dataset YAML file
+        batch_size: Batch size
+        img_size: Image size (square)
+        augment: Whether to apply augmentation
+        shuffle: Whether to shuffle the dataset
+        workers: Number of workers for dataloader
+        mode: 'train', 'val', or 'test'
+        rect: Use rectangular training
+        cache: Cache images for faster training
+        single_cls: Treat as single-class dataset
+        hyp: Hyperparameters dictionary
+        
+    Returns:
+        Tuple of (dataloader, dataset)
+    """
+    data_dict = get_dataset_from_yaml(dataset_yaml)
+    
+    # Determine the correct path based on mode
+    if mode == 'train':
+        img_path = data_dict.get('train')
+        augment = augment  # Use augmentation for training
+    elif mode == 'val':
+        img_path = data_dict.get('val')
+        augment = False  # No augmentation for validation
+    else:  # test
+        img_path = data_dict.get('test')
+        augment = False  # No augmentation for testing
+    
+    # Get label path from images path
+    img_dir = os.path.dirname(img_path)
+    base_dir = os.path.dirname(img_dir)
+    label_path = os.path.join(base_dir, 'labels')
+    if not os.path.exists(label_path):
+        label_path = None  # For inference without labels
+        
+    # Create dataset
+    dataset = YOLODataset(
+        img_path=img_path,
+        label_path=label_path,
+        img_size=img_size,
+        batch_size=batch_size,
+        augment=augment,
+        hyp=hyp,
+        rect=rect,
+        cache=cache,
+        single_cls=single_cls,
+        stride=32,  # Standard stride for YOLOv8
+        pad=0.5
+    )
+    
+    # Create dataloader
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle and not rect,  # Disable shuffle for rectangular training
+        num_workers=workers,
+        pin_memory=True,
+        collate_fn=dataset.collate_fn
+    )
+    
+    return loader, dataset
+
+
+def create_qat_dataloader(
+    dataset_yaml: str,
+    batch_size: int = 16,
+    img_size: int = 640,
+    augment: bool = True,
+    shuffle: bool = True,
+    workers: int = 8,
+    mode: str = 'train',
+    rect: bool = False,
+    cache: bool = False,
+    single_cls: bool = False,
+    hyp: Optional[Dict] = None,
+    use_qat_transforms: bool = True
+) -> Tuple[DataLoader, Dataset]:
+    """
+    Create a specialized dataloader for QAT training.
+    
+    This dataloader applies quantization-specific preprocessing and augmentations
+    that are more suitable for QAT training.
+    
+    Args:
+        dataset_yaml: Path to dataset YAML file
+        batch_size: Batch size
+        img_size: Image size (square)
+        augment: Whether to apply augmentation
+        shuffle: Whether to shuffle the dataset
+        workers: Number of workers for dataloader
+        mode: 'train', 'val', or 'test'
+        rect: Use rectangular training
+        cache: Cache images for faster training
+        single_cls: Treat as single-class dataset
+        hyp: Hyperparameters dictionary
+        use_qat_transforms: Whether to use QAT-specific transforms
+        
+    Returns:
+        Tuple of (dataloader, dataset)
+    """
+    data_dict = get_dataset_from_yaml(dataset_yaml)
+    
+    # Determine the correct path based on mode
+    if mode == 'train':
+        img_path = data_dict.get('train')
+        augment = augment  # Use augmentation for training
+    elif mode == 'val':
+        img_path = data_dict.get('val')
+        augment = False  # No augmentation for validation
+    else:  # test
+        img_path = data_dict.get('test')
+        augment = False  # No augmentation for testing
+    
+    # Get label path from images path
+    img_dir = os.path.dirname(img_path)
+    base_dir = os.path.dirname(img_dir)
+    label_path = os.path.join(base_dir, 'labels')
+    if not os.path.exists(label_path):
+        label_path = None  # For inference without labels
+        
+    # Create QAT-specific dataset
+    dataset = QATDataset(
+        img_path=img_path,
+        label_path=label_path,
+        img_size=img_size,
+        batch_size=batch_size,
+        augment=augment,
+        hyp=hyp,
+        rect=rect,
+        cache=cache,
+        single_cls=single_cls,
+        stride=32,  # Standard stride for YOLOv8
+        pad=0.5,
+        use_qat_transforms=use_qat_transforms and mode == 'train',
+        quantization_preprocessing=quantization_preprocessing if use_qat_transforms else None
+    )
+    
+    # Create dataloader
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle and not rect,  # Disable shuffle for rectangular training
+        num_workers=workers,
+        pin_memory=True,
+        collate_fn=dataset.collate_fn
+    )
+    
+    return loader, dataset
+
+
+class CalibrationDataset(Dataset):
+    """
+    Dataset for calibrating quantization parameters.
+    
+    This dataset is specifically designed for the calibration phase of quantization,
+    applying minimal augmentation to capture representative activation statistics.
+    """
+    
+    def __init__(
+        self,
+        img_path: str,
+        img_size: int = 640,
+        cache: bool = False,
+        transform: Optional[Callable] = None
+    ):
+        self.img_path = img_path
+        self.img_size = img_size
+        self.transform = transform
+        self.cache = cache
+        self.samples = []
+        
+        # Collect image paths
+        if os.path.isdir(img_path):
+            self.img_files = [
+                os.path.join(img_path, f) 
+                for f in os.listdir(img_path) 
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+            ]
+        else:
+            with open(img_path, 'r') as f:
+                self.img_files = [line.strip() for line in f]
+                
+        # Cache images if requested
+        self.cached_images = [None] * len(self.img_files) if cache else None
+    
+    def __len__(self):
+        return len(self.img_files)
+    
+    def __getitem__(self, index):
+        # Get image
+        if self.cache and self.cached_images[index] is not None:
+            img = self.cached_images[index]
+        else:
+            # Use OpenCV to maintain compatibility with YOLOv8
+            import cv2
+            img = cv2.imread(self.img_files[index])
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Resize
+            img = cv2.resize(img, (self.img_size, self.img_size))
+            
+            # Cache if needed
+            if self.cache:
+                self.cached_images[index] = img
+        
+        # Apply transforms if provided
+        if self.transform:
+            img = self.transform(image=img)['image']
+        
+        # Convert to tensor and normalize
+        img = img.transpose(2, 0, 1)  # HWC to CHW
+        img = np.ascontiguousarray(img)
+        img = torch.from_numpy(img).float() / 255.0
+        
+        return img, self.img_files[index]
+
+
+def create_calibration_dataloader(
+    img_path: str,
+    batch_size: int = 8,
+    img_size: int = 640,
+    workers: int = 4,
+    cache: bool = False
+) -> DataLoader:
+    """
+    Create a dataloader specifically for calibration.
+    
+    Args:
+        img_path: Path to calibration images
+        batch_size: Batch size
+        img_size: Image size (square)
+        workers: Number of workers
+        cache: Whether to cache images
+        
+    Returns:
+        DataLoader for calibration
+    """
+    # Create dataset with minimal preprocessing
+    dataset = CalibrationDataset(
+        img_path=img_path,
+        img_size=img_size,
+        cache=cache,
+        transform=get_validation_transforms(img_size)
+    )
+    
+    # Create dataloader
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,  # Shuffle to get diverse samples for calibration
+        num_workers=workers,
+        pin_memory=True
+    )
+    
+    return loader
+
+// preprocessing.py
+"""
+Preprocessing utilities for YOLOv8 QAT training.
+
+This module provides specialized preprocessing functions for preparing
+data for quantization-aware training, ensuring that the input data
+has appropriate statistical properties.
+"""
+
+import cv2
+import numpy as np
+import torch
+from typing import Dict, List, Optional, Tuple, Union, Any
+
+
+def prepare_image(
+    img_path: str,
+    img_size: int = 640,
+    normalize: bool = True,
+    to_tensor: bool = True
+) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Prepare an image for inference or training.
+    
+    Args:
+        img_path: Path to the image file
+        img_size: Target image size
+        normalize: Whether to normalize pixel values
+        to_tensor: Whether to convert to PyTorch tensor
+        
+    Returns:
+        Prepared image as numpy array or PyTorch tensor
+    """
+    # Read image with OpenCV
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Resize
+    img = cv2.resize(img, (img_size, img_size))
+    
+    # Ensure correct datatype for quantization
+    img = img.astype(np.float32)
+    
+    if normalize:
+        # Standard normalization values for ImageNet pre-trained models
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img = img / 255.0  # Scale to [0, 1]
+        img = (img - mean) / std
+    
+    if to_tensor:
+        # Convert to tensor and change channel order
+        img = img.transpose(2, 0, 1)  # HWC to CHW format
+        img = np.ascontiguousarray(img)
+        img = torch.from_numpy(img)
+    
+    return img
+
+
+def preprocess_batch(
+    batch: List[Union[np.ndarray, torch.Tensor]],
+    normalize: bool = True,
+    pad_to_square: bool = True
+) -> torch.Tensor:
+    """
+    Preprocess a batch of images for model input.
+    
+    Args:
+        batch: List of images
+        normalize: Whether to normalize pixel values
+        pad_to_square: Whether to pad images to square
+        
+    Returns:
+        Batch tensor ready for model input
+    """
+    if not batch:
+        return None
+    
+    # Convert to numpy arrays if tensors
+    if isinstance(batch[0], torch.Tensor):
+        batch = [img.numpy() if img.is_cuda else img.cpu().numpy() for img in batch]
+    
+    # Determine target shape
+    if pad_to_square:
+        max_h = max(img.shape[0] for img in batch)
+        max_w = max(img.shape[1] for img in batch)
+        target_shape = (max(max_h, max_w), max(max_h, max_w))
+    else:
+        max_h = max(img.shape[0] for img in batch)
+        max_w = max(img.shape[1] for img in batch)
+        target_shape = (max_h, max_w)
+    
+    # Process each image
+    processed_batch = []
+    for img in batch:
+        # Handle padding
+        if pad_to_square or img.shape[0] != target_shape[0] or img.shape[1] != target_shape[1]:
+            padded_img = np.zeros((target_shape[0], target_shape[1], 3), dtype=np.float32)
+            padded_img[:img.shape[0], :img.shape[1], :] = img
+            img = padded_img
+        
+        # Normalize if needed
+        if normalize:
+            img = img / 255.0  # Scale to [0, 1]
+            
+            # Apply ImageNet normalization
+            mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
+            std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+            img = (img - mean) / std
+        
+        # Convert to CHW format
+        img = img.transpose(2, 0, 1)
+        processed_batch.append(img)
+    
+    # Stack into batch tensor
+    batch_tensor = torch.from_numpy(np.stack(processed_batch, axis=0))
+    return batch_tensor
+
+
+def quantization_preprocessing(img: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Apply preprocessing specific to quantization-aware training.
+    
+    This function ensures that the input image has appropriate statistical
+    properties for quantization, potentially including clipping outliers,
+    special normalization, or other adjustments.
+    
+    Args:
+        img: Input image as numpy array or PyTorch tensor
+        
+    Returns:
+        Preprocessed image suitable for QAT
+    """
+    # Convert tensor to numpy if needed
+    is_tensor = isinstance(img, torch.Tensor)
+    if is_tensor:
+        # Save original device
+        device = img.device
+        img = img.cpu().numpy()
+    
+    # Apply quantization-friendly preprocessing
+    if img.ndim == 3:  # Single image
+        # Ensure values are in good range for quantization
+        # Slightly clip extreme values to avoid quantization issues
+        if img.max() > 0:  # Only normalize non-empty images
+            percentile_99 = np.percentile(img, 99)
+            percentile_1 = np.percentile(img, 1)
+            img = np.clip(img, percentile_1, percentile_99)
+            
+            # Rescale to utilize full range while avoiding extremes
+            img = (img - img.min()) / (img.max() - img.min() + 1e-6) * 0.9 + 0.05
+    elif img.ndim == 4:  # Batch of images
+        for i in range(img.shape[0]):
+            if img[i].max() > 0:  # Only normalize non-empty images
+                percentile_99 = np.percentile(img[i], 99)
+                percentile_1 = np.percentile(img[i], 1)
+                img[i] = np.clip(img[i], percentile_1, percentile_99)
+                
+                # Rescale to utilize full range while avoiding extremes
+                img[i] = (img[i] - img[i].min()) / (img[i].max() - img[i].min() + 1e-6) * 0.9 + 0.05
+    
+    # Convert back to tensor if needed
+    if is_tensor:
+        img = torch.from_numpy(img).to(device)
+    
+    return img
+
+
+def normalize_for_quantization(
+    tensor: torch.Tensor,
+    per_channel: bool = True,
+    symmetric: bool = False,
+    channel_dim: int = 1
+) -> torch.Tensor:
+    """
+    Normalize tensor specifically for quantization.
+    
+    This function applies normalization that is designed to work well
+    with quantization by optimizing the range of values to reduce
+    quantization error.
+    
+    Args:
+        tensor: Input tensor
+        per_channel: Whether to normalize per channel
+        symmetric: Whether to use symmetric normalization around zero
+        channel_dim: Dimension for channels
+        
+    Returns:
+        Normalized tensor suitable for quantization
+    """
+    if per_channel:
+        # Get dimensions for reduction
+        reduce_dims = list(range(tensor.dim()))
+        reduce_dims.pop(channel_dim)
+        
+        # Calculate statistics per channel
+        min_vals, _ = torch.min(tensor, dim=reduce_dims, keepdim=True)
+        max_vals, _ = torch.max(tensor, dim=reduce_dims, keepdim=True)
+        
+        if symmetric:
+            # For symmetric quantization, center around zero
+            abs_max = torch.max(torch.abs(min_vals), torch.abs(max_vals))
+            tensor = torch.clamp(tensor, -abs_max, abs_max)
+            tensor = tensor / (abs_max + 1e-6)  # Scale to [-1, 1]
+        else:
+            # For asymmetric quantization, scale to [0, 1]
+            tensor = (tensor - min_vals) / (max_vals - min_vals + 1e-6)
+            # Slightly reduce the range to avoid edge cases
+            tensor = tensor * 0.95 + 0.025
+    else:
+        # Global normalization
+        min_val = tensor.min()
+        max_val = tensor.max()
+        
+        if symmetric:
+            # Center around zero for symmetric quantization
+            abs_max = max(abs(min_val.item()), abs(max_val.item()))
+            tensor = torch.clamp(tensor, -abs_max, abs_max)
+            tensor = tensor / (abs_max + 1e-6)
+        else:
+            # Scale to [0, 1] for asymmetric quantization
+            tensor = (tensor - min_val) / (max_val - min_val + 1e-6)
+            # Slightly reduce the range to avoid edge cases
+            tensor = tensor * 0.95 + 0.025
+    
+    return tensor
+
+
+def apply_input_calibration(
+    batch: torch.Tensor,
+    calibration_stats: Dict[str, Any]
+) -> torch.Tensor:
+    """
+    Apply calibration to input batch based on pre-computed statistics.
+    
+    Args:
+        batch: Input batch of images
+        calibration_stats: Dictionary of calibration statistics
+        
+    Returns:
+        Calibrated batch
+    """
+    # Check if calibration stats are provided
+    if not calibration_stats:
+        return batch
+    
+    # Extract calibration statistics
+    if 'min' in calibration_stats and 'max' in calibration_stats:
+        min_val = calibration_stats['min']
+        max_val = calibration_stats['max']
+        
+        # Apply calibration
+        batch = torch.clamp(batch, min_val, max_val)
+        batch = (batch - min_val) / (max_val - min_val + 1e-6)
+    
+    elif 'mean' in calibration_stats and 'std' in calibration_stats:
+        mean = calibration_stats['mean']
+        std = calibration_stats['std']
+        
+        # Apply normalization
+        if mean.dim() == 1:  # Per-channel stats
+            # Reshape for broadcasting
+            mean = mean.view(1, -1, 1, 1)
+            std = std.view(1, -1, 1, 1)
+        
+        # Apply normalization
+        batch = (batch - mean) / (std + 1e-6)
+    
+    return batch
+
+
+def prepare_batch_for_qat(
+    batch: torch.Tensor,
+    device: torch.device,
+    calibration_stats: Optional[Dict[str, Any]] = None
+) -> torch.Tensor:
+    """
+    Prepare a batch specifically for QAT training.
+    
+    Args:
+        batch: Input batch of images
+        device: Target device
+        calibration_stats: Optional calibration statistics
+        
+    Returns:
+        Batch prepared for QAT
+    """
+    # Move to device
+    batch = batch.to(device)
+    
+    # Apply quantization-specific preprocessing
+    batch = quantization_preprocessing(batch)
+    
+    # Apply calibration if provided
+    if calibration_stats:
+        batch = apply_input_calibration(batch, calibration_stats)
+    
+    return batch

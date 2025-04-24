@@ -1,0 +1,2147 @@
+// __init__.py
+from .observers import (
+    CustomMinMaxObserver,
+    PerChannelMinMaxObserver,
+    HistogramObserver,
+    get_observer
+)
+
+from .fake_quantize import (
+    CustomFakeQuantize,
+    PerChannelFakeQuantize,
+    LSQFakeQuantize,
+    create_fake_quantizer,
+    get_fake_quantize_from_config
+)
+
+from .qconfig import (
+    create_qconfig,
+    get_default_qat_qconfig,
+    get_sensitive_layer_qconfig,
+    get_first_layer_qconfig,
+    get_last_layer_qconfig,
+    get_lsq_qconfig,
+    QAT_CONFIGS,
+    get_qconfig_by_name,
+    create_qconfig_mapping,
+    prepare_qat_config_from_yaml
+)
+
+from .qat_modules import (
+    QATConv2d,
+    QATBatchNorm2d,
+    QATLinear,
+    QATReLU
+)
+
+from .fusion import (
+    fuse_conv_bn,
+    fuse_conv_bn_relu,
+    fuse_conv_bn_silu,
+    fuse_yolov8_modules,
+    find_modules_to_fuse,
+    fuse_model_modules
+)
+
+from .utils import (
+    load_quantization_config,
+    prepare_model_for_qat,
+    convert_qat_model_to_quantized,
+    apply_layer_specific_quantization,
+    skip_layers_from_quantization,
+    get_model_size,
+    compare_model_sizes,
+    save_quantized_model,
+    load_quantized_model,
+    analyze_quantization_effects,
+    get_quantization_parameters,
+    measure_layer_wise_quantization_error
+)
+
+from .calibration import (
+    Calibrator,
+    calibrate_model,
+    PercentileCalibrator,
+    EntropyCalibrator,
+    build_calibrator
+)
+
+from .schemes import (
+    get_weight_quantizer,
+    get_activation_quantizer,
+    INT8_SYMMETRIC,
+    INT8_SYMMETRIC_PER_CHANNEL,
+    UINT8_ASYMMETRIC,
+)
+
+# Main API functions for easy access
+def prepare_qat_model(model, config=None, config_path=None, skip_layers=None):
+    """
+    Prepare model for quantization-aware training.
+    
+    Args:
+        model: Model to prepare
+        config: Quantization configuration dictionary
+        config_path: Path to configuration file
+        skip_layers: List of layer regex patterns to skip
+        
+    Returns:
+        Prepared model
+    """
+    if config_path is not None:
+        config = load_quantization_config(config_path)
+    
+    # Prepare model for QAT
+    model = prepare_model_for_qat(model, config, inplace=True)
+    
+    # Skip specified layers from quantization
+    if skip_layers is not None:
+        model = skip_layers_from_quantization(model, skip_layers)
+    
+    return model
+
+def quantize_model(qat_model):
+    """
+    Convert QAT model to quantized model.
+    
+    Args:
+        qat_model: QAT model to convert
+        
+    Returns:
+        Quantized model
+    """
+    return convert_qat_model_to_quantized(qat_model, inplace=False)
+
+def calibrate_and_quantize(model, dataloader, method='histogram', num_batches=100, device='cuda'):
+    """
+    Calibrate and quantize model in one step.
+    
+    Args:
+        model: Model to calibrate and quantize
+        dataloader: DataLoader for calibration
+        method: Calibration method
+        num_batches: Number of batches for calibration
+        device: Device to use
+        
+    Returns:
+        Calibrated and quantized model
+    """
+    # Calibrate model
+    calibrated_model = calibrate_model(model, dataloader, method, num_batches, device)
+    
+    # Convert to quantized model
+    quantized_model = convert_qat_model_to_quantized(calibrated_model, inplace=False)
+    
+    return quantized_model
+
+def create_qat_config_from_config_file(config_path):
+    """
+    Create QAT configuration from config file.
+    
+    Args:
+        config_path: Path to configuration file
+        
+    Returns:
+        QAT configuration
+    """
+    config = load_quantization_config(config_path)
+    return prepare_qat_config_from_yaml(config)
+
+// calibration.py
+import torch
+import torch.nn as nn
+import logging
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class Calibrator:
+    """
+    Calibrator for post-training quantization.
+    """
+    
+    def __init__(self, model, calibration_loader, device='cuda', num_batches=100):
+        """
+        Initialize calibrator.
+        
+        Args:
+            model: Model to calibrate
+            calibration_loader: DataLoader for calibration
+            device: Device to use for calibration
+            num_batches: Number of batches to use for calibration
+        """
+        self.model = model
+        self.calibration_loader = calibration_loader
+        self.device = device
+        self.num_batches = num_batches
+    
+    def calibrate(self, method='histogram', progress=True):
+        """
+        Calibrate model.
+        
+        Args:
+            method: Calibration method
+            progress: Whether to show progress bar
+            
+        Returns:
+            Calibrated model
+        """
+        logger.info(f"Calibrating model using {method} method...")
+        
+        # Put model in eval mode for calibration
+        self.model.eval()
+        
+        # Create iterator
+        data_iter = iter(self.calibration_loader)
+        
+        # Create progress bar if requested
+        if progress:
+            pbar = tqdm(range(min(self.num_batches, len(self.calibration_loader))), 
+                        desc=f"Calibrating ({method})")
+        else:
+            pbar = range(min(self.num_batches, len(self.calibration_loader)))
+        
+        # Run calibration
+        with torch.no_grad():
+            for _ in pbar:
+                try:
+                    # Get batch
+                    batch = next(data_iter)
+                    
+                    # Handle different formats
+                    if isinstance(batch, (tuple, list)):
+                        inputs = batch[0]
+                    else:
+                        inputs = batch
+                    
+                    # Move to device
+                    if isinstance(inputs, torch.Tensor):
+                        inputs = inputs.to(self.device)
+                    
+                    # Forward pass to update observers
+                    self.model(inputs)
+                    
+                except StopIteration:
+                    # Restart iterator if we run out of data
+                    data_iter = iter(self.calibration_loader)
+                    batch = next(data_iter)
+                    
+                    # Handle different formats
+                    if isinstance(batch, (tuple, list)):
+                        inputs = batch[0]
+                    else:
+                        inputs = batch
+                    
+                    # Move to device
+                    if isinstance(inputs, torch.Tensor):
+                        inputs = inputs.to(self.device)
+                    
+                    # Forward pass to update observers
+                    self.model(inputs)
+        
+        logger.info("Calibration complete")
+        
+        return self.model
+
+def calibrate_model(model, dataloader, method='histogram', num_batches=100, device='cuda'):
+    """
+    Calibrate model using specified method.
+    
+    Args:
+        model: Model to calibrate
+        dataloader: DataLoader for calibration
+        method: Calibration method (histogram, minmax, percentile)
+        num_batches: Number of batches to use for calibration
+        device: Device to use for calibration
+        
+    Returns:
+        Calibrated model
+    """
+    calibrator = Calibrator(
+        model=model,
+        calibration_loader=dataloader,
+        device=device,
+        num_batches=num_batches
+    )
+    
+    return calibrator.calibrate(method=method)
+
+class PercentileCalibrator(Calibrator):
+    """
+    Calibrator using percentile method.
+    Sets quantization parameters based on percentile of observed values.
+    """
+    
+    def __init__(self, model, calibration_loader, device='cuda', num_batches=100, percentile=99.99):
+        """
+        Initialize percentile calibrator.
+        
+        Args:
+            model: Model to calibrate
+            calibration_loader: DataLoader for calibration
+            device: Device to use for calibration
+            num_batches: Number of batches to use for calibration
+            percentile: Percentile to use for calibration
+        """
+        super().__init__(model, calibration_loader, device, num_batches)
+        self.percentile = percentile
+    
+    def calibrate(self, progress=True):
+        """
+        Calibrate model using percentile method.
+        
+        Args:
+            progress: Whether to show progress bar
+            
+        Returns:
+            Calibrated model
+        """
+        logger.info(f"Calibrating model using percentile method (p={self.percentile})...")
+        
+        # Collect activations
+        activations = {}
+        
+        # Register hooks to collect activations
+        handles = []
+        
+        def hook_fn(name):
+            def hook(module, input, output):
+                if name not in activations:
+                    activations[name] = []
+                # Collect sample of activations
+                if len(activations[name]) < 1000:  # Limit samples to avoid memory issues
+                    if isinstance(output, torch.Tensor):
+                        activations[name].append(output.detach().cpu().view(-1))
+                    elif isinstance(output, (tuple, list)) and isinstance(output[0], torch.Tensor):
+                        activations[name].append(output[0].detach().cpu().view(-1))
+            return hook
+        
+        # Register hooks for modules with qconfig
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'qconfig') and module.qconfig is not None:
+                handles.append(module.register_forward_hook(hook_fn(name)))
+        
+        # Run forward passes to collect activations
+        super().calibrate(method='percentile', progress=progress)
+        
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+        
+        # Calculate percentile for each module
+        for name, acts in activations.items():
+            if acts:
+                # Concatenate activation samples
+                acts_tensor = torch.cat(acts, dim=0)
+                
+                # Calculate percentile
+                q_min = torch.quantile(acts_tensor, 1 - self.percentile/100, dim=0).item()
+                q_max = torch.quantile(acts_tensor, self.percentile/100, dim=0).item()
+                
+                # Find module and update observers if available
+                for n, m in self.model.named_modules():
+                    if n == name and hasattr(m, 'activation_post_process'):
+                        observer = m.activation_post_process
+                        if hasattr(observer, 'min_val') and hasattr(observer, 'max_val'):
+                            observer.min_val = torch.tensor(q_min)
+                            observer.max_val = torch.tensor(q_max)
+                            observer.initialized = torch.tensor(1, dtype=torch.bool)
+        
+        logger.info("Percentile calibration complete")
+        
+        return self.model
+
+class EntropyCalibrator(Calibrator):
+    """
+    Calibrator using entropy method.
+    Minimizes information loss during quantization.
+    """
+    
+    def calibrate(self, progress=True):
+        """
+        Calibrate model using entropy method.
+        
+        Args:
+            progress: Whether to show progress bar
+            
+        Returns:
+            Calibrated model
+        """
+        logger.info("Calibrating model using entropy method...")
+        
+        # Collect activations
+        activations = {}
+        
+        # Register hooks to collect activations
+        handles = []
+        
+        def hook_fn(name):
+            def hook(module, input, output):
+                if name not in activations:
+                    activations[name] = []
+                # Collect sample of activations
+                if len(activations[name]) < 1000:  # Limit samples to avoid memory issues
+                    if isinstance(output, torch.Tensor):
+                        activations[name].append(output.detach().cpu())
+                    elif isinstance(output, (tuple, list)) and isinstance(output[0], torch.Tensor):
+                        activations[name].append(output[0].detach().cpu())
+            return hook
+        
+        # Register hooks for modules with qconfig
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'qconfig') and module.qconfig is not None:
+                handles.append(module.register_forward_hook(hook_fn(name)))
+        
+        # Run forward passes to collect activations
+        super().calibrate(method='entropy', progress=progress)
+        
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+        
+        # Calculate optimal thresholds for each module
+        for name, acts in activations.items():
+            if acts:
+                # Concatenate activation samples
+                acts_tensor = torch.cat(acts, dim=0).view(-1)
+                
+                # Find optimal threshold using KL divergence
+                threshold = self._find_optimal_threshold(acts_tensor)
+                
+                # Find module and update observers if available
+                for n, m in self.model.named_modules():
+                    if n == name and hasattr(m, 'activation_post_process'):
+                        observer = m.activation_post_process
+                        if hasattr(observer, 'min_val') and hasattr(observer, 'max_val'):
+                            observer.min_val = torch.tensor(0.0)
+                            observer.max_val = torch.tensor(threshold)
+                            observer.initialized = torch.tensor(1, dtype=torch.bool)
+        
+        logger.info("Entropy calibration complete")
+        
+        return self.model
+    
+    def _find_optimal_threshold(self, tensor, bins=2048, quantile=0.9999):
+        """
+        Find optimal threshold using KL divergence.
+        
+        Args:
+            tensor: Tensor of activations
+            bins: Number of histogram bins
+            quantile: Quantile to use for range
+            
+        Returns:
+            Optimal threshold
+        """
+        # Trim outliers
+        tensor = tensor[tensor < torch.quantile(tensor, quantile)]
+        tensor = tensor[tensor > torch.quantile(tensor, 1 - quantile)]
+        
+        # Create histogram
+        hist, bin_edges = torch.histogram(tensor, bins=bins)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        # Normalize histogram
+        hist = hist / torch.sum(hist)
+        
+        # Add small constant to avoid zeros
+        hist = hist + 1e-8
+        hist = hist / torch.sum(hist)
+        
+        # Calculate KL divergence for different thresholds
+        min_kl_div = float('inf')
+        optimal_threshold = bin_centers[-1].item()
+        
+        # Try different thresholds
+        for i in range(bins // 2, bins):
+            threshold = bin_centers[i].item()
+            
+            # Create quantized distribution
+            q_hist = torch.zeros_like(hist)
+            for j in range(bins):
+                if bin_centers[j] <= threshold:
+                    # Quantize bin to closest quantized value
+                    q_val = torch.round(bin_centers[j] / threshold * 255) * threshold / 255
+                    # Find closest bin
+                    closest_bin = torch.argmin(torch.abs(bin_centers - q_val))
+                    # Add to quantized histogram
+                    q_hist[closest_bin] += hist[j]
+            
+            # Normalize quantized histogram
+            q_hist = q_hist + 1e-8
+            q_hist = q_hist / torch.sum(q_hist)
+            
+            # Calculate KL divergence
+            kl_div = torch.sum(hist * torch.log(hist / q_hist))
+            
+            # Update optimal threshold if KL divergence is lower
+            if kl_div < min_kl_div:
+                min_kl_div = kl_div
+                optimal_threshold = threshold
+        
+        return optimal_threshold
+
+def build_calibrator(model, dataloader, method='histogram', **kwargs):
+    """
+    Build calibrator based on method.
+    
+    Args:
+        model: Model to calibrate
+        dataloader: DataLoader for calibration
+        method: Calibration method
+        kwargs: Additional arguments for calibrator
+        
+    Returns:
+        Calibrator instance
+    """
+    if method == 'percentile':
+        percentile = kwargs.get('percentile', 99.99)
+        return PercentileCalibrator(
+            model=model,
+            calibration_loader=dataloader,
+            device=kwargs.get('device', 'cuda'),
+            num_batches=kwargs.get('num_batches', 100),
+            percentile=percentile
+        )
+    elif method == 'entropy':
+        return EntropyCalibrator(
+            model=model,
+            calibration_loader=dataloader,
+            device=kwargs.get('device', 'cuda'),
+            num_batches=kwargs.get('num_batches', 100)
+        )
+    else:
+        return Calibrator(
+            model=model,
+            calibration_loader=dataloader,
+            device=kwargs.get('device', 'cuda'),
+            num_batches=kwargs.get('num_batches', 100)
+        )
+
+// fake_quantize.py
+# Contains fake quantization modules that simulate quantization:
+#   - FakeQuantize: Base class for fake quantization
+#   - Specialized variants for different quantization schemes
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.quantization.fake_quantize import FakeQuantize
+from .observers import get_observer
+
+class CustomFakeQuantize(FakeQuantize):
+    """
+    Custom FakeQuantize module with improved gradient approximation.
+    Uses Straight-Through Estimator (STE) with a smoother gradient.
+    """
+    
+    def __init__(self, observer, quant_min, quant_max, **observer_kwargs):
+        """
+        Initialize custom fake quantize module.
+        
+        Args:
+            observer: Observer class for collecting statistics
+            quant_min: Minimum quantized value
+            quant_max: Maximum quantized value
+            observer_kwargs: Additional arguments for observer
+        """
+        super().__init__(observer, quant_min, quant_max, **observer_kwargs)
+        self.grad_factor = 1.0  # Factor for gradient scaling
+    
+    def forward(self, x):
+        """
+        Forward pass with quantization and dequantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Quantized and dequantized tensor
+        """
+        if self.training:
+            # Update observer statistics
+            self.activation_post_process(x)
+            
+            # Get quantization parameters
+            scale, zero_point = self.calculate_qparams()
+            self.scale.copy_(scale)
+            self.zero_point.copy_(zero_point)
+            
+            # Quantize and dequantize in forward pass
+            x_q = torch.fake_quantize_per_tensor_affine(
+                x, scale.item(), int(zero_point.item()), 
+                self.quant_min, self.quant_max)
+            
+            # Apply STE with smoother gradient in backward pass
+            return x_q + (x - x_q).detach() * self.grad_factor
+        else:
+            # In eval mode, just apply quantization
+            return torch.fake_quantize_per_tensor_affine(
+                x, self.scale.item(), int(self.zero_point.item()),
+                self.quant_min, self.quant_max)
+
+
+class PerChannelFakeQuantize(FakeQuantize):
+    """
+    Per-channel fake quantization for weights.
+    """
+    
+    def __init__(self, observer, quant_min, quant_max, ch_axis=0, **observer_kwargs):
+        """
+        Initialize per-channel fake quantize module.
+        
+        Args:
+            observer: Observer class for collecting statistics
+            quant_min: Minimum quantized value
+            quant_max: Maximum quantized value
+            ch_axis: Channel axis for per-channel quantization
+            observer_kwargs: Additional arguments for observer
+        """
+        super().__init__(observer, quant_min, quant_max, ch_axis=ch_axis, **observer_kwargs)
+        self.ch_axis = ch_axis
+        self.grad_factor = 1.0  # Factor for gradient scaling
+    
+    def forward(self, x):
+        """
+        Forward pass with per-channel quantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Quantized and dequantized tensor
+        """
+        if self.training:
+            # Update observer statistics
+            self.activation_post_process(x)
+            
+            # Get quantization parameters
+            scales, zero_points = self.calculate_qparams()
+            self.scale.copy_(scales)
+            self.zero_point.copy_(zero_points)
+            
+            # Apply per-channel fake quantization
+            x_q = torch.fake_quantize_per_channel_affine(
+                x, scales, zero_points.to(torch.int32), 
+                self.ch_axis, self.quant_min, self.quant_max)
+            
+            # Apply STE with smoother gradient in backward pass
+            return x_q + (x - x_q).detach() * self.grad_factor
+        else:
+            # In eval mode, just apply quantization
+            return torch.fake_quantize_per_channel_affine(
+                x, self.scale, self.zero_point.to(torch.int32),
+                self.ch_axis, self.quant_min, self.quant_max)
+
+
+class LSQFakeQuantize(FakeQuantize):
+    """
+    Learned Step Size Quantization (LSQ).
+    LSQ learns the quantization step size as a model parameter.
+    """
+    
+    def __init__(self, observer, quant_min, quant_max, **observer_kwargs):
+        """
+        Initialize LSQ fake quantize module.
+        
+        Args:
+            observer: Observer class for collecting statistics
+            quant_min: Minimum quantized value
+            quant_max: Maximum quantized value
+            observer_kwargs: Additional arguments for observer
+        """
+        super().__init__(observer, quant_min, quant_max, **observer_kwargs)
+        self.register_parameter('step_size', 
+                                nn.Parameter(torch.tensor([1.0])))
+        self.register_buffer('initialized', torch.tensor(0, dtype=torch.bool))
+    
+    def _initialize_step_size(self, x):
+        """
+        Initialize step size based on the range of input tensor.
+        
+        Args:
+            x: Input tensor
+        """
+        with torch.no_grad():
+            min_val = torch.min(x)
+            max_val = torch.max(x)
+            
+            # Handle constant tensor case
+            if min_val == max_val:
+                min_val = torch.tensor(-1.0)
+                max_val = torch.tensor(1.0)
+            
+            if self.quant_min < 0:
+                # Symmetric quantization (for weights)
+                max_abs = torch.max(torch.abs(min_val), torch.abs(max_val))
+                self.step_size.copy_(2 * max_abs / (self.quant_max - self.quant_min))
+            else:
+                # Asymmetric quantization (for activations)
+                self.step_size.copy_((max_val - min_val) / (self.quant_max - self.quant_min))
+                
+            # Ensure step size is positive and non-zero
+            if self.step_size <= 0:
+                self.step_size.copy_(torch.tensor([0.1]))
+                
+            self.initialized.copy_(torch.tensor(1, dtype=torch.bool))
+    
+    def forward(self, x):
+        """
+        Forward pass with learned step size quantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Quantized and dequantized tensor
+        """
+        if self.training:
+            if not self.initialized:
+                self._initialize_step_size(x)
+            
+            # Calculate zero point
+            if self.quant_min < 0:
+                # Symmetric quantization
+                zero_point = torch.zeros_like(self.step_size)
+            else:
+                # Asymmetric quantization
+                zero_point = self.quant_min - torch.min(x) / self.step_size
+                zero_point = torch.clamp(zero_point, self.quant_min, self.quant_max)
+            
+            # Quantize
+            x_scaled = x / self.step_size
+            x_clipped = torch.clamp(x_scaled, self.quant_min, self.quant_max)
+            x_rounded = torch.round(x_clipped)
+            x_q = x_rounded * self.step_size
+            
+            # STE with gradient scaling
+            x_q = x_q - x_scaled.detach() + x_scaled
+            
+            return x_q
+        else:
+            # In eval mode
+            x_scaled = x / self.step_size
+            x_clipped = torch.clamp(x_scaled, self.quant_min, self.quant_max)
+            x_rounded = torch.round(x_clipped)
+            return x_rounded * self.step_size
+
+
+# Factory function to create fake quantizer based on configuration
+def create_fake_quantizer(observer_type, quant_min, quant_max, dtype=torch.quint8, 
+                         qscheme=torch.per_tensor_affine, ch_axis=0, is_weight=False):
+    """
+    Create appropriate fake quantizer based on configuration.
+    
+    Args:
+        observer_type: Type of observer ("minmax", "moving_average_minmax", "histogram")
+        quant_min: Minimum quantized value
+        quant_max: Maximum quantized value
+        dtype: Quantized data type
+        qscheme: Quantization scheme
+        ch_axis: Channel axis for per-channel quantization
+        is_weight: Whether quantizing weights (True) or activations (False)
+        
+    Returns:
+        FakeQuantize module
+    """
+    observer_class = get_observer(observer_type, dtype, qscheme, ch_axis)
+    
+    # Check if per-channel quantization is needed
+    if qscheme in [torch.per_channel_symmetric, torch.per_channel_affine]:
+        return PerChannelFakeQuantize.with_args(
+            observer=observer_class,
+            quant_min=quant_min,
+            quant_max=quant_max,
+            ch_axis=ch_axis
+        )
+    else:
+        return CustomFakeQuantize.with_args(
+            observer=observer_class,
+            quant_min=quant_min,
+            quant_max=quant_max
+        )
+
+
+# Helper function to get fake quantize module from config
+def get_fake_quantize_from_config(config, is_weight=False):
+    """
+    Create fake quantize module from configuration.
+    
+    Args:
+        config: Quantization configuration
+        is_weight: Whether quantizing weights (True) or activations (False)
+        
+    Returns:
+        FakeQuantize module
+    """
+    if is_weight:
+        # Weight quantization
+        cfg = config["weight"]
+        dtype = torch.qint8 if cfg["dtype"] == "qint8" else torch.quint8
+        qscheme = torch.per_channel_symmetric if cfg["scheme"] == "per_channel" else torch.per_tensor_symmetric
+        quant_min, quant_max = -128, 127
+    else:
+        # Activation quantization
+        cfg = config["activation"]
+        dtype = torch.quint8 if cfg["dtype"] == "quint8" else torch.qint8
+        qscheme = torch.per_tensor_affine
+        quant_min, quant_max = (0, 255) if dtype == torch.quint8 else (-128, 127)
+    
+    return create_fake_quantizer(
+        observer_type=cfg["observer"],
+        quant_min=quant_min,
+        quant_max=quant_max,
+        dtype=dtype,
+        qscheme=qscheme,
+        ch_axis=0 if is_weight else -1
+    )
+
+// fusion.py
+# Implements module fusion for better quantization:
+#     - Conv-BN-ReLU fusion
+#     - Other common fusion patterns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.quantization.fuse_modules import fuse_modules
+import re
+
+
+def fuse_conv_bn(conv, bn):
+    """
+    Fuse Conv2d and BatchNorm2d modules.
+    
+    Args:
+        conv: Conv2d module
+        bn: BatchNorm2d module
+        
+    Returns:
+        Fused Conv2d module
+    """
+    # Get parameters
+    w_conv = conv.weight.clone().detach()
+    
+    # Handle bias
+    if conv.bias is not None:
+        b_conv = conv.bias.clone().detach()
+    else:
+        b_conv = torch.zeros_like(bn.running_mean)
+    
+    # BatchNorm parameters
+    mean = bn.running_mean
+    var = bn.running_var
+    eps = bn.eps
+    gamma = bn.weight
+    beta = bn.bias
+    
+    # Fuse parameters
+    w_fused = w_conv * (gamma / torch.sqrt(var + eps)).reshape(-1, 1, 1, 1)
+    b_fused = beta + (b_conv - mean) * gamma / torch.sqrt(var + eps)
+    
+    # Create new Conv2d module
+    fused_conv = nn.Conv2d(
+        conv.in_channels,
+        conv.out_channels,
+        conv.kernel_size,
+        conv.stride,
+        conv.padding,
+        conv.dilation,
+        conv.groups,
+        bias=True,
+        padding_mode=conv.padding_mode,
+    )
+    
+    # Set weights and bias
+    fused_conv.weight.data = w_fused
+    fused_conv.bias.data = b_fused
+    
+    return fused_conv
+
+
+def fuse_conv_bn_relu(conv, bn, relu):
+    """
+    Fuse Conv2d, BatchNorm2d, and ReLU modules.
+    
+    Args:
+        conv: Conv2d module
+        bn: BatchNorm2d module
+        relu: ReLU module
+        
+    Returns:
+        Fused Conv2d module
+    """
+    # Fuse Conv and BN first
+    fused_conv = fuse_conv_bn(conv, bn)
+    
+    # Create a new module that includes ReLU
+    class ConvBnReLU(nn.Module):
+        def __init__(self, conv):
+            super(ConvBnReLU, self).__init__()
+            self.conv = conv
+        
+        def forward(self, x):
+            return F.relu(self.conv(x))
+    
+    return ConvBnReLU(fused_conv)
+
+
+def fuse_conv_bn_silu(conv, bn, silu):
+    """
+    Fuse Conv2d, BatchNorm2d, and SiLU (Swish) modules.
+    
+    Args:
+        conv: Conv2d module
+        bn: BatchNorm2d module
+        silu: SiLU module
+        
+    Returns:
+        Fused Conv2d module
+    """
+    # Fuse Conv and BN first
+    fused_conv = fuse_conv_bn(conv, bn)
+    
+    # Create a new module that includes SiLU
+    class ConvBnSiLU(nn.Module):
+        def __init__(self, conv):
+            super(ConvBnSiLU, self).__init__()
+            self.conv = conv
+        
+        def forward(self, x):
+            x = self.conv(x)
+            return x * torch.sigmoid(x)  # SiLU/Swish activation
+    
+    return ConvBnSiLU(fused_conv)
+
+
+def find_modules_to_fuse(model, fusion_patterns):
+    """
+    Find modules to fuse in model based on fusion patterns.
+    
+    Args:
+        model: Model to search
+        fusion_patterns: List of patterns to search for
+        
+    Returns:
+        List of lists of module names to fuse
+    """
+    modules_to_fuse = []
+    named_modules = dict(model.named_modules())
+    
+    # Helper function to check if a module matches a pattern
+    def matches_pattern(name, pattern):
+        return re.match(pattern, name) is not None
+    
+    # Check each module
+    for name, module in named_modules.items():
+        for pattern in fusion_patterns:
+            if matches_pattern(name, pattern["pattern"]):
+                # Check if module has required components
+                module_names = []
+                current_name = name
+                
+                # Try to find all modules in the pattern
+                all_found = True
+                for module_type in pattern["modules"]:
+                    if current_name in named_modules and isinstance(named_modules[current_name], get_module_class(module_type)):
+                        module_names.append(current_name)
+                        # For sequential modules, move to the next one
+                        if current_name + ".1" in named_modules:
+                            current_name = current_name + ".1"
+                        elif current_name + ".bn" in named_modules and module_type == "conv":
+                            current_name = current_name + ".bn"
+                        elif current_name + ".act" in named_modules and (module_type == "bn" or module_type == "conv"):
+                            current_name = current_name + ".act"
+                        else:
+                            # If no standard pattern is found, break the chain
+                            all_found = False
+                            break
+                    else:
+                        all_found = False
+                        break
+                
+                if all_found and len(module_names) == len(pattern["modules"]):
+                    modules_to_fuse.append(module_names)
+    
+    return modules_to_fuse
+
+
+def get_module_class(module_type):
+    """
+    Get module class from type string.
+    
+    Args:
+        module_type: String representation of module type
+        
+    Returns:
+        Module class
+    """
+    if module_type == "conv":
+        return nn.Conv2d
+    elif module_type == "bn":
+        return nn.BatchNorm2d
+    elif module_type == "relu":
+        return nn.ReLU
+    elif module_type == "silu":
+        # SiLU (Swish) could be implemented in different ways
+        return (nn.SiLU, nn.Hardswish)
+    else:
+        raise ValueError(f"Unknown module type: {module_type}")
+
+
+def fuse_model_modules(model, fusion_patterns, inplace=False):
+    """
+    Fuse modules in model based on fusion patterns.
+    
+    Args:
+        model: Model to fuse
+        fusion_patterns: List of fusion patterns
+        inplace: Whether to modify model inplace
+        
+    Returns:
+        Fused model
+    """
+    if not inplace:
+        model = model.deepcopy()
+    
+    # Find modules to fuse
+    modules_to_fuse = find_modules_to_fuse(model, fusion_patterns)
+    
+    # Apply fuser function for each pattern
+    for module_names in modules_to_fuse:
+        # Get first module type to determine fuser function
+        first_module = model
+        for name in module_names[0].split('.'):
+            if name.isdigit():
+                first_module = first_module[int(name)]
+            else:
+                first_module = getattr(first_module, name)
+        
+        # Determine fuser function based on modules
+        if len(module_names) == 2:
+            fuser_function = fuse_conv_bn
+        elif len(module_names) == 3:
+            # Check if third module is ReLU or SiLU
+            third_module = model
+            for name in module_names[2].split('.'):
+                if name.isdigit():
+                    third_module = third_module[int(name)]
+                else:
+                    third_module = getattr(third_module, name)
+            
+            if isinstance(third_module, nn.ReLU):
+                fuser_function = fuse_conv_bn_relu
+            else:
+                fuser_function = fuse_conv_bn_silu
+        else:
+            continue
+        
+        # Apply fuser function
+        fuse_modules(model, module_names, inplace=True, fuser_func=fuser_function)
+    
+    return model
+
+
+def fuse_yolov8_modules(model, fusion_patterns=None):
+    """
+    Fuse modules in YOLOv8 model for better quantization.
+    
+    Args:
+        model: YOLOv8 model
+        fusion_patterns: Optional fusion patterns override
+        
+    Returns:
+        Fused model
+    """
+    if fusion_patterns is None:
+        # Default fusion patterns for YOLOv8
+        fusion_patterns = [
+            {
+                "pattern": r"model\.\d+\.conv",
+                "modules": ["conv", "bn"],
+                "fuser_method": "fuse_conv_bn"
+            },
+            {
+                "pattern": r"model\.\d+\.cv\d+\.conv",
+                "modules": ["conv", "bn", "silu"],
+                "fuser_method": "fuse_conv_bn_silu"
+            },
+            # Add more specific patterns as needed
+        ]
+    
+    return fuse_model_modules(model, fusion_patterns, inplace=True)
+
+// observer.py
+# Implements observer classes that collect statistics about tensor values:
+#   - MinMaxObserver:               Records min/max values
+#   - MovingAverageMinMaxObserver:  Tracks running min/max
+#   - HistogramObserver:            For more sophisticated calibration
+
+import torch
+import torch.nn as nn
+from torch.quantization.observer import _ObserverBase, MinMaxObserver, MovingAverageMinMaxObserver
+import torch.nn.functional as F
+
+class CustomMinMaxObserver(_ObserverBase):
+    """
+    Custom MinMax Observer for more precise quantization.
+    Tracks min and max values with momentum.
+    """
+    
+    def __init__(self, dtype=torch.quint8, qscheme=torch.per_tensor_affine,
+                ch_axis=0, momentum=0.1, eps=1e-5):
+        """
+        Initialize custom observer.
+        
+        Args:
+            dtype: Quantized data type
+            qscheme: Quantization scheme
+            ch_axis: Channel axis for per-channel quantization
+            momentum: Momentum for moving average
+            eps: Small value for numerical stability
+        """
+        super().__init__(dtype=dtype)
+        self.qscheme = qscheme
+        self.ch_axis = ch_axis
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer('min_val', torch.tensor(float('inf')))
+        self.register_buffer('max_val', torch.tensor(float('-inf')))
+        self.register_buffer('initialized', torch.tensor(0, dtype=torch.bool))
+    
+    def forward(self, x_orig):
+        """
+        Forward pass to observe tensor values.
+        
+        Args:
+            x_orig: Input tensor
+            
+        Returns:
+            Input tensor (unchanged)
+        """
+        x = x_orig.detach()
+        
+        if x.numel() == 0:
+            return x_orig
+        
+        min_val = torch.min(x)
+        max_val = torch.max(x)
+        
+        if not self.initialized:
+            self.min_val.copy_(min_val)
+            self.max_val.copy_(max_val)
+            self.initialized.copy_(torch.tensor(1, dtype=torch.bool))
+        else:
+            self.min_val.copy_(torch.min(self.min_val * (1 - self.momentum) + min_val * self.momentum, min_val))
+            self.max_val.copy_(torch.max(self.max_val * (1 - self.momentum) + max_val * self.momentum, max_val))
+        
+        return x_orig
+    
+    def calculate_qparams(self):
+        """
+        Calculate quantization parameters.
+        
+        Returns:
+            scale and zero_point
+        """
+        if not self.initialized:
+            return torch.tensor([1.0]), torch.tensor([0])
+        
+        min_val = self.min_val
+        max_val = self.max_val
+        
+        # Handle case where min=max
+        if min_val == max_val:
+            scale = torch.tensor(1.0)
+            zero_point = torch.tensor(0)
+            return scale, zero_point
+        
+        if self.qscheme == torch.per_tensor_symmetric or self.qscheme == torch.per_channel_symmetric:
+            # Symmetric quantization
+            max_abs = torch.max(torch.abs(min_val), torch.abs(max_val))
+            scale = max_abs / ((self.quant_max - self.quant_min) / 2)
+            zero_point = torch.zeros_like(scale, dtype=torch.int32)
+        else:
+            # Affine quantization
+            scale = (max_val - min_val) / (self.quant_max - self.quant_min)
+            zero_point = self.quant_min - torch.round(min_val / scale)
+            zero_point = torch.clamp(zero_point, self.quant_min, self.quant_max).to(torch.int32)
+        
+        return scale, zero_point
+    
+    def extra_repr(self):
+        return f"dtype={self.dtype}, qscheme={self.qscheme}, ch_axis={self.ch_axis}, momentum={self.momentum}"
+
+
+class PerChannelMinMaxObserver(_ObserverBase):
+    """
+    Per-channel min-max observer for weights.
+    """
+    
+    def __init__(self, dtype=torch.qint8, qscheme=torch.per_channel_symmetric,
+                ch_axis=0, eps=1e-5):
+        """
+        Initialize per-channel observer.
+        
+        Args:
+            dtype: Quantized data type
+            qscheme: Quantization scheme
+            ch_axis: Channel axis for per-channel quantization
+            eps: Small value for numerical stability
+        """
+        super().__init__(dtype=dtype)
+        self.qscheme = qscheme
+        self.ch_axis = ch_axis
+        self.eps = eps
+        self.register_buffer('min_vals', None)
+        self.register_buffer('max_vals', None)
+        self.register_buffer('initialized', torch.tensor(0, dtype=torch.bool))
+    
+    def forward(self, x_orig):
+        """
+        Forward pass to observe tensor values.
+        
+        Args:
+            x_orig: Input tensor
+            
+        Returns:
+            Input tensor (unchanged)
+        """
+        x = x_orig.detach()
+        
+        if x.numel() == 0:
+            return x_orig
+        
+        # Reshape tensor to get min/max per channel
+        x_dim = x.size()
+        new_shape = [1] * len(x_dim)
+        new_shape[self.ch_axis] = x_dim[self.ch_axis]
+        x_reshaped = x.reshape(x_dim[self.ch_axis], -1)
+        
+        # Get min and max per channel
+        min_vals = torch.min(x_reshaped, dim=1)[0]
+        max_vals = torch.max(x_reshaped, dim=1)[0]
+        
+        if not self.initialized:
+            self.min_vals = min_vals
+            self.max_vals = max_vals
+            self.initialized.copy_(torch.tensor(1, dtype=torch.bool))
+        else:
+            self.min_vals = torch.min(self.min_vals, min_vals)
+            self.max_vals = torch.max(self.max_vals, max_vals)
+        
+        return x_orig
+    
+    def calculate_qparams(self):
+        """
+        Calculate per-channel quantization parameters.
+        
+        Returns:
+            scales and zero_points
+        """
+        if not self.initialized:
+            return torch.tensor([1.0]), torch.tensor([0])
+        
+        min_vals = self.min_vals
+        max_vals = self.max_vals
+        
+        # Handle case where min=max for each channel
+        same_vals = min_vals == max_vals
+        if same_vals.any():
+            max_vals[same_vals] = min_vals[same_vals] + 1e-5
+        
+        if self.qscheme == torch.per_channel_symmetric:
+            # Symmetric quantization
+            max_abs = torch.max(torch.abs(min_vals), torch.abs(max_vals))
+            scales = max_abs / ((self.quant_max - self.quant_min) / 2)
+            zero_points = torch.zeros_like(scales, dtype=torch.int32)
+        else:
+            # Affine quantization
+            scales = (max_vals - min_vals) / (self.quant_max - self.quant_min)
+            zero_points = self.quant_min - torch.round(min_vals / scales)
+            zero_points = torch.clamp(zero_points, self.quant_min, self.quant_max).to(torch.int32)
+        
+        return scales, zero_points
+    
+    def extra_repr(self):
+        return f"dtype={self.dtype}, qscheme={self.qscheme}, ch_axis={self.ch_axis}"
+
+
+class HistogramObserver(_ObserverBase):
+    """
+    Histogram-based observer for more precise quantization.
+    Uses histogram of values to determine optimal scale and zero-point.
+    """
+    
+    def __init__(self, dtype=torch.quint8, qscheme=torch.per_tensor_affine,
+                 bins=2048, upsample_rate=1, eps=1e-5):
+        """
+        Initialize histogram observer.
+        
+        Args:
+            dtype: Quantized data type
+            qscheme: Quantization scheme
+            bins: Number of histogram bins
+            upsample_rate: Bin upsampling for higher precision
+            eps: Small value for numerical stability
+        """
+        super().__init__(dtype=dtype)
+        self.qscheme = qscheme
+        self.bins = bins
+        self.upsample_rate = upsample_rate
+        self.eps = eps
+        self.register_buffer('min_val', torch.tensor(float('inf')))
+        self.register_buffer('max_val', torch.tensor(float('-inf')))
+        self.register_buffer('histogram', torch.zeros(self.bins))
+        self.register_buffer('initialized', torch.tensor(0, dtype=torch.bool))
+    
+    def _compute_histogram(self, x, min_val, max_val):
+        """
+        Compute histogram of tensor values.
+        
+        Args:
+            x: Input tensor
+            min_val: Minimum value
+            max_val: Maximum value
+            
+        Returns:
+            Histogram tensor
+        """
+        # Handle case where min=max
+        if min_val == max_val:
+            min_val = min_val - 0.5
+            max_val = max_val + 0.5
+        
+        hist_range = max_val - min_val
+        # Compute histogram
+        hist = torch.histc(x, self.bins, min=min_val, max=max_val)
+        return hist
+    
+    def forward(self, x_orig):
+        """
+        Forward pass to observe tensor values.
+        
+        Args:
+            x_orig: Input tensor
+            
+        Returns:
+            Input tensor (unchanged)
+        """
+        x = x_orig.detach()
+        
+        if x.numel() == 0:
+            return x_orig
+        
+        min_val = torch.min(x)
+        max_val = torch.max(x)
+        
+        if not self.initialized:
+            self.min_val.copy_(min_val)
+            self.max_val.copy_(max_val)
+            self.histogram.copy_(self._compute_histogram(x, min_val, max_val))
+            self.initialized.copy_(torch.tensor(1, dtype=torch.bool))
+        else:
+            self.min_val.copy_(torch.min(self.min_val, min_val))
+            self.max_val.copy_(torch.max(self.max_val, max_val))
+            # Update histogram with new range
+            self.histogram.copy_(self._compute_histogram(x, self.min_val, self.max_val))
+        
+        return x_orig
+    
+    def _compute_quantization_params(self, hist, min_val, max_val):
+        """
+        Compute optimal quantization parameters from histogram.
+        
+        Args:
+            hist: Histogram tensor
+            min_val: Minimum value
+            max_val: Maximum value
+            
+        Returns:
+            scale and zero_point
+        """
+        if self.qscheme == torch.per_tensor_symmetric:
+            # For symmetric quantization, use max absolute value
+            max_abs = torch.max(torch.abs(min_val), torch.abs(max_val))
+            scale = max_abs / ((self.quant_max - self.quant_min) / 2)
+            zero_point = torch.zeros_like(scale, dtype=torch.int32)
+        else:
+            # For affine quantization, use histogram to find optimal params
+            bin_width = (max_val - min_val) / self.bins
+            scale = bin_width
+            
+            # Compute cumulative histogram
+            cumsum = torch.cumsum(hist, dim=0)
+            
+            # Find threshold that minimizes quantization error
+            threshold = cumsum[-1] * 0.95  # 95th percentile
+            zero_point_idx = torch.nonzero(cumsum >= threshold)[0]
+            zero_point = self.quant_min + zero_point_idx
+            zero_point = torch.clamp(zero_point, self.quant_min, self.quant_max).to(torch.int32)
+        
+        return scale, zero_point
+    
+    def calculate_qparams(self):
+        """
+        Calculate quantization parameters using histogram.
+        
+        Returns:
+            scale and zero_point
+        """
+        if not self.initialized:
+            return torch.tensor([1.0]), torch.tensor([0])
+        
+        return self._compute_quantization_params(self.histogram, self.min_val, self.max_val)
+    
+    def extra_repr(self):
+        return f"dtype={self.dtype}, qscheme={self.qscheme}, bins={self.bins}"
+
+
+# Helper function to get the correct observer based on configuration
+def get_observer(observer_type, dtype, qscheme, ch_axis=0):
+    """
+    Get observer instance based on type.
+    
+    Args:
+        observer_type: Type of observer
+        dtype: Quantized data type
+        qscheme: Quantization scheme
+        ch_axis: Channel axis for per-channel quantization
+        
+    Returns:
+        Observer instance
+    """
+    if observer_type == "minmax":
+        if qscheme == torch.per_channel_symmetric or qscheme == torch.per_channel_affine:
+            return PerChannelMinMaxObserver(dtype=dtype, qscheme=qscheme, ch_axis=ch_axis)
+        else:
+            return MinMaxObserver(dtype=dtype, qscheme=qscheme)
+    elif observer_type == "moving_average_minmax":
+        return MovingAverageMinMaxObserver(dtype=dtype, qscheme=qscheme)
+    elif observer_type == "histogram":
+        return HistogramObserver(dtype=dtype, qscheme=qscheme)
+    else:
+        raise ValueError(f"Unknown observer type: {observer_type}")
+
+// qat_modules.py
+# QAT-ready versions of PyTorch modules:
+#     - QATConv2d: Quantization-aware Conv2d
+#     - QATLinear: Quantization-aware Linear
+#     - And other specialized modules
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.quantization.fake_quantize import FakeQuantize
+from .fake_quantize import CustomFakeQuantize, PerChannelFakeQuantize
+
+class QATConv2d(nn.Conv2d):
+    """
+    Quantization-aware training version of Conv2d.
+    """
+    
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, bias=True,
+                 padding_mode='zeros', qconfig=None):
+        """
+        Initialize QAT Conv2d.
+        
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of convolution kernel
+            stride: Stride of convolution
+            padding: Padding of convolution
+            dilation: Dilation of convolution
+            groups: Number of groups
+            bias: Whether to include bias
+            padding_mode: Mode of padding
+            qconfig: Quantization configuration
+        """
+        super().__init__(in_channels, out_channels, kernel_size, stride,
+                          padding, dilation, groups, bias, padding_mode)
+        
+        # Initialize quantization parameters if qconfig is provided
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.weight_fake_quant = qconfig.weight()
+            self.activation_post_process = qconfig.activation()
+        else:
+            self.weight_fake_quant = None
+            self.activation_post_process = None
+    
+    def forward(self, x):
+        """
+        Forward pass with quantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        # Quantize weights if weight_fake_quant is available
+        if self.weight_fake_quant is not None:
+            weight = self.weight_fake_quant(self.weight)
+        else:
+            weight = self.weight
+        
+        # Perform convolution
+        output = F.conv2d(
+            x, weight, self.bias, self.stride,
+            self.padding, self.dilation, self.groups
+        )
+        
+        # Quantize activations if activation_post_process is available
+        if self.activation_post_process is not None:
+            output = self.activation_post_process(output)
+        
+        return output
+    
+    @classmethod
+    def from_float(cls, mod):
+        """
+        Create QATConv2d from float Conv2d.
+        
+        Args:
+            mod: Float Conv2d module
+            
+        Returns:
+            QATConv2d module
+        """
+        qat_conv = cls(
+            mod.in_channels, mod.out_channels, mod.kernel_size,
+            mod.stride, mod.padding, mod.dilation, mod.groups,
+            mod.bias is not None, mod.padding_mode
+        )
+        qat_conv.weight = mod.weight
+        qat_conv.bias = mod.bias
+        qat_conv.qconfig = mod.qconfig
+        
+        if hasattr(mod, 'weight_fake_quant'):
+            qat_conv.weight_fake_quant = mod.weight_fake_quant
+        
+        if hasattr(mod, 'activation_post_process'):
+            qat_conv.activation_post_process = mod.activation_post_process
+        
+        return qat_conv
+    
+    def to_float(self):
+        """
+        Convert to float Conv2d.
+        
+        Returns:
+            Float Conv2d module
+        """
+        float_conv = nn.Conv2d(
+            self.in_channels, self.out_channels, self.kernel_size,
+            self.stride, self.padding, self.dilation, self.groups,
+            self.bias is not None, self.padding_mode
+        )
+        float_conv.weight = self.weight
+        float_conv.bias = self.bias
+        
+        return float_conv
+
+
+class QATBatchNorm2d(nn.BatchNorm2d):
+    """
+    Quantization-aware training version of BatchNorm2d.
+    """
+    
+    def __init__(self, num_features, eps=1e-5, momentum=0.1,
+                 affine=True, track_running_stats=True, qconfig=None):
+        """
+        Initialize QAT BatchNorm2d.
+        
+        Args:
+            num_features: Number of features
+            eps: Epsilon value for numerical stability
+            momentum: Momentum for running statistics
+            affine: Whether to use learnable affine parameters
+            track_running_stats: Whether to track running statistics
+            qconfig: Quantization configuration
+        """
+        super().__init__(num_features, eps, momentum, affine, track_running_stats)
+        
+        # Initialize quantization parameters if qconfig is provided
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.activation_post_process = qconfig.activation()
+        else:
+            self.activation_post_process = None
+    
+    def forward(self, x):
+        """
+        Forward pass with quantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        # Perform batch normalization
+        output = super().forward(x)
+        
+        # Quantize activations if activation_post_process is available
+        if self.activation_post_process is not None:
+            output = self.activation_post_process(output)
+        
+        return output
+    
+    @classmethod
+    def from_float(cls, mod):
+        """
+        Create QATBatchNorm2d from float BatchNorm2d.
+        
+        Args:
+            mod: Float BatchNorm2d module
+            
+        Returns:
+            QATBatchNorm2d module
+        """
+        qat_bn = cls(
+            mod.num_features, mod.eps, mod.momentum,
+            mod.affine, mod.track_running_stats
+        )
+        qat_bn.weight = mod.weight
+        qat_bn.bias = mod.bias
+        qat_bn.running_mean = mod.running_mean
+        qat_bn.running_var = mod.running_var
+        qat_bn.num_batches_tracked = mod.num_batches_tracked
+        qat_bn.qconfig = mod.qconfig
+        
+        if hasattr(mod, 'activation_post_process'):
+            qat_bn.activation_post_process = mod.activation_post_process
+        
+        return qat_bn
+    
+    def to_float(self):
+        """
+        Convert to float BatchNorm2d.
+        
+        Returns:
+            Float BatchNorm2d module
+        """
+        float_bn = nn.BatchNorm2d(
+            self.num_features, self.eps, self.momentum,
+            self.affine, self.track_running_stats
+        )
+        float_bn.weight = self.weight
+        float_bn.bias = self.bias
+        float_bn.running_mean = self.running_mean
+        float_bn.running_var = self.running_var
+        float_bn.num_batches_tracked = self.num_batches_tracked
+        
+        return float_bn
+
+
+class QATLinear(nn.Linear):
+    """
+    Quantization-aware training version of Linear.
+    """
+    
+    def __init__(self, in_features, out_features, bias=True, qconfig=None):
+        """
+        Initialize QAT Linear.
+        
+        Args:
+            in_features: Number of input features
+            out_features: Number of output features
+            bias: Whether to include bias
+            qconfig: Quantization configuration
+        """
+        super().__init__(in_features, out_features, bias)
+        
+        # Initialize quantization parameters if qconfig is provided
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.weight_fake_quant = qconfig.weight()
+            self.activation_post_process = qconfig.activation()
+        else:
+            self.weight_fake_quant = None
+            self.activation_post_process = None
+    
+    def forward(self, x):
+        """
+        Forward pass with quantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        # Quantize weights if weight_fake_quant is available
+        if self.weight_fake_quant is not None:
+            weight = self.weight_fake_quant(self.weight)
+        else:
+            weight = self.weight
+        
+        # Perform linear operation
+        output = F.linear(x, weight, self.bias)
+        
+        # Quantize activations if activation_post_process is available
+        if self.activation_post_process is not None:
+            output = self.activation_post_process(output)
+        
+        return output
+    
+    @classmethod
+    def from_float(cls, mod):
+        """
+        Create QATLinear from float Linear.
+        
+        Args:
+            mod: Float Linear module
+            
+        Returns:
+            QATLinear module
+        """
+        qat_linear = cls(
+            mod.in_features, mod.out_features, mod.bias is not None
+        )
+        qat_linear.weight = mod.weight
+        qat_linear.bias = mod.bias
+        qat_linear.qconfig = mod.qconfig
+        
+        if hasattr(mod, 'weight_fake_quant'):
+            qat_linear.weight_fake_quant = mod.weight_fake_quant
+        
+        if hasattr(mod, 'activation_post_process'):
+            qat_linear.activation_post_process = mod.activation_post_process
+        
+        return qat_linear
+    
+    def to_float(self):
+        """
+        Convert to float Linear.
+        
+        Returns:
+            Float Linear module
+        """
+        float_linear = nn.Linear(
+            self.in_features, self.out_features, self.bias is not None
+        )
+        float_linear.weight = self.weight
+        float_linear.bias = self.bias
+        
+        return float_linear
+
+
+class QATReLU(nn.ReLU):
+    """
+    Quantization-aware training version of ReLU.
+    """
+    
+    def __init__(self, inplace=False, qconfig=None):
+        """
+        Initialize QAT ReLU.
+        
+        Args:
+            inplace: Whether to modify input inplace
+            qconfig: Quantization configuration
+        """
+        super().__init__(inplace)
+        
+        # Initialize quantization parameters if qconfig is provided
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.activation_post_process = qconfig.activation()
+        else:
+            self.activation_post_process = None
+    
+    def forward(self, x):
+        """
+        Forward pass with quantization.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        # Perform ReLU
+        output = F.relu(x, self.inplace)
+        
+        # Quantize activations if activation_post_process is available
+        if self.activation_post_process is not None:
+            output = self.activation_post_process(output)
+        
+        return output
+    
+    @classmethod
+    def from_float(cls, mod):
+        """
+        Create QATReLU from float ReLU.
+        
+        Args:
+            mod: Float ReLU module
+            
+        Returns:
+            QATReLU module
+        """
+        qat_relu = cls(mod.inplace)
+        qat_relu.qconfig = mod.qconfig
+        
+        if hasattr(mod, 'activation_post_process'):
+            qat_relu.activation_post_process = mod.activation_post_process
+        
+        return qat_relu
+    
+    def to_float(self):
+        """
+        Convert to float ReLU.
+        
+        Returns:
+            Float ReLU module
+        """
+        return nn.ReLU(self.inplace)
+
+// qconfig.py
+# Defines quantization configurations:
+#   - QConfig objects that pair weight and activation observers
+#   - Predefined configurations for common scenarios
+
+import torch
+from torch.quantization import QConfig
+from torch.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
+from torch.quantization.fake_quantize import FakeQuantize
+
+from .observers import CustomMinMaxObserver, PerChannelMinMaxObserver, HistogramObserver
+from .fake_quantize import CustomFakeQuantize, PerChannelFakeQuantize, LSQFakeQuantize
+
+# Helper function to create QConfig from parameters
+def create_qconfig(
+    activation_observer=MovingAverageMinMaxObserver,
+    weight_observer=MinMaxObserver,
+    activation_quantize=FakeQuantize,
+    weight_quantize=FakeQuantize,
+    activation_dtype=torch.quint8,
+    weight_dtype=torch.qint8,
+    activation_qscheme=torch.per_tensor_affine,
+    weight_qscheme=torch.per_channel_symmetric,
+    activation_reduce_range=False,
+    weight_reduce_range=False,
+    weight_ch_axis=0,
+):
+    """
+    Create custom QConfig with specified parameters.
+    
+    Args:
+        activation_observer: Observer for activations
+        weight_observer: Observer for weights
+        activation_quantize: Fake quantize module for activations
+        weight_quantize: Fake quantize module for weights
+        activation_dtype: Data type for quantized activations
+        weight_dtype: Data type for quantized weights
+        activation_qscheme: Quantization scheme for activations
+        weight_qscheme: Quantization scheme for weights
+        activation_reduce_range: Reduce range for activations
+        weight_reduce_range: Reduce range for weights
+        weight_ch_axis: Channel axis for per-channel quantization
+        
+    Returns:
+        QConfig object
+    """
+    # Define activation fake quantize
+    activation_fake_quant = activation_quantize.with_args(
+        observer=activation_observer,
+        quant_min=0 if activation_dtype == torch.quint8 else -128,
+        quant_max=255 if activation_dtype == torch.quint8 else 127,
+        dtype=activation_dtype,
+        qscheme=activation_qscheme,
+        reduce_range=activation_reduce_range,
+    )
+    
+    # Define weight fake quantize
+    if weight_qscheme in [torch.per_channel_symmetric, torch.per_channel_affine]:
+        weight_fake_quant = weight_quantize.with_args(
+            observer=weight_observer,
+            quant_min=-128,
+            quant_max=127,
+            dtype=weight_dtype,
+            qscheme=weight_qscheme,
+            ch_axis=weight_ch_axis,
+            reduce_range=weight_reduce_range,
+        )
+    else:
+        weight_fake_quant = weight_quantize.with_args(
+            observer=weight_observer,
+            quant_min=-128,
+            quant_max=127,
+            dtype=weight_dtype,
+            qscheme=weight_qscheme,
+            reduce_range=weight_reduce_range,
+        )
+    
+    return QConfig(activation=activation_fake_quant, weight=weight_fake_quant)
+
+# Default QAT configuration
+def get_default_qat_qconfig():
+    """
+    Returns the default QConfig for QAT.
+    Uses per-channel quantization for weights and per-tensor for activations.
+    """
+    return create_qconfig(
+        activation_observer=MovingAverageMinMaxObserver,
+        weight_observer=MinMaxObserver,
+        activation_quantize=CustomFakeQuantize,
+        weight_quantize=PerChannelFakeQuantize,
+        activation_dtype=torch.quint8,
+        weight_dtype=torch.qint8,
+        activation_qscheme=torch.per_tensor_affine,
+        weight_qscheme=torch.per_channel_symmetric,
+        weight_ch_axis=0,
+    )
+
+# QConfig for sensitive layers (e.g., detection heads)
+def get_sensitive_layer_qconfig():
+    """
+    Returns a QConfig for layers sensitive to quantization.
+    Uses histogram observer for activations for more precise statistics.
+    """
+    return create_qconfig(
+        activation_observer=HistogramObserver,
+        weight_observer=PerChannelMinMaxObserver,
+        activation_quantize=CustomFakeQuantize,
+        weight_quantize=PerChannelFakeQuantize,
+        activation_dtype=torch.quint8,
+        weight_dtype=torch.qint8,
+        activation_qscheme=torch.per_tensor_affine,
+        weight_qscheme=torch.per_channel_symmetric,
+        weight_ch_axis=0,
+    )
+
+# QConfig for first convolutional layer
+def get_first_layer_qconfig():
+    """
+    Returns a QConfig for the first layer.
+    Uses higher precision for first layer which is critical for model accuracy.
+    """
+    return create_qconfig(
+        activation_observer=HistogramObserver,
+        weight_observer=PerChannelMinMaxObserver,
+        activation_quantize=CustomFakeQuantize,
+        weight_quantize=PerChannelFakeQuantize,
+        activation_dtype=torch.quint8,
+        weight_dtype=torch.qint8,
+        activation_qscheme=torch.per_tensor_affine,
+        weight_qscheme=torch.per_channel_symmetric,
+        weight_ch_axis=0,
+    )
+
+# QConfig for last layer (output layer)
+def get_last_layer_qconfig():
+    """
+    Returns a QConfig for the last layer.
+    Uses higher precision for output layer which is critical for model accuracy.
+    """
+    return create_qconfig(
+        activation_observer=HistogramObserver,
+        weight_observer=PerChannelMinMaxObserver,
+        activation_quantize=CustomFakeQuantize,
+        weight_quantize=PerChannelFakeQuantize,
+        activation_dtype=torch.quint8,
+        weight_dtype=torch.qint8,
+        activation_qscheme=torch.per_tensor_affine,
+        weight_qscheme=torch.per_channel_symmetric,
+        weight_ch_axis=0,
+    )
+
+# QConfig using advanced LSQ quantization
+def get_lsq_qconfig():
+    """
+    Returns a QConfig using Learned Step Size Quantization (LSQ).
+    LSQ typically improves model accuracy by learning optimal quantization steps.
+    """
+    return create_qconfig(
+        activation_observer=MovingAverageMinMaxObserver,
+        weight_observer=MinMaxObserver,
+        activation_quantize=LSQFakeQuantize,
+        weight_quantize=LSQFakeQuantize,
+        activation_dtype=torch.quint8,
+        weight_dtype=torch.qint8,
+        activation_qscheme=torch.per_tensor_affine,
+        weight_qscheme=torch.per_channel_symmetric,
+        weight_ch_axis=0,
+    )
+
+# Dictionary of available QConfigs
+QAT_CONFIGS = {
+    "default": get_default_qat_qconfig(),
+    "sensitive": get_sensitive_layer_qconfig(),
+    "first_layer": get_first_layer_qconfig(),
+    "last_layer": get_last_layer_qconfig(),
+    "lsq": get_lsq_qconfig(),
+}
+
+# Function to get QConfig by name
+def get_qconfig_by_name(name):
+    """
+    Get QConfig by name.
+    
+    Args:
+        name: Name of QConfig
+        
+    Returns:
+        QConfig object
+    """
+    if name not in QAT_CONFIGS:
+        raise ValueError(f"Unknown QConfig: {name}")
+    return QAT_CONFIGS[name]
+
+# Function to map layer names to QConfigs using regex patterns
+def create_qconfig_mapping(model, layer_configs, default_qconfig="default"):
+    """
+    Create QConfig mapping for model layers.
+    
+    Args:
+        model: Model to create mapping for
+        layer_configs: Layer-specific configurations
+        default_qconfig: Default QConfig name
+        
+    Returns:
+        Dictionary mapping regex patterns to QConfigs
+    """
+    import re
+    qconfig_mapping = {}
+    
+    # Map layer names to QConfigs
+    for layer_name, _ in model.named_modules():
+        # Default QConfig
+        qconfig_mapping[layer_name] = get_qconfig_by_name(default_qconfig)
+        
+        # Check if layer matches any pattern
+        for config in layer_configs:
+            pattern = config["pattern"]
+            if re.match(pattern, layer_name):
+                # Get QConfig type
+                qconfig_type = config.get("qconfig", "sensitive")
+                qconfig_mapping[layer_name] = get_qconfig_by_name(qconfig_type)
+                break
+    
+    return qconfig_mapping
+
+# Function to prepare QAT config from YAML configuration
+def prepare_qat_config_from_yaml(config):
+    """
+    Prepare QAT configuration from YAML.
+    
+    Args:
+        config: YAML configuration
+        
+    Returns:
+        Dictionary of QConfigs
+    """
+    qat_config = {}
+    
+    # Extract quantization settings
+    quant_config = config.get("quantization", {})
+    
+    # Prepare default QConfig
+    qat_config["default"] = create_qconfig(
+        activation_observer=get_observer_by_name(
+            quant_config.get("activation", {}).get("observer", "moving_average_minmax")
+        ),
+        weight_observer=get_observer_by_name(
+            quant_config.get("weight", {}).get("observer", "minmax")
+        ),
+        activation_dtype=get_dtype_by_name(
+            quant_config.get("activation", {}).get("dtype", "quint8")
+        ),
+        weight_dtype=get_dtype_by_name(
+            quant_config.get("weight", {}).get("dtype", "qint8")
+        ),
+        activation_qscheme=get_qscheme_by_name(
+            quant_config.get("activation", {}).get("qscheme", "per_tensor_affine")
+        ),
+        weight_qscheme=get_qscheme_by_name(
+            quant_config.get("weight", {}).get("qscheme", "per_channel_symmetric")
+        ),
+    )
+    
+    # Prepare layer-specific QConfigs
+    for layer_config in quant_config.get("layer_configs", []):
+        layer_name = layer_config.get("pattern", "")
+        layer_config_dict = layer_config.get("config", {})
+        
+        qat_config[layer_name] = create_qconfig(
+            activation_observer=get_observer_by_name(
+                layer_config_dict.get("activation", {}).get("observer", "moving_average_minmax")
+            ),
+            weight_observer=get_observer_by_name(
+                layer_config_dict.get("weight", {}).get("observer", "minmax")
+            ),
+            activation_dtype=get_dtype_by_name(
+                layer_config_dict.get("activation", {}).get("dtype", "quint8")
+            ),
+            weight_dtype=get_dtype_by_name(
+                layer_config_dict.get("weight", {}).get("dtype", "qint8")
+            ),
+            activation_qscheme=get_qscheme_by_name(
+                layer_config_dict.get("activation", {}).get("qscheme", "per_tensor_affine")
+            ),
+            weight_qscheme=get_qscheme_by_name(
+                layer_config_dict.get("weight", {}).get("qscheme", "per_channel_symmetric")
+            ),
+        )
+    
+    return qat_config
+
+# Helper functions
+def get_observer_by_name(name):
+    """
+    Get observer class by name.
+    
+    Args:
+        name: Observer name
+        
+    Returns:
+        Observer class
+    """
+    observers = {
+        "minmax": MinMaxObserver,
+        "moving_average_minmax": MovingAverageMinMaxObserver,
+        "histogram": HistogramObserver,
+        "custom_minmax": CustomMinMaxObserver,
+        "per_channel_minmax": PerChannelMinMaxObserver,
+    }
+    return observers.get(name, MovingAverageMinMaxObserver)
+
+def get_dtype_by_name(name):
+    """
+    Get dtype by name.
+    
+    Args:
+        name: Dtype name
+        
+    Returns:
+        Torch dtype
+    """
+    dtypes = {
+        "quint8": torch.quint8,
+        "qint8": torch.qint8,
+    }
+    return dtypes.get(name, torch.quint8)
+
+def get_qscheme_by_name(name):
+    """
+    Get quantization scheme by name.
+    
+    Args:
+        name: Scheme name
+        
+    Returns:
+        Torch qscheme
+    """
+    qschemes = {
+        "per_tensor_affine": torch.per_tensor_affine,
+        "per_tensor_symmetric": torch.per_tensor_symmetric,
+        "per_channel_affine": torch.per_channel_affine,
+        "per_channel_symmetric": torch.per_channel_symmetric,
+    }
+    return qschemes.get(name, torch.per_tensor_affine)

@@ -1,0 +1,4672 @@
+// __init__.py
+"""
+Evaluation utilities for YOLOv8 QAT models.
+
+This module provides tools for evaluating and comparing regular and quantized models,
+analyzing performance metrics, and visualizing results.
+"""
+
+from .metrics import (
+    compute_map,
+    compute_precision_recall,
+    compute_confusion_matrix,
+    compute_f1_score,
+    calculate_accuracy,
+    calculate_mean_average_precision
+)
+
+from .visualization import (
+    plot_precision_recall_curve,
+    plot_confusion_matrix,
+    visualize_detections,
+    visualize_activation_distributions,
+    compare_detection_results,
+    generate_evaluation_report
+)
+
+from .compare_models import (
+    compare_fp32_int8_models,
+    compare_model_outputs,
+    compute_output_error,
+    compare_layer_outputs,
+    export_comparison_report
+)
+
+from .latency_testing import (
+    measure_inference_time,
+    benchmark_model,
+    profile_model_layers,
+    measure_throughput,
+    export_benchmark_results
+)
+
+from .accuracy_drift import (
+    track_accuracy_change,
+    analyze_quantization_impact,
+    identify_critical_layers,
+    measure_drift_per_class,
+    plot_accuracy_drift
+)
+
+from .memory_profiling import (
+    measure_model_size,
+    measure_memory_usage,
+    profile_activation_memory,
+    compare_memory_requirements,
+    export_memory_profile
+)
+
+# Main API functions
+def evaluate_model(model, dataloader, metrics=None):
+    """
+    Evaluate model performance on given dataloader.
+    
+    Args:
+        model: Model to evaluate
+        dataloader: DataLoader with evaluation dataset
+        metrics: List of metrics to compute (default: ['map', 'latency'])
+        
+    Returns:
+        Dictionary with evaluation results
+    """
+    from .metrics import compute_evaluation_metrics
+    return compute_evaluation_metrics(model, dataloader, metrics)
+
+def compare_models(fp32_model, int8_model, dataloader, metrics=None):
+    """
+    Compare FP32 and INT8 models performance.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        dataloader: DataLoader with evaluation dataset
+        metrics: List of metrics to compute
+        
+    Returns:
+        Dictionary with comparison results
+    """
+    from .compare_models import compare_fp32_int8_models
+    return compare_fp32_int8_models(fp32_model, int8_model, dataloader, metrics)
+
+def generate_report(evaluation_results, output_path="./evaluation_report"):
+    """
+    Generate comprehensive evaluation report.
+    
+    Args:
+        evaluation_results: Results from evaluate_model or compare_models
+        output_path: Path to save report
+        
+    Returns:
+        Path to generated report
+    """
+    from .visualization import generate_evaluation_report
+    return generate_evaluation_report(evaluation_results, output_path)
+
+def measure_performance(model, input_shape=(1, 3, 640, 640), num_runs=100, device="cuda"):
+    """
+    Measure model inference performance.
+    
+    Args:
+        model: Model to benchmark
+        input_shape: Shape of input tensor
+        num_runs: Number of inference runs
+        device: Device to run on
+        
+    Returns:
+        Dictionary with performance metrics
+    """
+    from .latency_testing import benchmark_model
+    return benchmark_model(model, input_shape, num_runs, device)
+
+// accuracy_drift.py
+# Tracks accuracy changes during quantization
+"""
+Accuracy drift analysis utilities for YOLOv8 QAT evaluation.
+
+This module provides functions for analyzing how quantization affects model accuracy,
+identifying critical layers, and tracking accuracy changes across different classes.
+"""
+
+import torch
+import numpy as np
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+import matplotlib.pyplot as plt
+import os
+from collections import defaultdict
+import pandas as pd
+import seaborn as sns
+from tqdm import tqdm
+import json
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def track_accuracy_change(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    num_classes: int = 10,
+    confidence_threshold: float = 0.5,
+    iou_threshold: float = 0.5,
+    device: str = "cuda"
+) -> Dict[str, Any]:
+    """
+    Track accuracy changes between FP32 and INT8 models.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        dataloader: DataLoader with evaluation dataset
+        num_classes: Number of classes
+        confidence_threshold: Confidence threshold for predictions
+        iou_threshold: IoU threshold for matching predictions to targets
+        device: Device to run evaluation on
+        
+    Returns:
+        Dictionary with accuracy change metrics
+    """
+    # Set models to evaluation mode
+    fp32_model.eval()
+    int8_model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    fp32_model.to(device)
+    int8_model.to(device)
+    
+    # Initialize metrics
+    class_correct_fp32 = np.zeros(num_classes)
+    class_correct_int8 = np.zeros(num_classes)
+    class_total = np.zeros(num_classes)
+    
+    # Initialize confusion matrices
+    fp32_confusion = np.zeros((num_classes, num_classes))
+    int8_confusion = np.zeros((num_classes, num_classes))
+    
+    # Evaluation loop
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Tracking accuracy")):
+            # Process batch
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                images, targets = batch[0], batch[1]
+            else:
+                # For custom dataset formats
+                images, targets = batch['image'], batch['target']
+            
+            # Move to device
+            images = images.to(device)
+            if isinstance(targets, torch.Tensor):
+                targets = targets.to(device)
+            elif isinstance(targets, (tuple, list)):
+                targets = [t.to(device) if isinstance(t, torch.Tensor) else t for t in targets]
+            
+            # Run models
+            fp32_preds = fp32_model(images)
+            int8_preds = int8_model(images)
+            
+            # Process predictions and targets for each image in batch
+            for i in range(len(images)):
+                # Extract predictions and targets for this image
+                fp32_pred = fp32_preds[i] if isinstance(fp32_preds, list) else fp32_preds[i:i+1]
+                int8_pred = int8_preds[i] if isinstance(int8_preds, list) else int8_preds[i:i+1]
+                target = targets[i] if isinstance(targets, list) else targets[i:i+1]
+                
+                # Filter predictions by confidence
+                if hasattr(fp32_pred, 'shape') and fp32_pred.shape[0] > 0 and fp32_pred.shape[1] >= 6:
+                    fp32_pred = fp32_pred[fp32_pred[:, 4] >= confidence_threshold]
+                
+                if hasattr(int8_pred, 'shape') and int8_pred.shape[0] > 0 and int8_pred.shape[1] >= 6:
+                    int8_pred = int8_pred[int8_pred[:, 4] >= confidence_threshold]
+                
+                # Process each ground truth object
+                if hasattr(target, 'shape') and target.shape[0] > 0:
+                    for j in range(target.shape[0]):
+                        gt_class = int(target[j, 0].item())
+                        gt_box = target[j, 1:5] if target.shape[1] >= 5 else None
+                        
+                        # Skip if class is out of range
+                        if gt_class >= num_classes:
+                            continue
+                        
+                        class_total[gt_class] += 1
+                        
+                        # Check FP32 predictions
+                        if hasattr(fp32_pred, 'shape') and fp32_pred.shape[0] > 0 and gt_box is not None:
+                            # Calculate IoU with all predictions
+                            ious = box_iou(gt_box.unsqueeze(0), fp32_pred[:, :4])
+                            
+                            if ious.shape[1] > 0:
+                                # Find best match
+                                best_iou, best_idx = ious.max(1)
+                                
+                                if best_iou >= iou_threshold:
+                                    pred_class = int(fp32_pred[best_idx, 5].item())
+                                    
+                                    # Update confusion matrix
+                                    fp32_confusion[gt_class, pred_class] += 1
+                                    
+                                    # Check if class prediction is correct
+                                    if pred_class == gt_class:
+                                        class_correct_fp32[gt_class] += 1
+                        
+                        # Check INT8 predictions
+                        if hasattr(int8_pred, 'shape') and int8_pred.shape[0] > 0 and gt_box is not None:
+                            # Calculate IoU with all predictions
+                            ious = box_iou(gt_box.unsqueeze(0), int8_pred[:, :4])
+                            
+                            if ious.shape[1] > 0:
+                                # Find best match
+                                best_iou, best_idx = ious.max(1)
+                                
+                                if best_iou >= iou_threshold:
+                                    pred_class = int(int8_pred[best_idx, 5].item())
+                                    
+                                    # Update confusion matrix
+                                    int8_confusion[gt_class, pred_class] += 1
+                                    
+                                    # Check if class prediction is correct
+                                    if pred_class == gt_class:
+                                        class_correct_int8[gt_class] += 1
+    
+    # Calculate class-wise accuracy
+    class_accuracy_fp32 = np.zeros(num_classes)
+    class_accuracy_int8 = np.zeros(num_classes)
+    
+    for i in range(num_classes):
+        if class_total[i] > 0:
+            class_accuracy_fp32[i] = class_correct_fp32[i] / class_total[i]
+            class_accuracy_int8[i] = class_correct_int8[i] / class_total[i]
+    
+    # Calculate overall accuracy
+    overall_accuracy_fp32 = class_correct_fp32.sum() / class_total.sum() if class_total.sum() > 0 else 0
+    overall_accuracy_int8 = class_correct_int8.sum() / class_total.sum() if class_total.sum() > 0 else 0
+    
+    # Calculate absolute and relative changes
+    absolute_change = class_accuracy_int8 - class_accuracy_fp32
+    relative_change = np.zeros(num_classes)
+    
+    for i in range(num_classes):
+        if class_accuracy_fp32[i] > 0:
+            relative_change[i] = absolute_change[i] / class_accuracy_fp32[i]
+    
+    # Calculate normalized confusion matrices
+    fp32_confusion_norm = np.zeros_like(fp32_confusion)
+    int8_confusion_norm = np.zeros_like(int8_confusion)
+    
+    for i in range(num_classes):
+        row_sum = fp32_confusion[i].sum()
+        if row_sum > 0:
+            fp32_confusion_norm[i] = fp32_confusion[i] / row_sum
+        
+        row_sum = int8_confusion[i].sum()
+        if row_sum > 0:
+            int8_confusion_norm[i] = int8_confusion[i] / row_sum
+    
+    # Return results
+    return {
+        'class_accuracy_fp32': class_accuracy_fp32,
+        'class_accuracy_int8': class_accuracy_int8,
+        'class_total': class_total,
+        'overall_accuracy_fp32': overall_accuracy_fp32,
+        'overall_accuracy_int8': overall_accuracy_int8,
+        'absolute_change': absolute_change,
+        'relative_change': relative_change,
+        'fp32_confusion': fp32_confusion,
+        'int8_confusion': int8_confusion,
+        'fp32_confusion_norm': fp32_confusion_norm,
+        'int8_confusion_norm': int8_confusion_norm
+    }
+
+def box_iou(box1, box2):
+    """
+    Calculate IoU between two sets of boxes.
+    
+    Args:
+        box1: First set of boxes (N, 4)
+        box2: Second set of boxes (M, 4)
+        
+    Returns:
+        IoU tensor (N, M)
+    """
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    
+    # Calculate intersection area
+    left_top = torch.max(box1[:, None, :2], box2[:, :2])
+    right_bottom = torch.min(box1[:, None, 2:], box2[:, 2:])
+    wh = (right_bottom - left_top).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    
+    # Calculate union area
+    union = area1[:, None] + area2 - inter
+    
+    # Calculate IoU
+    iou = inter / (union + 1e-6)
+    
+    return iou
+
+def analyze_quantization_impact(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    num_classes: int = 10,
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Analyze the impact of quantization on model accuracy.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        dataloader: DataLoader with evaluation dataset
+        num_classes: Number of classes
+        device: Device to run evaluation on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with impact analysis results
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./quantization_impact"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Track accuracy change
+    accuracy_results = track_accuracy_change(
+        fp32_model=fp32_model,
+        int8_model=int8_model,
+        dataloader=dataloader,
+        num_classes=num_classes,
+        device=device
+    )
+    
+    # Calculate additional metrics
+    overall_absolute_change = accuracy_results['overall_accuracy_int8'] - accuracy_results['overall_accuracy_fp32']
+    overall_relative_change = overall_absolute_change / accuracy_results['overall_accuracy_fp32'] if accuracy_results['overall_accuracy_fp32'] > 0 else 0
+    
+    # Find classes with largest accuracy drop
+    class_changes = [(i, accuracy_results['absolute_change'][i]) for i in range(num_classes)]
+    class_changes.sort(key=lambda x: x[1])  # Sort by change (ascending, so most negative first)
+    
+    most_affected_classes = class_changes[:3]  # Top 3 most negatively affected
+    least_affected_classes = class_changes[-3:]  # Top 3 least affected (or most positively affected)
+    
+    # Prepare results
+    results = {
+        'overall_accuracy_fp32': accuracy_results['overall_accuracy_fp32'],
+        'overall_accuracy_int8': accuracy_results['overall_accuracy_int8'],
+        'overall_absolute_change': overall_absolute_change,
+        'overall_relative_change': overall_relative_change,
+        'class_metrics': {
+            'class_accuracy_fp32': accuracy_results['class_accuracy_fp32'].tolist(),
+            'class_accuracy_int8': accuracy_results['class_accuracy_int8'].tolist(),
+            'class_absolute_change': accuracy_results['absolute_change'].tolist(),
+            'class_relative_change': accuracy_results['relative_change'].tolist(),
+            'class_total': accuracy_results['class_total'].tolist()
+        },
+        'most_affected_classes': most_affected_classes,
+        'least_affected_classes': least_affected_classes
+    }
+    
+    # Export results if requested
+    if export_results:
+        # Export to JSON
+        json_path = os.path.join(output_path, 'quantization_impact.json')
+        
+        # Ensure serializable
+        serializable_results = {
+            'overall_accuracy_fp32': float(results['overall_accuracy_fp32']),
+            'overall_accuracy_int8': float(results['overall_accuracy_int8']),
+            'overall_absolute_change': float(results['overall_absolute_change']),
+            'overall_relative_change': float(results['overall_relative_change']),
+            'class_metrics': {
+                'class_accuracy_fp32': [float(x) for x in results['class_metrics']['class_accuracy_fp32']],
+                'class_accuracy_int8': [float(x) for x in results['class_metrics']['class_accuracy_int8']],
+                'class_absolute_change': [float(x) for x in results['class_metrics']['class_absolute_change']],
+                'class_relative_change': [float(x) for x in results['class_metrics']['class_relative_change']],
+                'class_total': [int(x) for x in results['class_metrics']['class_total']]
+            },
+            'most_affected_classes': [[int(c[0]), float(c[1])] for c in results['most_affected_classes']],
+            'least_affected_classes': [[int(c[0]), float(c[1])] for c in results['least_affected_classes']]
+        }
+        
+        # Save to JSON
+        with open(json_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        logger.info(f"Quantization impact results saved to {json_path}")
+        
+        # Create accuracy comparison plot
+        plt.figure(figsize=(12, 6))
+        
+        # Show side by side bar chart of FP32 vs INT8 accuracy by class
+        classes = list(range(num_classes))
+        fp32_values = accuracy_results['class_accuracy_fp32']
+        int8_values = accuracy_results['class_accuracy_int8']
+        
+        x = np.arange(len(classes))
+        width = 0.35
+        
+        plt.bar(x - width/2, fp32_values, width, label='FP32')
+        plt.bar(x + width/2, int8_values, width, label='INT8')
+        
+        plt.xlabel('Class')
+        plt.ylabel('Accuracy')
+        plt.title('Class-wise Accuracy Comparison')
+        plt.xticks(x, classes)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Save plot
+        accuracy_plot_path = os.path.join(output_path, 'accuracy_comparison.png')
+        plt.savefig(accuracy_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create accuracy change plot
+        plt.figure(figsize=(12, 6))
+        
+        # Plot absolute change
+        plt.bar(x, accuracy_results['absolute_change'], color=['red' if c < 0 else 'green' for c in accuracy_results['absolute_change']])
+        
+        plt.xlabel('Class')
+        plt.ylabel('Absolute Accuracy Change')
+        plt.title('Impact of Quantization on Class Accuracy')
+        plt.xticks(x, classes)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add horizontal line at y=0
+        plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+        
+        # Add annotations for overall change
+        plt.figtext(0.5, 0.01, f'Overall Accuracy Change: {overall_absolute_change:.4f} ({overall_relative_change*100:.2f}%)', 
+                   ha='center', fontsize=12, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # Save plot
+        change_plot_path = os.path.join(output_path, 'accuracy_change.png')
+        plt.savefig(change_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create confusion matrix plots
+        plt.figure(figsize=(12, 10))
+        
+        # Plot FP32 confusion matrix
+        plt.subplot(1, 2, 1)
+        sns.heatmap(accuracy_results['fp32_confusion_norm'], annot=True, fmt='.2f', cmap='Blues')
+        plt.xlabel('Predicted Class')
+        plt.ylabel('True Class')
+        plt.title('FP32 Model Confusion Matrix')
+        
+        # Plot INT8 confusion matrix
+        plt.subplot(1, 2, 2)
+        sns.heatmap(accuracy_results['int8_confusion_norm'], annot=True, fmt='.2f', cmap='Blues')
+        plt.xlabel('Predicted Class')
+        plt.ylabel('True Class')
+        plt.title('INT8 Model Confusion Matrix')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        confusion_plot_path = os.path.join(output_path, 'confusion_matrices.png')
+        plt.savefig(confusion_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def identify_critical_layers(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    layer_patterns: Optional[List[str]] = None,
+    num_classes: int = 10,
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, List[Tuple[str, float]]]:
+    """
+    Identify layers critical for maintaining accuracy after quantization.
+    
+    This function performs a sensitivity analysis by simulating quantization on 
+    individual layers and measuring the impact on accuracy.
+    
+    Args:
+        model: Model to analyze
+        dataloader: DataLoader with evaluation dataset
+        layer_patterns: Optional list of layer name patterns to test
+        num_classes: Number of classes
+        device: Device to run evaluation on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with critical layers and their impact scores
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./critical_layers"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Get baseline accuracy
+    from .metrics import compute_evaluation_metrics
+    
+    baseline_metrics = compute_evaluation_metrics(
+        model=model,
+        dataloader=dataloader,
+        metrics=['accuracy'],
+        device=device
+    )
+    
+    baseline_accuracy = baseline_metrics.get('accuracy', 0)
+    
+    # Find all layers matching patterns
+    if layer_patterns is None:
+        # Default patterns for common layer types
+        layer_patterns = [
+            r'.*\.conv\d+$',
+            r'.*\.bn\d+$',
+            r'.*\.linear$',
+            r'.*\.fc$'
+        ]
+    
+    # Collect layers to test
+    import re
+    layers_to_test = []
+    
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear, nn.BatchNorm2d)):
+            # Check if layer matches any pattern
+            for pattern in layer_patterns:
+                if re.match(pattern, name):
+                    layers_to_test.append((name, module))
+                    break
+    
+    logger.info(f"Found {len(layers_to_test)} layers to test for criticality")
+    
+    # Simulate quantization on each layer and measure accuracy impact
+    layer_impacts = []
+    
+    for name, module in tqdm(layers_to_test, desc="Testing layer criticality"):
+        # Create a temporary copy of the model
+        import copy
+        temp_model = copy.deepcopy(model)
+        
+        # Find corresponding module in the copy
+        modules_dict = dict(temp_model.named_modules())
+        if name in modules_dict:
+            module_copy = modules_dict[name]
+            
+            # Apply simulated quantization to the module
+            _apply_simulated_quantization(module_copy)
+            
+            # Measure accuracy with this layer quantized
+            metrics = compute_evaluation_metrics(
+                model=temp_model,
+                dataloader=dataloader,
+                metrics=['accuracy'],
+                device=device
+            )
+            
+            # Calculate accuracy change
+            quantized_accuracy = metrics.get('accuracy', 0)
+            accuracy_change = baseline_accuracy - quantized_accuracy
+            
+            # Store impact
+            layer_impacts.append((name, accuracy_change))
+            
+            # Clean up
+            del temp_model
+    
+    # Sort layers by impact (higher means more critical)
+    layer_impacts.sort(key=lambda x: x[1], reverse=True)
+    
+    # Categorize layers
+    high_impact = [(name, impact) for name, impact in layer_impacts if impact > 0.05]
+    medium_impact = [(name, impact) for name, impact in layer_impacts if 0.01 <= impact <= 0.05]
+    low_impact = [(name, impact) for name, impact in layer_impacts if impact < 0.01]
+    
+    results = {
+        'high_impact_layers': high_impact,
+        'medium_impact_layers': medium_impact,
+        'low_impact_layers': low_impact,
+        'all_layers': layer_impacts
+    }
+    
+    # Export results if requested
+    if export_results:
+        # Export to CSV
+        csv_path = os.path.join(output_path, 'critical_layers.csv')
+        
+        # Create DataFrame
+        df = pd.DataFrame(layer_impacts, columns=['layer_name', 'accuracy_impact'])
+        df = df.sort_values('accuracy_impact', ascending=False)
+        
+        # Save to CSV
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Critical layer analysis saved to {csv_path}")
+        
+        # Create bar chart of top N most critical layers
+        top_n = min(20, len(layer_impacts))
+        
+        plt.figure(figsize=(12, 8))
+        
+        top_layers = df.head(top_n)
+        plt.barh(top_layers['layer_name'], top_layers['accuracy_impact'])
+        plt.xlabel('Accuracy Impact')
+        plt.title(f'Top {top_n} Most Critical Layers')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        critical_plot_path = os.path.join(output_path, 'critical_layers.png')
+        plt.savefig(critical_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def measure_drift_per_class(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    class_names: Optional[List[str]] = None,
+    confidence_threshold: float = 0.5,
+    num_classes: int = 10,
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Measure accuracy drift per class due to quantization.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        dataloader: DataLoader with evaluation dataset
+        class_names: Optional list of class names
+        confidence_threshold: Confidence threshold for predictions
+        num_classes: Number of classes
+        device: Device to run evaluation on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with per-class drift metrics
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./class_drift"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set models to evaluation mode
+    fp32_model.eval()
+    int8_model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    fp32_model.to(device)
+    int8_model.to(device)
+    
+    # Initialize metrics
+    class_metrics = defaultdict(lambda: {
+        'fp32_correct': 0,
+        'int8_correct': 0,
+        'fp32_predictions': 0,
+        'int8_predictions': 0,
+        'total_instances': 0,
+        'fp32_only_correct': 0,
+        'int8_only_correct': 0,
+        'both_correct': 0,
+        'both_incorrect': 0
+    })
+    
+    # Use default class names if not provided
+    if class_names is None:
+        class_names = [f"Class {i}" for i in range(num_classes)]
+    
+    # Evaluation loop
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Measuring per-class drift")):
+            # Process batch
+            images, targets = None, None
+            
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                images, targets = batch[0], batch[1]
+            elif isinstance(batch, dict) and 'image' in batch and 'target' in batch:
+                images, targets = batch['image'], batch['target']
+            else:
+                raise ValueError(f"Unsupported batch format: {type(batch)}")
+            
+            # Move to device
+            images = images.to(device)
+            if isinstance(targets, torch.Tensor):
+                targets = targets.to(device)
+            elif isinstance(targets, (tuple, list)):
+                targets = [t.to(device) if isinstance(t, torch.Tensor) else t for t in targets]
+            
+            # Run models
+            fp32_preds = fp32_model(images)
+            int8_preds = int8_model(images)
+            
+            # Process each image in batch
+            for i in range(images.shape[0]):
+                # Get predictions and targets for this image
+                fp32_pred = fp32_preds[i] if isinstance(fp32_preds, list) else fp32_preds[i:i+1]
+                int8_pred = int8_preds[i] if isinstance(int8_preds, list) else int8_preds[i:i+1]
+                target = targets[i] if isinstance(targets, list) else targets[i:i+1]
+                
+                # Process each object in the image
+                if hasattr(target, 'shape') and target.shape[0] > 0:
+                    for j in range(target.shape[0]):
+                        gt_class = int(target[j, 0].item())
+                        gt_box = target[j, 1:5] if target.shape[1] >= 5 else None
+                        
+                        # Skip if class is out of range
+                        if gt_class >= num_classes:
+                            continue
+                        
+                        class_name = class_names[gt_class] if gt_class < len(class_names) else f"Class {gt_class}"
+                        class_metrics[class_name]['total_instances'] += 1
+                        
+                        # Check FP32 prediction
+                        fp32_correct = False
+                        if hasattr(fp32_pred, 'shape') and fp32_pred.shape[0] > 0 and gt_box is not None:
+                            # Filter by confidence
+                            conf_mask = fp32_pred[:, 4] >= confidence_threshold
+                            fp32_filtered = fp32_pred[conf_mask]
+                            
+                            class_metrics[class_name]['fp32_predictions'] += len(fp32_filtered)
+                            
+                            if len(fp32_filtered) > 0:
+                                # Calculate IoU with all predictions
+                                ious = box_iou(gt_box.unsqueeze(0), fp32_filtered[:, :4])
+                                
+                                # Find best match
+                                best_iou, best_idx = ious.max(1)
+                                
+                                if best_iou >= 0.5:  # Use fixed IoU threshold
+                                    pred_class = int(fp32_filtered[best_idx, 5].item())
+                                    
+                                    if pred_class == gt_class:
+                                        class_metrics[class_name]['fp32_correct'] += 1
+                                        fp32_correct = True
+                        
+                        # Check INT8 prediction
+                        int8_correct = False
+                        if hasattr(int8_pred, 'shape') and int8_pred.shape[0] > 0 and gt_box is not None:
+                            # Filter by confidence
+                            conf_mask = int8_pred[:, 4] >= confidence_threshold
+                            int8_filtered = int8_pred[conf_mask]
+                            
+                            class_metrics[class_name]['int8_predictions'] += len(int8_filtered)
+                            
+                            if len(int8_filtered) > 0:
+                                # Calculate IoU with all predictions
+                                ious = box_iou(gt_box.unsqueeze(0), int8_filtered[:, :4])
+                                
+                                # Find best match
+                                best_iou, best_idx = ious.max(1)
+                                
+                                if best_iou >= 0.5:  # Use fixed IoU threshold
+                                    pred_class = int(int8_filtered[best_idx, 5].item())
+                                    
+                                    if pred_class == gt_class:
+                                        class_metrics[class_name]['int8_correct'] += 1
+                                        int8_correct = True
+                        
+                        # Update combined metrics
+                        if fp32_correct and int8_correct:
+                            class_metrics[class_name]['both_correct'] += 1
+                        elif fp32_correct and not int8_correct:
+                            class_metrics[class_name]['fp32_only_correct'] += 1
+                        elif not fp32_correct and int8_correct:
+                            class_metrics[class_name]['int8_only_correct'] += 1
+                        else:
+                            class_metrics[class_name]['both_incorrect'] += 1
+    
+    # Calculate derived metrics
+    for class_name, metrics in class_metrics.items():
+        # Calculate accuracy
+        if metrics['total_instances'] > 0:
+            metrics['fp32_accuracy'] = metrics['fp32_correct'] / metrics['total_instances']
+            metrics['int8_accuracy'] = metrics['int8_correct'] / metrics['total_instances']
+            metrics['absolute_change'] = metrics['int8_accuracy'] - metrics['fp32_accuracy']
+            metrics['relative_change'] = metrics['absolute_change'] / metrics['fp32_accuracy'] if metrics['fp32_accuracy'] > 0 else 0
+        else:
+            metrics['fp32_accuracy'] = 0
+            metrics['int8_accuracy'] = 0
+            metrics['absolute_change'] = 0
+            metrics['relative_change'] = 0
+        
+        # Calculate precision
+        if metrics['fp32_predictions'] > 0:
+            metrics['fp32_precision'] = metrics['fp32_correct'] / metrics['fp32_predictions']
+        else:
+            metrics['fp32_precision'] = 0
+            
+        if metrics['int8_predictions'] > 0:
+            metrics['int8_precision'] = metrics['int8_correct'] / metrics['int8_predictions']
+        else:
+            metrics['int8_precision'] = 0
+    
+    # Convert defaultdict to regular dict for better serialization
+    results = {
+        'class_metrics': dict(class_metrics),
+        'class_names': class_names[:num_classes]
+    }
+    
+    # Export results if requested
+    if export_results:
+        # Export to JSON
+        json_path = os.path.join(output_path, 'class_drift.json')
+        
+        # Create serializable version
+        serializable_results = {
+            'class_metrics': {},
+            'class_names': results['class_names']
+        }
+        
+        for class_name, metrics in results['class_metrics'].items():
+            serializable_results['class_metrics'][class_name] = {
+                k: float(v) if isinstance(v, (float, np.float32, np.float64)) else int(v)
+                for k, v in metrics.items()
+            }
+        
+        # Save to JSON
+        with open(json_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        logger.info(f"Class drift results saved to {json_path}")
+        
+        # Create accuracy comparison plot
+        plt.figure(figsize=(14, 8))
+        
+        # Extract data for plotting
+        classes = list(results['class_metrics'].keys())
+        fp32_accuracy = [results['class_metrics'][c]['fp32_accuracy'] for c in classes]
+        int8_accuracy = [results['class_metrics'][c]['int8_accuracy'] for c in classes]
+        
+        # Sort by FP32 accuracy
+        sorted_indices = np.argsort(fp32_accuracy)[::-1]  # Descending order
+        classes = [classes[i] for i in sorted_indices]
+        fp32_accuracy = [fp32_accuracy[i] for i in sorted_indices]
+        int8_accuracy = [int8_accuracy[i] for i in sorted_indices]
+        
+        # Plot
+        x = np.arange(len(classes))
+        width = 0.35
+        
+        plt.bar(x - width/2, fp32_accuracy, width, label='FP32')
+        plt.bar(x + width/2, int8_accuracy, width, label='INT8')
+        
+        plt.xlabel('Class')
+        plt.ylabel('Accuracy')
+        plt.title('Accuracy Comparison by Class')
+        plt.xticks(x, classes, rotation=45, ha='right')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        # Save plot
+        accuracy_plot_path = os.path.join(output_path, 'class_accuracy_comparison.png')
+        plt.savefig(accuracy_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create accuracy change plot
+        plt.figure(figsize=(14, 8))
+        
+        # Extract data for plotting
+        absolute_changes = [results['class_metrics'][c]['absolute_change'] for c in classes]
+        
+        # Plot
+        plt.bar(x, absolute_changes, color=['red' if c < 0 else 'green' for c in absolute_changes])
+        
+        plt.xlabel('Class')
+        plt.ylabel('Absolute Accuracy Change')
+        plt.title('Accuracy Change Due to Quantization')
+        plt.xticks(x, classes, rotation=45, ha='right')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+        plt.tight_layout()
+        
+        # Save plot
+        change_plot_path = os.path.join(output_path, 'class_accuracy_change.png')
+        plt.savefig(change_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create "agreement" plot (both correct, FP32 only, INT8 only, both wrong)
+        plt.figure(figsize=(14, 8))
+        
+        # Extract data for plotting
+        both_correct = [results['class_metrics'][c]['both_correct'] for c in classes]
+        fp32_only = [results['class_metrics'][c]['fp32_only_correct'] for c in classes]
+        int8_only = [results['class_metrics'][c]['int8_only_correct'] for c in classes]
+        both_wrong = [results['class_metrics'][c]['both_incorrect'] for c in classes]
+        
+        # Convert to percentages
+        totals = np.array([results['class_metrics'][c]['total_instances'] for c in classes])
+        
+        # Avoid division by zero
+        totals = np.maximum(totals, 1)
+        
+        both_correct_pct = 100 * np.array(both_correct) / totals
+        fp32_only_pct = 100 * np.array(fp32_only) / totals
+        int8_only_pct = 100 * np.array(int8_only) / totals
+        both_wrong_pct = 100 * np.array(both_wrong) / totals
+        
+        # Create stacked bar chart
+        plt.bar(x, both_correct_pct, label='Both Correct', color='green')
+        plt.bar(x, fp32_only_pct, bottom=both_correct_pct, label='FP32 Only', color='orange')
+        plt.bar(x, int8_only_pct, bottom=both_correct_pct+fp32_only_pct, label='INT8 Only', color='blue')
+        plt.bar(x, both_wrong_pct, bottom=both_correct_pct+fp32_only_pct+int8_only_pct, label='Both Wrong', color='red')
+        
+        plt.xlabel('Class')
+        plt.ylabel('Percentage')
+        plt.title('Model Agreement by Class')
+        plt.xticks(x, classes, rotation=45, ha='right')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        # Save plot
+        agreement_plot_path = os.path.join(output_path, 'model_agreement.png')
+        plt.savefig(agreement_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def plot_accuracy_drift(
+    results: Dict[str, Any],
+    output_path: Optional[str] = None
+) -> Dict[str, str]:
+    """
+    Generate and save plots of accuracy drift.
+    
+    Args:
+        results: Results from analyze_quantization_impact or measure_drift_per_class
+        output_path: Path to save plots
+        
+    Returns:
+        Dictionary mapping plot names to file paths
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./accuracy_plots"
+    
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Initialize paths dictionary
+    plot_paths = {}
+    
+    # Check if results are from analyze_quantization_impact
+    if 'class_metrics' in results and isinstance(results['class_metrics'], dict):
+        # Extract class metrics
+        class_metrics = results['class_metrics']
+        
+        if 'class_accuracy_fp32' in class_metrics and 'class_accuracy_int8' in class_metrics:
+            # Create accuracy comparison plot
+            plt.figure(figsize=(12, 6))
+            
+            # Extract data
+            class_accuracy_fp32 = np.array(class_metrics['class_accuracy_fp32'])
+            class_accuracy_int8 = np.array(class_metrics['class_accuracy_int8'])
+            class_absolute_change = np.array(class_metrics['class_absolute_change'])
+            
+            # Create indices for classes
+            num_classes = len(class_accuracy_fp32)
+            classes = list(range(num_classes))
+            
+            # Create side-by-side bar chart
+            x = np.arange(num_classes)
+            width = 0.35
+            
+            plt.bar(x - width/2, class_accuracy_fp32, width, label='FP32')
+            plt.bar(x + width/2, class_accuracy_int8, width, label='INT8')
+            
+            plt.xlabel('Class')
+            plt.ylabel('Accuracy')
+            plt.title('Class-wise Accuracy Comparison')
+            plt.xticks(x, classes)
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+            
+            # Save plot
+            accuracy_plot_path = os.path.join(output_path, 'accuracy_comparison.png')
+            plt.savefig(accuracy_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            plot_paths['accuracy_comparison'] = accuracy_plot_path
+            
+            # Create accuracy change plot
+            plt.figure(figsize=(12, 6))
+            
+            plt.bar(x, class_absolute_change, color=['red' if c < 0 else 'green' for c in class_absolute_change])
+            
+            plt.xlabel('Class')
+            plt.ylabel('Absolute Accuracy Change')
+            plt.title('Impact of Quantization on Class Accuracy')
+            plt.xticks(x, classes)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+            
+            # Add annotations for overall change
+            overall_absolute_change = results.get('overall_absolute_change', 0)
+            overall_relative_change = results.get('overall_relative_change', 0)
+            
+            plt.figtext(0.5, 0.01, f'Overall Accuracy Change: {overall_absolute_change:.4f} ({overall_relative_change*100:.2f}%)', 
+                       ha='center', fontsize=12, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # Save plot
+            change_plot_path = os.path.join(output_path, 'accuracy_change.png')
+            plt.savefig(change_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            plot_paths['accuracy_change'] = change_plot_path
+    
+    # Check if results are from measure_drift_per_class
+    elif 'class_metrics' in results and isinstance(results['class_metrics'], dict) and 'class_names' in results:
+        # Extract class metrics and names
+        class_metrics = results['class_metrics']
+        class_names = results['class_names']
+        
+        # Create list of classes
+        classes = list(class_metrics.keys())
+        
+        # Extract accuracy values
+        fp32_accuracy = [class_metrics[c]['fp32_accuracy'] for c in classes]
+        int8_accuracy = [class_metrics[c]['int8_accuracy'] for c in classes]
+        absolute_changes = [class_metrics[c]['absolute_change'] for c in classes]
+        
+        # Sort by FP32 accuracy
+        sorted_indices = np.argsort(fp32_accuracy)[::-1]  # Descending order
+        classes = [classes[i] for i in sorted_indices]
+        fp32_accuracy = [fp32_accuracy[i] for i in sorted_indices]
+        int8_accuracy = [int8_accuracy[i] for i in sorted_indices]
+        absolute_changes = [absolute_changes[i] for i in sorted_indices]
+        
+        # Create accuracy comparison plot
+        plt.figure(figsize=(14, 8))
+        
+        x = np.arange(len(classes))
+        width = 0.35
+        
+        plt.bar(x - width/2, fp32_accuracy, width, label='FP32')
+        plt.bar(x + width/2, int8_accuracy, width, label='INT8')
+        
+        plt.xlabel('Class')
+        plt.ylabel('Accuracy')
+        plt.title('Accuracy Comparison by Class')
+        plt.xticks(x, classes, rotation=45, ha='right')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        # Save plot
+        accuracy_plot_path = os.path.join(output_path, 'class_accuracy_comparison.png')
+        plt.savefig(accuracy_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        plot_paths['class_accuracy_comparison'] = accuracy_plot_path
+        
+        # Create accuracy change plot
+        plt.figure(figsize=(14, 8))
+        
+        plt.bar(x, absolute_changes, color=['red' if c < 0 else 'green' for c in absolute_changes])
+        
+        plt.xlabel('Class')
+        plt.ylabel('Absolute Accuracy Change')
+        plt.title('Accuracy Change Due to Quantization')
+        plt.xticks(x, classes, rotation=45, ha='right')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+        plt.tight_layout()
+        
+        # Save plot
+        change_plot_path = os.path.join(output_path, 'class_accuracy_change.png')
+        plt.savefig(change_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        plot_paths['class_accuracy_change'] = change_plot_path
+        
+        # Extract agreement data
+        both_correct = [class_metrics[c]['both_correct'] for c in classes]
+        fp32_only = [class_metrics[c]['fp32_only_correct'] for c in classes]
+        int8_only = [class_metrics[c]['int8_only_correct'] for c in classes]
+        both_wrong = [class_metrics[c]['both_incorrect'] for c in classes]
+        
+        # Convert to percentages
+        totals = np.array([class_metrics[c]['total_instances'] for c in classes])
+        
+        # Avoid division by zero
+        totals = np.maximum(totals, 1)
+        
+        both_correct_pct = 100 * np.array(both_correct) / totals
+        fp32_only_pct = 100 * np.array(fp32_only) / totals
+        int8_only_pct = 100 * np.array(int8_only) / totals
+        both_wrong_pct = 100 * np.array(both_wrong) / totals
+        
+        # Create agreement plot
+        plt.figure(figsize=(14, 8))
+        
+        plt.bar(x, both_correct_pct, label='Both Correct', color='green')
+        plt.bar(x, fp32_only_pct, bottom=both_correct_pct, label='FP32 Only', color='orange')
+        plt.bar(x, int8_only_pct, bottom=both_correct_pct+fp32_only_pct, label='INT8 Only', color='blue')
+        plt.bar(x, both_wrong_pct, bottom=both_correct_pct+fp32_only_pct+int8_only_pct, label='Both Wrong', color='red')
+        
+        plt.xlabel('Class')
+        plt.ylabel('Percentage')
+        plt.title('Model Agreement by Class')
+        plt.xticks(x, classes, rotation=45, ha='right')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        # Save plot
+        agreement_plot_path = os.path.join(output_path, 'model_agreement.png')
+        plt.savefig(agreement_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        plot_paths['model_agreement'] = agreement_plot_path
+    
+    return plot_paths
+
+def _apply_simulated_quantization(module):
+    """
+    Apply simulated int8 quantization to a module.
+    
+    This is a helper function for identify_critical_layers.
+    
+    Args:
+        module: Module to apply simulated quantization to
+    """
+    # Apply simulated 8-bit quantization to weights
+    if hasattr(module, 'weight') and module.weight is not None:
+        # Calculate range
+        w_min = module.weight.min()
+        w_max = module.weight.max()
+        
+        # Calculate scale and zero point
+        scale = (w_max - w_min) / 255
+        zero_point = -128 - w_min / scale
+        
+        # Quantize weights (simulate int8 quantization)
+        w_quant = torch.clamp(torch.round(module.weight / scale + zero_point), -128, 127)
+        
+        # Dequantize (simulate conversion back to float32)
+        w_dequant = (w_quant - zero_point) * scale
+        
+        # Replace weights with quantized-dequantized version
+        module.weight.data = w_dequant
+
+// compare_model.py
+"""
+Utilities for comparing FP32 and INT8 models.
+
+This module provides functions for comparing the performance, accuracy, and 
+outputs of floating-point and quantized models.
+"""
+
+import torch
+import numpy as np
+import time
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+from tqdm import tqdm
+import pandas as pd
+import os
+import json
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def compare_fp32_int8_models(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    metrics: Optional[List[str]] = None,
+    device: str = "cuda",
+    num_samples: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Compare FP32 and INT8 models on various metrics.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        dataloader: DataLoader with evaluation dataset
+        metrics: List of metrics to compute (default: ['accuracy', 'latency', 'output_error'])
+        device: Device to run evaluation on
+        num_samples: Optional number of samples to use for evaluation
+        
+    Returns:
+        Dictionary with comparison results
+    """
+    if metrics is None:
+        metrics = ['accuracy', 'latency', 'output_error']
+    
+    # Set models to evaluation mode
+    fp32_model.eval()
+    int8_model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    fp32_model.to(device)
+    int8_model.to(device)
+    
+    # Initialize results
+    results = {
+        'accuracy_comparison': {},
+        'latency_comparison': {},
+        'output_comparison': {},
+        'layer_comparison': {}
+    }
+    
+    # Storage for predictions and targets
+    fp32_predictions = []
+    int8_predictions = []
+    targets = []
+    
+    # Storage for FP32 and INT8 outputs
+    layer_outputs_fp32 = defaultdict(list)
+    layer_outputs_int8 = defaultdict(list)
+    
+    # Register hooks to collect layer outputs
+    fp32_hooks = []
+    int8_hooks = []
+    
+    if 'layer_outputs' in metrics:
+        # Create hooks to capture layer outputs
+        def create_hook(layer_name, output_dict):
+            def hook(module, input, output):
+                # Store a copy of the output
+                if isinstance(output, torch.Tensor):
+                    output_dict[layer_name].append(output.detach().cpu())
+                elif isinstance(output, tuple) and isinstance(output[0], torch.Tensor):
+                    output_dict[layer_name].append(output[0].detach().cpu())
+            return hook
+        
+        # Register hooks for important layers
+        for name, module in fp32_model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.BatchNorm2d)):
+                fp32_hooks.append(module.register_forward_hook(create_hook(name, layer_outputs_fp32)))
+        
+        for name, module in int8_model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.BatchNorm2d)):
+                int8_hooks.append(module.register_forward_hook(create_hook(name, layer_outputs_int8)))
+    
+    # Track inference times
+    fp32_times = []
+    int8_times = []
+    
+    # Evaluation loop
+    with torch.no_grad():
+        # Limit samples if requested
+        sample_loader = dataloader
+        if num_samples is not None and num_samples < len(dataloader.dataset):
+            indices = torch.randperm(len(dataloader.dataset))[:num_samples]
+            subset = torch.utils.data.Subset(dataloader.dataset, indices)
+            sample_loader = torch.utils.data.DataLoader(
+                subset, batch_size=dataloader.batch_size, 
+                shuffle=False, num_workers=dataloader.num_workers
+            )
+        
+        for batch_idx, batch in enumerate(tqdm(sample_loader, desc="Comparing models")):
+            # Process batch
+            images, target = None, None
+            
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                images, target = batch[0], batch[1]
+            elif isinstance(batch, dict) and 'image' in batch and 'target' in batch:
+                images, target = batch['image'], batch['target']
+            else:
+                raise ValueError(f"Unsupported batch format: {type(batch)}")
+            
+            # Move to device
+            images = images.to(device)
+            if isinstance(target, torch.Tensor):
+                target = target.to(device)
+            elif isinstance(target, (tuple, list)):
+                target = [t.to(device) if isinstance(t, torch.Tensor) else t for t in target]
+            
+            # Store targets
+            targets.append(target)
+            
+            # Run FP32 model
+            start_time = time.time()
+            fp32_output = fp32_model(images)
+            fp32_time = time.time() - start_time
+            fp32_times.append(fp32_time)
+            
+            # Store FP32 predictions
+            fp32_predictions.append(fp32_output)
+            
+            # Run INT8 model
+            start_time = time.time()
+            int8_output = int8_model(images)
+            int8_time = time.time() - start_time
+            int8_times.append(int8_time)
+            
+            # Store INT8 predictions
+            int8_predictions.append(int8_output)
+    
+    # Remove hooks
+    for hook in fp32_hooks:
+        hook.remove()
+    
+    for hook in int8_hooks:
+        hook.remove()
+    
+    # Calculate metrics
+    if 'accuracy' in metrics:
+        # Calculate accuracy metrics using predictions
+        from ..metrics import compute_map, calculate_mean_average_precision
+        
+        # Determine number of classes from dataloader
+        num_classes = dataloader.dataset.num_classes if hasattr(dataloader.dataset, 'num_classes') else 10
+        
+        # Calculate mAP for FP32 model
+        fp32_map = compute_map(fp32_predictions, targets, num_classes)
+        
+        # Calculate mAP for INT8 model
+        int8_map = compute_map(int8_predictions, targets, num_classes)
+        
+        # Calculate accuracy change
+        map50_fp32 = fp32_map.get('mAP@.5', 0)
+        map50_int8 = int8_map.get('mAP@.5', 0)
+        absolute_change = map50_int8 - map50_fp32
+        relative_change = absolute_change / map50_fp32 if map50_fp32 > 0 else 0
+        
+        # Store results
+        results['accuracy_comparison'] = {
+            'fp32_map': fp32_map,
+            'int8_map': int8_map,
+            'fp32_map50': map50_fp32,
+            'int8_map50': map50_int8,
+            'absolute_change': absolute_change,
+            'relative_change': relative_change
+        }
+    
+    if 'latency' in metrics:
+        # Calculate latency metrics
+        fp32_mean_time = np.mean(fp32_times)
+        int8_mean_time = np.mean(int8_times)
+        fp32_fps = 1.0 / fp32_mean_time
+        int8_fps = 1.0 / int8_mean_time
+        speedup = fp32_mean_time / int8_mean_time if int8_mean_time > 0 else 0
+        
+        # Store results
+        results['latency_comparison'] = {
+            'fp32_time': fp32_mean_time,
+            'int8_time': int8_mean_time,
+            'fp32_fps': fp32_fps,
+            'int8_fps': int8_fps,
+            'speedup': speedup,
+            'fp32_times': fp32_times,
+            'int8_times': int8_times
+        }
+    
+    if 'output_error' in metrics:
+        # Calculate output error metrics
+        # Compare outputs from the first batch as example
+        if len(fp32_predictions) > 0 and len(int8_predictions) > 0:
+            if isinstance(fp32_predictions[0], torch.Tensor) and isinstance(int8_predictions[0], torch.Tensor):
+                output_errors = []
+                
+                for fp32_pred, int8_pred in zip(fp32_predictions, int8_predictions):
+                    # Handle different output formats
+                    if isinstance(fp32_pred, (tuple, list)) and isinstance(int8_pred, (tuple, list)):
+                        # Multiple outputs (e.g., boxes, scores, classes)
+                        multi_errors = []
+                        for fp32_out, int8_out in zip(fp32_pred, int8_pred):
+                            if isinstance(fp32_out, torch.Tensor) and isinstance(int8_out, torch.Tensor):
+                                # Calculate error
+                                error = compute_output_error(fp32_out, int8_out)
+                                multi_errors.append(error)
+                        
+                        if multi_errors:
+                            # Average errors across multiple outputs
+                            output_errors.append(np.mean(multi_errors))
+                    elif isinstance(fp32_pred, torch.Tensor) and isinstance(int8_pred, torch.Tensor):
+                        # Single output tensor
+                        error = compute_output_error(fp32_pred, int8_pred)
+                        output_errors.append(error)
+                
+                if output_errors:
+                    # Calculate statistics of errors
+                    mean_error = np.mean(output_errors)
+                    max_error = np.max(output_errors)
+                    std_error = np.std(output_errors)
+                    
+                    # Store results
+                    results['output_comparison'] = {
+                        'mean_error': mean_error,
+                        'max_error': max_error,
+                        'std_error': std_error,
+                        'error_distribution': output_errors
+                    }
+    
+    if 'layer_outputs' in metrics:
+        # Calculate layer-wise differences
+        common_layers = set(layer_outputs_fp32.keys()).intersection(set(layer_outputs_int8.keys()))
+        layer_errors = {}
+        
+        for layer_name in common_layers:
+            # Get outputs
+            fp32_outputs = layer_outputs_fp32[layer_name]
+            int8_outputs = layer_outputs_int8[layer_name]
+            
+            # Calculate errors for each batch
+            errors = []
+            for fp32_out, int8_out in zip(fp32_outputs, int8_outputs):
+                error = compute_output_error(fp32_out, int8_out)
+                errors.append(error)
+            
+            # Calculate statistics
+            mean_error = np.mean(errors) if errors else 0
+            max_error = np.max(errors) if errors else 0
+            
+            # Store results
+            layer_errors[layer_name] = {
+                'mean_error': mean_error,
+                'max_error': max_error
+            }
+        
+        # Store results
+        results['layer_comparison'] = layer_errors
+    
+    return results
+
+def compare_model_outputs(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    device: str = "cuda"
+) -> Dict[str, Any]:
+    """
+    Compare outputs between FP32 and INT8 models for a single input.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        input_tensor: Input tensor
+        device: Device to run inference on
+        
+    Returns:
+        Dictionary with output comparison results
+    """
+    # Set models to evaluation mode
+    fp32_model.eval()
+    int8_model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    fp32_model.to(device)
+    int8_model.to(device)
+    
+    # Move input to device
+    input_tensor = input_tensor.to(device)
+    
+    # Run inference
+    with torch.no_grad():
+        # FP32 model
+        start_time = time.time()
+        fp32_output = fp32_model(input_tensor)
+        fp32_time = time.time() - start_time
+        
+        # INT8 model
+        start_time = time.time()
+        int8_output = int8_model(input_tensor)
+        int8_time = time.time() - start_time
+    
+    # Calculate output error
+    if isinstance(fp32_output, torch.Tensor) and isinstance(int8_output, torch.Tensor):
+        # Single output tensor
+        error = compute_output_error(fp32_output, int8_output)
+    elif isinstance(fp32_output, (tuple, list)) and isinstance(int8_output, (tuple, list)):
+        # Multiple outputs
+        errors = []
+        for fp32_out, int8_out in zip(fp32_output, int8_output):
+            if isinstance(fp32_out, torch.Tensor) and isinstance(int8_out, torch.Tensor):
+                errors.append(compute_output_error(fp32_out, int8_out))
+        
+        error = np.mean(errors) if errors else 0
+    else:
+        error = 0
+    
+    # Return results
+    return {
+        'fp32_output': fp32_output,
+        'int8_output': int8_output,
+        'output_error': error,
+        'fp32_time': fp32_time,
+        'int8_time': int8_time,
+        'speedup': fp32_time / int8_time if int8_time > 0 else 0
+    }
+
+def compute_output_error(
+    fp32_output: torch.Tensor,
+    int8_output: torch.Tensor,
+    error_type: str = "mse"
+) -> float:
+    """
+    Compute error between FP32 and INT8 outputs.
+    
+    Args:
+        fp32_output: Output tensor from FP32 model
+        int8_output: Output tensor from INT8 model
+        error_type: Type of error metric ('mse', 'mae', 'relative')
+        
+    Returns:
+        Error value
+    """
+    # Ensure tensors are on same device and same dtype
+    if fp32_output.device != int8_output.device:
+        int8_output = int8_output.to(fp32_output.device)
+    
+    # Convert to float for consistent comparison
+    fp32_output = fp32_output.float()
+    int8_output = int8_output.float()
+    
+    # Compute error based on type
+    if error_type == "mse":
+        # Mean squared error
+        return torch.mean((fp32_output - int8_output) ** 2).item()
+    elif error_type == "mae":
+        # Mean absolute error
+        return torch.mean(torch.abs(fp32_output - int8_output)).item()
+    elif error_type == "relative":
+        # Relative error
+        abs_diff = torch.abs(fp32_output - int8_output)
+        abs_fp32 = torch.abs(fp32_output) + 1e-8  # Avoid division by zero
+        return torch.mean(abs_diff / abs_fp32).item()
+    else:
+        raise ValueError(f"Unsupported error type: {error_type}")
+
+def compare_layer_outputs(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    layer_names: Optional[List[str]] = None,
+    device: str = "cuda"
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compare outputs of specific layers between FP32 and INT8 models.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        input_tensor: Input tensor
+        layer_names: Optional list of layer names to compare (all if None)
+        device: Device to run inference on
+        
+    Returns:
+        Dictionary mapping layer names to error metrics
+    """
+    # Set models to evaluation mode
+    fp32_model.eval()
+    int8_model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    fp32_model.to(device)
+    int8_model.to(device)
+    
+    # Move input to device
+    input_tensor = input_tensor.to(device)
+    
+    # Storage for layer outputs
+    fp32_outputs = {}
+    int8_outputs = {}
+    
+    # Hooks to capture outputs
+    fp32_hooks = []
+    int8_hooks = []
+    
+    # Create hook function
+    def create_hook(layer_name, output_dict):
+        def hook(module, input, output):
+            # Store output tensor
+            if isinstance(output, torch.Tensor):
+                output_dict[layer_name] = output.detach()
+            elif isinstance(output, tuple) and isinstance(output[0], torch.Tensor):
+                output_dict[layer_name] = output[0].detach()
+        return hook
+    
+    # Register hooks for specified layers
+    if layer_names is None:
+        # Compare all layers
+        for name, module in fp32_model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.BatchNorm2d)):
+                fp32_hooks.append(module.register_forward_hook(create_hook(name, fp32_outputs)))
+        
+        for name, module in int8_model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.BatchNorm2d)):
+                int8_hooks.append(module.register_forward_hook(create_hook(name, int8_outputs)))
+    else:
+        # Compare only specified layers
+        for name, module in fp32_model.named_modules():
+            if name in layer_names:
+                fp32_hooks.append(module.register_forward_hook(create_hook(name, fp32_outputs)))
+        
+        for name, module in int8_model.named_modules():
+            if name in layer_names:
+                int8_hooks.append(module.register_forward_hook(create_hook(name, int8_outputs)))
+    
+    # Run inference
+    with torch.no_grad():
+        fp32_model(input_tensor)
+        int8_model(input_tensor)
+    
+    # Remove hooks
+    for hook in fp32_hooks:
+        hook.remove()
+    
+    for hook in int8_hooks:
+        hook.remove()
+    
+    # Calculate errors for each layer
+    results = {}
+    common_layers = set(fp32_outputs.keys()).intersection(set(int8_outputs.keys()))
+    
+    for layer_name in common_layers:
+        fp32_output = fp32_outputs[layer_name]
+        int8_output = int8_outputs[layer_name]
+        
+        # Calculate errors
+        mse = compute_output_error(fp32_output, int8_output, "mse")
+        mae = compute_output_error(fp32_output, int8_output, "mae")
+        rel_error = compute_output_error(fp32_output, int8_output, "relative")
+        
+        # Store results
+        results[layer_name] = {
+            'mse': mse,
+            'mae': mae,
+            'relative_error': rel_error
+        }
+    
+    return results
+
+def export_comparison_report(
+    comparison_results: Dict[str, Any],
+    output_path: str = "./comparison_report",
+    include_plots: bool = True
+) -> str:
+    """
+    Export comparison results to a report.
+    
+    Args:
+        comparison_results: Results from compare_fp32_int8_models
+        output_path: Path to save the report
+        include_plots: Whether to include plots in the report
+        
+    Returns:
+        Path to the exported report
+    """
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Extract results
+    accuracy_results = comparison_results.get('accuracy_comparison', {})
+    latency_results = comparison_results.get('latency_comparison', {})
+    output_results = comparison_results.get('output_comparison', {})
+    layer_results = comparison_results.get('layer_comparison', {})
+    
+    # Generate plots if requested
+    if include_plots:
+        # Plot accuracy comparison
+        if accuracy_results:
+            # Extract class-wise AP@.5
+            fp32_map = accuracy_results.get('fp32_map', {})
+            int8_map = accuracy_results.get('int8_map', {})
+            
+            # Find class-specific AP values
+            class_aps_fp32 = {}
+            class_aps_int8 = {}
+            
+            for k, v in fp32_map.items():
+                if k.startswith('AP@.5_class'):
+                    class_idx = k.replace('AP@.5_class', '')
+                    class_aps_fp32[f'Class {class_idx}'] = v
+            
+            for k, v in int8_map.items():
+                if k.startswith('AP@.5_class'):
+                    class_idx = k.replace('AP@.5_class', '')
+                    class_aps_int8[f'Class {class_idx}'] = v
+            
+            # Plot class-wise AP comparison
+            if class_aps_fp32 and class_aps_int8:
+                plt.figure(figsize=(12, 6))
+                
+                classes = list(class_aps_fp32.keys())
+                fp32_values = [class_aps_fp32.get(c, 0) for c in classes]
+                int8_values = [class_aps_int8.get(c, 0) for c in classes]
+                
+                x = np.arange(len(classes))
+                width = 0.35
+                
+                plt.bar(x - width/2, fp32_values, width, label='FP32')
+                plt.bar(x + width/2, int8_values, width, label='INT8')
+                
+                plt.xlabel('Class')
+                plt.ylabel('AP@.5')
+                plt.title('AP@.5 Comparison by Class')
+                plt.xticks(x, classes, rotation=45, ha='right')
+                plt.legend()
+                plt.tight_layout()
+                
+                ap_plot_path = os.path.join(output_path, 'ap_comparison.png')
+                plt.savefig(ap_plot_path, dpi=300, bbox_inches='tight')
+                plt.close()
+        
+        # Plot latency comparison
+        if latency_results:
+            fp32_times = latency_results.get('fp32_times', [])
+            int8_times = latency_results.get('int8_times', [])
+            
+            if fp32_times and int8_times:
+                plt.figure(figsize=(12, 6))
+                
+                plt.hist(np.array(fp32_times) * 1000, bins=30, alpha=0.7, label='FP32')
+                plt.hist(np.array(int8_times) * 1000, bins=30, alpha=0.7, label='INT8')
+                
+                plt.xlabel('Inference Time (ms)')
+                plt.ylabel('Frequency')
+                plt.title('Inference Time Distribution')
+                plt.legend()
+                plt.tight_layout()
+                
+                latency_plot_path = os.path.join(output_path, 'latency_comparison.png')
+                plt.savefig(latency_plot_path, dpi=300, bbox_inches='tight')
+                plt.close()
+        
+        # Plot layer error comparison
+        if layer_results:
+            layer_names = list(layer_results.keys())
+            mean_errors = [layer_results[name].get('mean_error', 0) for name in layer_names]
+            
+            # Sort by error magnitude
+            sorted_indices = np.argsort(mean_errors)[::-1]  # Descending order
+            sorted_layers = [layer_names[i] for i in sorted_indices]
+            sorted_errors = [mean_errors[i] for i in sorted_indices]
+            
+            # Plot top N layers with highest error
+            top_n = min(20, len(sorted_layers))
+            
+            plt.figure(figsize=(12, 8))
+            plt.barh(np.arange(top_n), sorted_errors[:top_n], align='center')
+            plt.yticks(np.arange(top_n), [l.split('.')[-1] for l in sorted_layers[:top_n]])
+            plt.xlabel('Mean Error')
+            plt.title('Layer-wise Quantization Error (Top 20)')
+            plt.tight_layout()
+            
+            layer_plot_path = os.path.join(output_path, 'layer_error_comparison.png')
+            plt.savefig(layer_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+    
+    # Create report document
+    report_path = os.path.join(output_path, 'comparison_report.json')
+    
+    # Ensure serializable results
+    serializable_results = {}
+    
+    # Process accuracy results
+    if accuracy_results:
+        serializable_results['accuracy'] = {
+            'fp32_map50': float(accuracy_results.get('fp32_map50', 0)),
+            'int8_map50': float(accuracy_results.get('int8_map50', 0)),
+            'absolute_change': float(accuracy_results.get('absolute_change', 0)),
+            'relative_change': float(accuracy_results.get('relative_change', 0))
+        }
+    
+    # Process latency results
+    if latency_results:
+        serializable_results['latency'] = {
+            'fp32_time_ms': float(latency_results.get('fp32_time', 0) * 1000),
+            'int8_time_ms': float(latency_results.get('int8_time', 0) * 1000),
+            'fp32_fps': float(latency_results.get('fp32_fps', 0)),
+            'int8_fps': float(latency_results.get('int8_fps', 0)),
+            'speedup': float(latency_results.get('speedup', 0))
+        }
+    
+    # Process output error results
+    if output_results:
+        serializable_results['output_error'] = {
+            'mean_error': float(output_results.get('mean_error', 0)),
+            'max_error': float(output_results.get('max_error', 0)),
+            'std_error': float(output_results.get('std_error', 0))
+        }
+    
+    # Process layer comparison results
+    if layer_results:
+        serializable_results['layer_errors'] = {}
+        for layer_name, errors in layer_results.items():
+            serializable_results['layer_errors'][layer_name] = {
+                'mean_error': float(errors.get('mean_error', 0)),
+                'max_error': float(errors.get('max_error', 0))
+            }
+    
+    # Save report
+    with open(report_path, 'w') as f:
+        json.dump(serializable_results, f, indent=2)
+    
+    logger.info(f"Comparison report saved to {report_path}")
+    
+    # Create CSV report for layer errors
+    if layer_results:
+        csv_path = os.path.join(output_path, 'layer_errors.csv')
+        
+        # Convert to DataFrame
+        layer_data = []
+        for layer_name, errors in layer_results.items():
+            layer_data.append({
+                'layer_name': layer_name,
+                'mean_error': errors.get('mean_error', 0),
+                'max_error': errors.get('max_error', 0)
+            })
+        
+        # Create DataFrame and sort by mean error
+        df = pd.DataFrame(layer_data)
+        df = df.sort_values('mean_error', ascending=False)
+        
+        # Save to CSV
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Layer errors saved to {csv_path}")
+    
+    return report_path
+
+// latency_testing.py
+# Measures inference speed
+"""
+Latency testing utilities for YOLOv8 QAT evaluation.
+
+This module provides functions for measuring inference speed and 
+benchmarking models on different hardware.
+"""
+
+import torch
+import numpy as np
+import time
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+from tqdm import tqdm
+import json
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch.nn as nn
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def measure_inference_time(
+    model: torch.nn.Module,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    num_runs: int = 100,
+    warmup_runs: int = 10,
+    device: str = "cuda"
+) -> Dict[str, float]:
+    """
+    Measure inference time of a model.
+    
+    Args:
+        model: Model to benchmark
+        input_shape: Shape of input tensor
+        num_runs: Number of inference runs
+        warmup_runs: Number of warmup runs
+        device: Device to run inference on
+        
+    Returns:
+        Dictionary with inference time statistics
+    """
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Generate random input
+    input_tensor = torch.rand(*input_shape).to(device)
+    
+    # Warm up the GPU if using CUDA
+    logger.info(f"Performing {warmup_runs} warmup runs...")
+    with torch.no_grad():
+        for _ in range(warmup_runs):
+            _ = model(input_tensor)
+    
+    # Measure inference time
+    logger.info(f"Measuring inference time over {num_runs} runs...")
+    times = []
+    
+    with torch.no_grad():
+        for _ in range(num_runs):
+            # Synchronize CUDA operations before timing
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            start_time = time.time()
+            _ = model(input_tensor)
+            
+            # Synchronize CUDA operations after timing
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            end_time = time.time()
+            times.append(end_time - start_time)
+    
+    # Calculate statistics
+    mean_time = np.mean(times)
+    median_time = np.median(times)
+    std_time = np.std(times)
+    min_time = np.min(times)
+    max_time = np.max(times)
+    p95_time = np.percentile(times, 95)
+    
+    # Calculate frames per second
+    fps = 1.0 / mean_time
+    
+    # Return results
+    return {
+        'mean_inference_time': mean_time,
+        'median_inference_time': median_time,
+        'std_inference_time': std_time,
+        'min_inference_time': min_time,
+        'max_inference_time': max_time,
+        'p95_inference_time': p95_time,
+        'fps': fps,
+        'all_times': times
+    }
+
+def benchmark_model(
+    model: torch.nn.Module,
+    input_shape: Union[Tuple[int, ...], List[Tuple[int, ...]]] = (1, 3, 640, 640),
+    num_runs: int = 100,
+    device: str = "cuda",
+    measure_memory: bool = True,
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Benchmark model inference performance.
+    
+    Args:
+        model: Model to benchmark
+        input_shape: Shape of input tensor or list of shapes for benchmarking different sizes
+        num_runs: Number of inference runs
+        device: Device to run inference on
+        measure_memory: Whether to measure memory usage
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with benchmark results
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./benchmark_results"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Initialize results
+    results = {
+        'model_name': model.__class__.__name__,
+        'device': str(device),
+        'input_shapes': [],
+        'latency': [],
+        'throughput': []
+    }
+    
+    # Add model complexity metrics
+    if hasattr(model, 'named_parameters'):
+        num_params = sum(p.numel() for p in model.parameters())
+        results['num_parameters'] = num_params
+    
+    # Add device information
+    if device.type == 'cuda' and torch.cuda.is_available():
+        results['gpu_name'] = torch.cuda.get_device_name(device)
+        results['cuda_version'] = torch.version.cuda
+    
+    # Convert single input shape to list
+    if isinstance(input_shape, tuple):
+        input_shapes = [input_shape]
+    else:
+        input_shapes = input_shape
+    
+    # Benchmark each input shape
+    for shape in input_shapes:
+        # Generate random input
+        input_tensor = torch.rand(*shape).to(device)
+        
+        # Measure inference time
+        latency_results = measure_inference_time(
+            model=model,
+            input_shape=shape,
+            num_runs=num_runs,
+            device=device
+        )
+        
+        # Append results
+        results['input_shapes'].append(shape)
+        results['latency'].append(latency_results)
+        results['throughput'].append(latency_results['fps'])
+    
+    # Measure memory usage if requested
+    if measure_memory:
+        memory_results = {}
+        
+        # Use largest input shape for memory measurement
+        largest_shape = max(input_shapes, key=lambda s: np.prod(s))
+        input_tensor = torch.rand(*largest_shape).to(device)
+        
+        if device.type == 'cuda' and torch.cuda.is_available():
+            # Measure CUDA memory usage
+            torch.cuda.reset_peak_memory_stats(device)
+            
+            # Run inference to measure peak memory
+            with torch.no_grad():
+                _ = model(input_tensor)
+            
+            # Get peak memory usage
+            memory_results['peak_memory_mb'] = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            memory_results['reserved_memory_mb'] = torch.cuda.memory_reserved(device) / (1024 * 1024)
+        
+        # Estimate model size
+        model_size_bytes = 0
+        for param in model.parameters():
+            model_size_bytes += param.nelement() * param.element_size()
+        
+        for buffer in model.buffers():
+            model_size_bytes += buffer.nelement() * buffer.element_size()
+        
+        memory_results['model_size_mb'] = model_size_bytes / (1024 * 1024)
+        
+        # Add memory results
+        results['memory'] = memory_results
+    
+    # Export results if requested
+    if export_results:
+        # Export to JSON
+        json_path = os.path.join(output_path, 'benchmark_results.json')
+        
+        # Create serializable copy
+        serializable_results = {
+            'model_name': results['model_name'],
+            'device': results['device'],
+            'num_parameters': results.get('num_parameters', 0),
+            'gpu_name': results.get('gpu_name', 'N/A'),
+            'cuda_version': results.get('cuda_version', 'N/A'),
+            'input_shapes': [list(shape) for shape in results['input_shapes']],
+            'throughput': results['throughput'],
+            'latency': []
+        }
+        
+        # Process latency results to make them serializable
+        for latency in results['latency']:
+            serializable_latency = {
+                'mean_inference_time': float(latency['mean_inference_time']),
+                'median_inference_time': float(latency['median_inference_time']),
+                'std_inference_time': float(latency['std_inference_time']),
+                'min_inference_time': float(latency['min_inference_time']),
+                'max_inference_time': float(latency['max_inference_time']),
+                'p95_inference_time': float(latency['p95_inference_time']),
+                'fps': float(latency['fps'])
+            }
+            serializable_results['latency'].append(serializable_latency)
+        
+        # Add memory results if available
+        if 'memory' in results:
+            serializable_results['memory'] = {
+                'model_size_mb': float(results['memory'].get('model_size_mb', 0)),
+                'peak_memory_mb': float(results['memory'].get('peak_memory_mb', 0)),
+                'reserved_memory_mb': float(results['memory'].get('reserved_memory_mb', 0))
+            }
+        
+        # Save to JSON
+        with open(json_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        logger.info(f"Benchmark results saved to {json_path}")
+        
+        # Create plots
+        # Latency plot
+        plt.figure(figsize=(10, 6))
+        
+        shape_labels = [f"{shape[0]}x{shape[2]}x{shape[3]}" for shape in results['input_shapes']]
+        mean_times = [lat['mean_inference_time'] * 1000 for lat in results['latency']]  # Convert to ms
+        
+        plt.bar(shape_labels, mean_times)
+        plt.ylabel('Inference Time (ms)')
+        plt.xlabel('Input Shape')
+        plt.title('Inference Time by Input Shape')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        latency_plot_path = os.path.join(output_path, 'latency_plot.png')
+        plt.savefig(latency_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # FPS plot
+        plt.figure(figsize=(10, 6))
+        
+        fps_values = [lat['fps'] for lat in results['latency']]
+        
+        plt.bar(shape_labels, fps_values)
+        plt.ylabel('Frames Per Second (FPS)')
+        plt.xlabel('Input Shape')
+        plt.title('Throughput by Input Shape')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        fps_plot_path = os.path.join(output_path, 'throughput_plot.png')
+        plt.savefig(fps_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def profile_model_layers(
+    model: torch.nn.Module,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Profile execution time of model layers.
+    
+    Args:
+        model: Model to profile
+        input_shape: Shape of input tensor
+        device: Device to run profiling on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with profiling results
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./profile_results"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Generate random input
+    input_tensor = torch.rand(*input_shape).to(device)
+    
+    # Storage for layer times
+    layer_times = {}
+    layer_types = {}
+    
+    # Hooks to measure execution time
+    handles = []
+    
+    def create_hook(name):
+        def hook(module, input, output):
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            start_time = time.time()
+            
+            # Recompute forward pass
+            with torch.no_grad():
+                _ = module(*input)
+            
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            end_time = time.time()
+            
+            # Store execution time
+            if name not in layer_times:
+                layer_times[name] = []
+            
+            layer_times[name].append(end_time - start_time)
+            layer_types[name] = module.__class__.__name__
+        
+        return hook
+    
+    # Register hooks for all modules
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear, nn.BatchNorm2d, nn.MaxPool2d, nn.AvgPool2d)):
+            handles.append(module.register_forward_hook(create_hook(name)))
+    
+    # Run inference multiple times to get more stable measurements
+    num_runs = 10
+    logger.info(f"Profiling model layers over {num_runs} runs...")
+    
+    with torch.no_grad():
+        for _ in range(num_runs):
+            _ = model(input_tensor)
+    
+    # Remove hooks
+    for handle in handles:
+        handle.remove()
+    
+    # Calculate average time for each layer
+    layer_profiles = []
+    
+    for name, times in layer_times.items():
+        avg_time = np.mean(times)
+        total_time = np.sum(times)
+        
+        # Compute parameter count for the layer
+        layer = dict(model.named_modules())[name]
+        num_params = sum(p.numel() for p in layer.parameters())
+        
+        layer_profiles.append({
+            'name': name,
+            'type': layer_types[name],
+            'avg_time': avg_time,
+            'total_time': total_time,
+            'parameters': num_params
+        })
+    
+    # Sort by total execution time
+    layer_profiles.sort(key=lambda x: x['total_time'], reverse=True)
+    
+    # Export results if requested
+    if export_results:
+        # Export to CSV
+        csv_path = os.path.join(output_path, 'layer_profile.csv')
+        
+        # Create DataFrame
+        df = pd.DataFrame(layer_profiles)
+        df['avg_time_ms'] = df['avg_time'] * 1000  # Convert to ms
+        df['total_time_ms'] = df['total_time'] * 1000  # Convert to ms
+        
+        # Save to CSV
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Layer profile saved to {csv_path}")
+        
+        # Create bar chart of top N slowest layers
+        top_n = min(20, len(layer_profiles))
+        
+        plt.figure(figsize=(12, 8))
+        
+        top_layers = df.sort_values('total_time_ms', ascending=False).head(top_n)
+        plt.barh(top_layers['name'], top_layers['total_time_ms'])
+        plt.xlabel('Total Execution Time (ms)')
+        plt.title(f'Top {top_n} Slowest Layers')
+        plt.tight_layout()
+        
+        profile_plot_path = os.path.join(output_path, 'layer_profile_plot.png')
+        plt.savefig(profile_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return {
+        'layer_profiles': layer_profiles,
+        'total_time': sum(profile['total_time'] for profile in layer_profiles)
+    }
+
+def measure_throughput(
+    model: torch.nn.Module,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    batch_sizes: List[int] = [1, 2, 4, 8, 16],
+    device: str = "cuda",
+    duration: float = 5.0,
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, List[Dict[str, float]]]:
+    """
+    Measure model throughput across different batch sizes.
+    
+    Args:
+        model: Model to benchmark
+        input_shape: Shape of input tensor (excluding batch dimension)
+        batch_sizes: List of batch sizes to test
+        device: Device to run benchmarking on
+        duration: Duration in seconds for each batch size test
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with throughput results
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./throughput_results"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Initialize results
+    results = []
+    
+    # Test each batch size
+    for batch_size in batch_sizes:
+        logger.info(f"Measuring throughput with batch size {batch_size}...")
+        
+        # Create input with the current batch size
+        batch_shape = (batch_size,) + input_shape[1:]  # Replace batch dimension
+        input_tensor = torch.rand(*batch_shape).to(device)
+        
+        # Warm up
+        with torch.no_grad():
+            for _ in range(10):
+                _ = model(input_tensor)
+        
+        # Measure throughput
+        num_iterations = 0
+        start_time = time.time()
+        
+        with torch.no_grad():
+            while time.time() - start_time < duration:
+                _ = model(input_tensor)
+                num_iterations += 1
+                
+                # Ensure we don't run indefinitely if something goes wrong
+                if num_iterations > 10000:
+                    break
+        
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        
+        # Calculate throughput
+        samples_per_second = (num_iterations * batch_size) / elapsed_time
+        batches_per_second = num_iterations / elapsed_time
+        
+        # Calculate latency
+        latency_per_batch = elapsed_time / num_iterations
+        latency_per_sample = elapsed_time / (num_iterations * batch_size)
+        
+        # Store results
+        results.append({
+            'batch_size': batch_size,
+            'samples_per_second': samples_per_second,
+            'batches_per_second': batches_per_second,
+            'latency_per_batch': latency_per_batch,
+            'latency_per_sample': latency_per_sample,
+            'iterations': num_iterations
+        })
+    
+    # Export results if requested
+    if export_results:
+        # Export to CSV
+        csv_path = os.path.join(output_path, 'throughput_results.csv')
+        
+        # Create DataFrame
+        df = pd.DataFrame(results)
+        
+        # Add ms versions of latency
+        df['latency_per_batch_ms'] = df['latency_per_batch'] * 1000
+        df['latency_per_sample_ms'] = df['latency_per_sample'] * 1000
+        
+        # Save to CSV
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Throughput results saved to {csv_path}")
+        
+        # Create throughput plot
+        plt.figure(figsize=(12, 6))
+        
+        plt.plot(df['batch_size'], df['samples_per_second'], marker='o', linewidth=2)
+        plt.xlabel('Batch Size')
+        plt.ylabel('Samples per Second')
+        plt.title('Throughput vs Batch Size')
+        plt.grid(True)
+        
+        throughput_plot_path = os.path.join(output_path, 'throughput_plot.png')
+        plt.savefig(throughput_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create latency plot
+        plt.figure(figsize=(12, 6))
+        
+        plt.plot(df['batch_size'], df['latency_per_batch_ms'], marker='o', linewidth=2, label='Per Batch')
+        plt.plot(df['batch_size'], df['latency_per_sample_ms'], marker='s', linewidth=2, label='Per Sample')
+        plt.xlabel('Batch Size')
+        plt.ylabel('Latency (ms)')
+        plt.title('Latency vs Batch Size')
+        plt.legend()
+        plt.grid(True)
+        
+        latency_plot_path = os.path.join(output_path, 'latency_plot.png')
+        plt.savefig(latency_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return {'throughput_results': results}
+
+def export_benchmark_results(
+    results: Dict[str, Any],
+    output_path: str = "./benchmark_results",
+    report_format: str = "markdown"
+) -> str:
+    """
+    Export benchmark results to a report.
+    
+    Args:
+        results: Benchmark results
+        output_path: Path to save report
+        report_format: Format of the report ('markdown', 'html', 'json')
+        
+    Returns:
+        Path to the exported report
+    """
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Initialize report content
+    report_content = ""
+    
+    if report_format == "markdown":
+        # Create Markdown report
+        report_content += "# YOLOv8 Model Benchmark Report\n\n"
+        
+        # Model information
+        report_content += "## Model Information\n\n"
+        report_content += f"- Model name: {results.get('model_name', 'N/A')}\n"
+        report_content += f"- Parameters: {results.get('num_parameters', 0):,}\n"
+        report_content += f"- Device: {results.get('device', 'N/A')}\n"
+        
+        if 'gpu_name' in results:
+            report_content += f"- GPU: {results.get('gpu_name', 'N/A')}\n"
+        
+        report_content += "\n"
+        
+        # Latency results
+        if 'latency' in results and len(results['latency']) > 0:
+            report_content += "## Latency Results\n\n"
+            report_content += "| Input Shape | Mean (ms) | Median (ms) | Min (ms) | Max (ms) | P95 (ms) | FPS |\n"
+            report_content += "|------------|-----------|-------------|---------|---------|---------|-------|\n"
+            
+            for i, shape in enumerate(results.get('input_shapes', [])):
+                latency = results['latency'][i]
+                shape_str = f"{shape[0]}x{shape[2]}x{shape[3]}"
+                
+                report_content += f"| {shape_str} | "
+                report_content += f"{latency['mean_inference_time']*1000:.2f} | "
+                report_content += f"{latency['median_inference_time']*1000:.2f} | "
+                report_content += f"{latency['min_inference_time']*1000:.2f} | "
+                report_content += f"{latency['max_inference_time']*1000:.2f} | "
+                report_content += f"{latency['p95_inference_time']*1000:.2f} | "
+                report_content += f"{latency['fps']:.2f} |\n"
+            
+            report_content += "\n"
+        
+        # Memory usage
+        if 'memory' in results:
+            report_content += "## Memory Usage\n\n"
+            report_content += f"- Model size: {results['memory'].get('model_size_mb', 0):.2f} MB\n"
+            
+            if 'peak_memory_mb' in results['memory']:
+                report_content += f"- Peak GPU memory: {results['memory'].get('peak_memory_mb', 0):.2f} MB\n"
+            
+            if 'reserved_memory_mb' in results['memory']:
+                report_content += f"- Reserved GPU memory: {results['memory'].get('reserved_memory_mb', 0):.2f} MB\n"
+            
+            report_content += "\n"
+        
+        # Throughput results
+        if 'throughput_results' in results:
+            report_content += "## Throughput Results\n\n"
+            report_content += "| Batch Size | Samples/s | Batches/s | Latency/Batch (ms) | Latency/Sample (ms) |\n"
+            report_content += "|------------|-----------|-----------|-------------------|------------------|\n"
+            
+            for result in results['throughput_results']:
+                report_content += f"| {result['batch_size']} | "
+                report_content += f"{result['samples_per_second']:.2f} | "
+                report_content += f"{result['batches_per_second']:.2f} | "
+                report_content += f"{result['latency_per_batch']*1000:.2f} | "
+                report_content += f"{result['latency_per_sample']*1000:.2f} |\n"
+            
+            report_content += "\n"
+        
+        # Layer profiling
+        if 'layer_profiles' in results:
+            report_content += "## Layer Profiling\n\n"
+            report_content += "Top 10 slowest layers:\n\n"
+            report_content += "| Layer | Type | Time (ms) | Parameters |\n"
+            report_content += "|------|------|-----------|------------|\n"
+            
+            # Sort by total time and show top 10
+            sorted_layers = sorted(results['layer_profiles'], key=lambda x: x['total_time'], reverse=True)[:10]
+            
+            for layer in sorted_layers:
+                report_content += f"| {layer['name']} | "
+                report_content += f"{layer['type']} | "
+                report_content += f"{layer['total_time']*1000:.2f} | "
+                report_content += f"{layer['parameters']:,} |\n"
+            
+            report_content += "\n"
+        
+        # Write to file
+        report_path = os.path.join(output_path, "benchmark_report.md")
+        with open(report_path, 'w') as f:
+            f.write(report_content)
+        
+        logger.info(f"Markdown report saved to {report_path}")
+        
+        # Try to convert to HTML if requested
+        if report_format == "html":
+            try:
+                import markdown
+                html_content = markdown.markdown(report_content, extensions=['tables'])
+                
+                html_path = os.path.join(output_path, "benchmark_report.html")
+                with open(html_path, 'w') as f:
+                    f.write(f"<!DOCTYPE html>\n<html>\n<head>\n")
+                    f.write(f"<title>YOLOv8 Model Benchmark Report</title>\n")
+                    f.write(f"<style>\n")
+                    f.write(f"body {{ font-family: Arial, sans-serif; margin: 20px; }}\n")
+                    f.write(f"table {{ border-collapse: collapse; width: 100%; }}\n")
+                    f.write(f"th, td {{ padding: 8px; text-align: left; border: 1px solid #ddd; }}\n")
+                    f.write(f"th {{ background-color: #f2f2f2; }}\n")
+                    f.write(f"</style>\n</head>\n<body>\n")
+                    f.write(html_content)
+                    f.write(f"\n</body>\n</html>")
+                
+                logger.info(f"HTML report saved to {html_path}")
+                return html_path
+            except ImportError:
+                logger.warning("markdown module not found, falling back to markdown report")
+        
+        return report_path
+    
+    elif report_format == "json":
+        # Create JSON report
+        json_path = os.path.join(output_path, "benchmark_report.json")
+        
+        # Save results as JSON
+        with open(json_path, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        
+        logger.info(f"JSON report saved to {json_path}")
+        return json_path
+    
+    else:
+        raise ValueError(f"Unsupported report format: {report_format}")
+
+// memory_profiling.py
+# Analyzes memory usage
+"""
+Memory profiling utilities for YOLOv8 QAT evaluation.
+
+This module provides functions for analyzing model memory usage,
+comparing memory requirements, and profiling activation memory.
+"""
+
+import torch
+import numpy as np
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+import json
+from tqdm import tqdm
+from collections import defaultdict
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def measure_model_size(
+    model: torch.nn.Module,
+    detailed: bool = True
+) -> Dict[str, Any]:
+    """
+    Measure model size in memory.
+    
+    Args:
+        model: Model to measure
+        detailed: Whether to return detailed size breakdown by layer
+        
+    Returns:
+        Dictionary with model size information
+    """
+    # Calculate total size
+    total_size = 0
+    layer_sizes = {}
+    
+    for name, param in model.named_parameters():
+        param_size = param.nelement() * param.element_size()
+        total_size += param_size
+        
+        if detailed:
+            layer_sizes[name] = param_size
+    
+    # Add buffer sizes (e.g., running means and variances in BatchNorm)
+    for name, buffer in model.named_buffers():
+        buffer_size = buffer.nelement() * buffer.element_size()
+        total_size += buffer_size
+        
+        if detailed:
+            layer_sizes[name] = buffer_size
+    
+    # Convert to megabytes
+    total_size_mb = total_size / (1024 * 1024)
+    
+    # Calculate parameter count
+    param_count = sum(p.numel() for p in model.parameters())
+    
+    # Prepare results
+    results = {
+        'size_bytes': total_size,
+        'size_mb': total_size_mb,
+        'param_count': param_count,
+        'param_size_mb': sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024),
+        'buffer_size_mb': sum(b.numel() * b.element_size() for b in model.buffers()) / (1024 * 1024)
+    }
+    
+    if detailed:
+        # Convert byte sizes to MB and sort by size
+        layer_sizes_mb = {name: size / (1024 * 1024) for name, size in layer_sizes.items()}
+        
+        # Group by layer type
+        layer_type_sizes = defaultdict(float)
+        
+        for name, size in layer_sizes_mb.items():
+            # Extract layer type from name
+            parts = name.split('.')
+            layer_type = 'unknown'
+            
+            for part in parts:
+                if any(t in part for t in ['conv', 'bn', 'linear', 'fc']):
+                    layer_type = part
+                    break
+            
+            layer_type_sizes[layer_type] += size
+        
+        results['layer_sizes_mb'] = layer_sizes_mb
+        results['layer_type_sizes_mb'] = dict(layer_type_sizes)
+    
+    return results
+
+def measure_memory_usage(
+    model: torch.nn.Module,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Measure memory usage during model inference.
+    
+    Args:
+        model: Model to measure
+        input_shape: Shape of input tensor
+        device: Device to run measurement on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with memory usage information
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./memory_profile"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Get model size
+    model_size = measure_model_size(model, detailed=True)
+    
+    # Initialize results
+    results = {
+        'model_size_mb': model_size['size_mb'],
+        'param_count': model_size['param_count'],
+        'param_size_mb': model_size['param_size_mb'],
+        'buffer_size_mb': model_size['buffer_size_mb'],
+        'layer_type_sizes_mb': model_size.get('layer_type_sizes_mb', {})
+    }
+    
+    # Measure peak memory usage during inference
+    if device.type == 'cuda' and torch.cuda.is_available():
+        # Reset peak memory stats
+        torch.cuda.reset_peak_memory_stats(device)
+        
+        # Generate random input
+        input_tensor = torch.rand(*input_shape, device=device)
+        
+        # Warmup
+        with torch.no_grad():
+            for _ in range(3):
+                _ = model(input_tensor)
+        
+        # Reset stats after warmup
+        torch.cuda.reset_peak_memory_stats(device)
+        
+        # Run inference and measure peak memory
+        with torch.no_grad():
+            _ = model(input_tensor)
+        
+        # Get peak memory usage
+        peak_memory = torch.cuda.max_memory_allocated(device)
+        reserved_memory = torch.cuda.memory_reserved(device)
+        
+        # Convert to MB
+        peak_memory_mb = peak_memory / (1024 * 1024)
+        reserved_memory_mb = reserved_memory / (1024 * 1024)
+        
+        # Add to results
+        results['peak_memory_mb'] = peak_memory_mb
+        results['reserved_memory_mb'] = reserved_memory_mb
+        results['activation_memory_mb'] = peak_memory_mb - model_size['size_mb']
+    
+    # Export results if requested
+    if export_results:
+        # Export to JSON
+        json_path = os.path.join(output_path, 'memory_usage.json')
+        
+        # Create serializable version
+        serializable_results = {
+            'model_size_mb': float(results['model_size_mb']),
+            'param_count': int(results['param_count']),
+            'param_size_mb': float(results['param_size_mb']),
+            'buffer_size_mb': float(results['buffer_size_mb']),
+        }
+        
+        # Add layer type sizes
+        if 'layer_type_sizes_mb' in results:
+            serializable_results['layer_type_sizes_mb'] = {
+                k: float(v) for k, v in results['layer_type_sizes_mb'].items()
+            }
+        
+        # Add peak memory if available
+        if 'peak_memory_mb' in results:
+            serializable_results['peak_memory_mb'] = float(results['peak_memory_mb'])
+            serializable_results['reserved_memory_mb'] = float(results['reserved_memory_mb'])
+            serializable_results['activation_memory_mb'] = float(results['activation_memory_mb'])
+        
+        # Save to JSON
+        with open(json_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        logger.info(f"Memory usage results saved to {json_path}")
+        
+        # Create bar chart of layer type sizes
+        if 'layer_type_sizes_mb' in results:
+            plt.figure(figsize=(10, 6))
+            
+            layer_types = list(results['layer_type_sizes_mb'].keys())
+            sizes = [results['layer_type_sizes_mb'][t] for t in layer_types]
+            
+            # Sort by size
+            sorted_indices = np.argsort(sizes)[::-1]  # Descending
+            layer_types = [layer_types[i] for i in sorted_indices]
+            sizes = [sizes[i] for i in sorted_indices]
+            
+            plt.bar(layer_types, sizes)
+            plt.xlabel('Layer Type')
+            plt.ylabel('Size (MB)')
+            plt.title('Memory Usage by Layer Type')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            
+            layer_sizes_plot_path = os.path.join(output_path, 'layer_type_sizes.png')
+            plt.savefig(layer_sizes_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # Create pie chart of memory breakdown
+        plt.figure(figsize=(10, 8))
+        
+        labels = ['Parameters', 'Buffers']
+        sizes = [results['param_size_mb'], results['buffer_size_mb']]
+        
+        if 'activation_memory_mb' in results:
+            labels.append('Activations')
+            sizes.append(results['activation_memory_mb'])
+        
+        plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+        plt.axis('equal')
+        plt.title('Memory Usage Breakdown')
+        
+        memory_breakdown_plot_path = os.path.join(output_path, 'memory_breakdown.png')
+        plt.savefig(memory_breakdown_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def profile_activation_memory(
+    model: torch.nn.Module,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Profile activation memory usage for each layer.
+    
+    Args:
+        model: Model to profile
+        input_shape: Shape of input tensor
+        device: Device to run profiling on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with activation memory usage by layer
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./activation_profile"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Storage for output sizes
+    output_sizes = {}
+    
+    # Register hooks to capture output sizes
+    handles = []
+    
+    def output_hook(name):
+        def hook(module, input, output):
+            # Calculate output size
+            if isinstance(output, torch.Tensor):
+                size_bytes = output.nelement() * output.element_size()
+                output_sizes[name] = size_bytes
+            elif isinstance(output, tuple) and isinstance(output[0], torch.Tensor):
+                size_bytes = sum(o.nelement() * o.element_size() for o in output if isinstance(o, torch.Tensor))
+                output_sizes[name] = size_bytes
+        
+        return hook
+    
+    # Register hooks for all modules
+    for name, module in model.named_modules():
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.BatchNorm2d, torch.nn.MaxPool2d)):
+            handles.append(module.register_forward_hook(output_hook(name)))
+    
+    # Generate random input
+    input_tensor = torch.rand(*input_shape, device=device)
+    
+    # Run inference
+    with torch.no_grad():
+        _ = model(input_tensor)
+    
+    # Remove hooks
+    for handle in handles:
+        handle.remove()
+    
+    # Convert to MB and create layer profiles
+    layer_profiles = []
+    
+    for name, size_bytes in output_sizes.items():
+        size_mb = size_bytes / (1024 * 1024)
+        
+        # Get layer type
+        layer_type = 'unknown'
+        for part in name.split('.'):
+            if any(t in part for t in ['conv', 'bn', 'linear', 'fc', 'pool']):
+                layer_type = part
+                break
+        
+        layer_profiles.append({
+            'name': name,
+            'type': layer_type,
+            'activation_size_bytes': size_bytes,
+            'activation_size_mb': size_mb
+        })
+    
+    # Sort by activation size
+    layer_profiles.sort(key=lambda x: x['activation_size_bytes'], reverse=True)
+    
+    # Calculate total activation memory
+    total_activation_bytes = sum(p['activation_size_bytes'] for p in layer_profiles)
+    total_activation_mb = total_activation_bytes / (1024 * 1024)
+    
+    # Prepare results
+    results = {
+        'layer_profiles': layer_profiles,
+        'total_activation_bytes': total_activation_bytes,
+        'total_activation_mb': total_activation_mb
+    }
+    
+    # Export results if requested
+    if export_results:
+        # Export to CSV
+        csv_path = os.path.join(output_path, 'activation_memory.csv')
+        
+        # Create DataFrame
+        df = pd.DataFrame(layer_profiles)
+        df = df.sort_values('activation_size_mb', ascending=False)
+        
+        # Save to CSV
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Activation memory profile saved to {csv_path}")
+        
+        # Create bar chart of top N layers with highest activation memory
+        top_n = min(20, len(layer_profiles))
+        
+        plt.figure(figsize=(12, 8))
+        
+        top_layers = df.head(top_n)
+        plt.barh(top_layers['name'], top_layers['activation_size_mb'])
+        plt.xlabel('Activation Memory (MB)')
+        plt.title(f'Top {top_n} Layers by Activation Memory')
+        plt.tight_layout()
+        
+        activation_plot_path = os.path.join(output_path, 'top_activation_memory.png')
+        plt.savefig(activation_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create pie chart of activation memory by layer type
+        # Group by layer type
+        layer_type_sizes = df.groupby('type')['activation_size_mb'].sum().reset_index()
+        layer_type_sizes = layer_type_sizes.sort_values('activation_size_mb', ascending=False)
+        
+        plt.figure(figsize=(10, 8))
+        
+        plt.pie(layer_type_sizes['activation_size_mb'], labels=layer_type_sizes['type'], 
+                autopct='%1.1f%%', startangle=90)
+        plt.axis('equal')
+        plt.title('Activation Memory by Layer Type')
+        
+        type_plot_path = os.path.join(output_path, 'activation_by_type.png')
+        plt.savefig(type_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def compare_memory_requirements(
+    fp32_model: torch.nn.Module,
+    int8_model: torch.nn.Module,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    device: str = "cuda",
+    export_results: bool = True,
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Compare memory requirements of FP32 and INT8 models.
+    
+    Args:
+        fp32_model: Floating point model
+        int8_model: Quantized model
+        input_shape: Shape of input tensor
+        device: Device to run comparison on
+        export_results: Whether to export results to file
+        output_path: Path to save results
+        
+    Returns:
+        Dictionary with memory requirement comparison
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./memory_comparison"
+    
+    # Create output directory if exporting results
+    if export_results:
+        os.makedirs(output_path, exist_ok=True)
+    
+    # Measure memory usage of FP32 model
+    fp32_memory = measure_memory_usage(
+        model=fp32_model,
+        input_shape=input_shape,
+        device=device,
+        export_results=False
+    )
+    
+    # Measure memory usage of INT8 model
+    int8_memory = measure_memory_usage(
+        model=int8_model,
+        input_shape=input_shape,
+        device=device,
+        export_results=False
+    )
+    
+    # Calculate memory savings
+    model_size_reduction = fp32_memory['model_size_mb'] - int8_memory['model_size_mb']
+    model_size_reduction_percent = 100 * model_size_reduction / fp32_memory['model_size_mb'] if fp32_memory['model_size_mb'] > 0 else 0
+    
+    # Calculate memory savings for activations if available
+    activation_reduction = 0
+    activation_reduction_percent = 0
+    
+    if 'activation_memory_mb' in fp32_memory and 'activation_memory_mb' in int8_memory:
+        activation_reduction = fp32_memory['activation_memory_mb'] - int8_memory['activation_memory_mb']
+        activation_reduction_percent = 100 * activation_reduction / fp32_memory['activation_memory_mb'] if fp32_memory['activation_memory_mb'] > 0 else 0
+    
+    # Calculate total memory savings if peak memory is available
+    total_reduction = 0
+    total_reduction_percent = 0
+    
+    if 'peak_memory_mb' in fp32_memory and 'peak_memory_mb' in int8_memory:
+        total_reduction = fp32_memory['peak_memory_mb'] - int8_memory['peak_memory_mb']
+        total_reduction_percent = 100 * total_reduction / fp32_memory['peak_memory_mb'] if fp32_memory['peak_memory_mb'] > 0 else 0
+    
+    # Prepare results
+    results = {
+        'fp32_model': {
+            'model_size_mb': fp32_memory['model_size_mb'],
+            'param_count': fp32_memory['param_count']
+        },
+        'int8_model': {
+            'model_size_mb': int8_memory['model_size_mb'],
+            'param_count': int8_memory['param_count']
+        },
+        'model_size_reduction_mb': model_size_reduction,
+        'model_size_reduction_percent': model_size_reduction_percent,
+        'compression_ratio': fp32_memory['model_size_mb'] / int8_memory['model_size_mb'] if int8_memory['model_size_mb'] > 0 else 0
+    }
+    
+    # Add activation memory if available
+    if 'activation_memory_mb' in fp32_memory and 'activation_memory_mb' in int8_memory:
+        results['fp32_model']['activation_memory_mb'] = fp32_memory['activation_memory_mb']
+        results['int8_model']['activation_memory_mb'] = int8_memory['activation_memory_mb']
+        results['activation_reduction_mb'] = activation_reduction
+        results['activation_reduction_percent'] = activation_reduction_percent
+    
+    # Add peak memory if available
+    if 'peak_memory_mb' in fp32_memory and 'peak_memory_mb' in int8_memory:
+        results['fp32_model']['peak_memory_mb'] = fp32_memory['peak_memory_mb']
+        results['int8_model']['peak_memory_mb'] = int8_memory['peak_memory_mb']
+        results['total_reduction_mb'] = total_reduction
+        results['total_reduction_percent'] = total_reduction_percent
+    
+    # Export results if requested
+    if export_results:
+        # Export to JSON
+        json_path = os.path.join(output_path, 'memory_comparison.json')
+        
+        # Create serializable version
+        serializable_results = {
+            'fp32_model': {
+                'model_size_mb': float(results['fp32_model']['model_size_mb']),
+                'param_count': int(results['fp32_model']['param_count'])
+            },
+            'int8_model': {
+                'model_size_mb': float(results['int8_model']['model_size_mb']),
+                'param_count': int(results['int8_model']['param_count'])
+            },
+            'model_size_reduction_mb': float(results['model_size_reduction_mb']),
+            'model_size_reduction_percent': float(results['model_size_reduction_percent']),
+            'compression_ratio': float(results['compression_ratio'])
+        }
+        
+        # Add activation memory if available
+        if 'activation_memory_mb' in results['fp32_model'] and 'activation_memory_mb' in results['int8_model']:
+            serializable_results['fp32_model']['activation_memory_mb'] = float(results['fp32_model']['activation_memory_mb'])
+            serializable_results['int8_model']['activation_memory_mb'] = float(results['int8_model']['activation_memory_mb'])
+            serializable_results['activation_reduction_mb'] = float(results['activation_reduction_mb'])
+            serializable_results['activation_reduction_percent'] = float(results['activation_reduction_percent'])
+        
+        # Add peak memory if available
+        if 'peak_memory_mb' in results['fp32_model'] and 'peak_memory_mb' in results['int8_model']:
+            serializable_results['fp32_model']['peak_memory_mb'] = float(results['fp32_model']['peak_memory_mb'])
+            serializable_results['int8_model']['peak_memory_mb'] = float(results['int8_model']['peak_memory_mb'])
+            serializable_results['total_reduction_mb'] = float(results['total_reduction_mb'])
+            serializable_results['total_reduction_percent'] = float(results['total_reduction_percent'])
+        
+        # Save to JSON
+        with open(json_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        logger.info(f"Memory comparison results saved to {json_path}")
+        
+        # Create bar chart comparing model sizes
+        plt.figure(figsize=(10, 6))
+        
+        models = ['FP32', 'INT8']
+        sizes = [results['fp32_model']['model_size_mb'], results['int8_model']['model_size_mb']]
+        
+        plt.bar(models, sizes, color=['blue', 'green'])
+        plt.ylabel('Model Size (MB)')
+        plt.title('Model Size Comparison')
+        
+        # Add text annotations
+        reduction_text = f"Reduction: {model_size_reduction:.2f} MB ({model_size_reduction_percent:.2f}%)"
+        compression_text = f"Compression Ratio: {results['compression_ratio']:.2f}x"
+        
+        plt.figtext(0.5, 0.01, reduction_text + '\n' + compression_text, 
+                   ha='center', fontsize=12, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        model_size_plot_path = os.path.join(output_path, 'model_size_comparison.png')
+        plt.savefig(model_size_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create bar chart comparing peak memory if available
+        if 'peak_memory_mb' in results['fp32_model'] and 'peak_memory_mb' in results['int8_model']:
+            plt.figure(figsize=(10, 6))
+            
+            sizes = [results['fp32_model']['peak_memory_mb'], results['int8_model']['peak_memory_mb']]
+            
+            plt.bar(models, sizes, color=['blue', 'green'])
+            plt.ylabel('Peak Memory Usage (MB)')
+            plt.title('Peak Memory Usage Comparison')
+            
+            # Add text annotations
+            reduction_text = f"Reduction: {total_reduction:.2f} MB ({total_reduction_percent:.2f}%)"
+            
+            plt.figtext(0.5, 0.01, reduction_text, 
+                       ha='center', fontsize=12, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            peak_memory_plot_path = os.path.join(output_path, 'peak_memory_comparison.png')
+            plt.savefig(peak_memory_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # Create stacked bar chart showing memory breakdown
+        plt.figure(figsize=(12, 8))
+        
+        # Prepare data
+        categories = ['Parameters', 'Buffers']
+        fp32_sizes = [
+            results['fp32_model']['param_size_mb'] if 'param_size_mb' in fp32_memory else 0,
+            results['fp32_model']['buffer_size_mb'] if 'buffer_size_mb' in fp32_memory else 0
+        ]
+        
+        int8_sizes = [
+            results['int8_model']['param_size_mb'] if 'param_size_mb' in int8_memory else 0,
+            results['int8_model']['buffer_size_mb'] if 'buffer_size_mb' in int8_memory else 0
+        ]
+        
+        # Add activation memory if available
+        if 'activation_memory_mb' in results['fp32_model'] and 'activation_memory_mb' in results['int8_model']:
+            categories.append('Activations')
+            fp32_sizes.append(results['fp32_model']['activation_memory_mb'])
+            int8_sizes.append(results['int8_model']['activation_memory_mb'])
+        
+        # Create stacked bar chart
+        x = np.arange(len(models))
+        width = 0.35
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        bottom_fp32 = 0
+        bottom_int8 = 0
+        
+        for i, (category, fp32_size, int8_size) in enumerate(zip(categories, fp32_sizes, int8_sizes)):
+            ax.bar(x[0], fp32_size, width, bottom=bottom_fp32, label=f"{category} (FP32)" if i == 0 else None)
+            ax.bar(x[1], int8_size, width, bottom=bottom_int8, label=f"{category} (INT8)" if i == 0 else None)
+            
+            # Update bottom position
+            bottom_fp32 += fp32_size
+            bottom_int8 += int8_size
+        
+        ax.set_ylabel('Memory Usage (MB)')
+        ax.set_title('Memory Usage Breakdown')
+        ax.set_xticks(x)
+        ax.set_xticklabels(models)
+        ax.legend()
+        
+        breakdown_plot_path = os.path.join(output_path, 'memory_breakdown_comparison.png')
+        plt.savefig(breakdown_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results
+
+def export_memory_profile(
+    results: Dict[str, Any],
+    output_path: Optional[str] = None,
+    report_format: str = "markdown"
+) -> str:
+    """
+    Export memory profile results to a report.
+    
+    Args:
+        results: Memory profiling results
+        output_path: Path to save report
+        report_format: Format of the report ('markdown', 'html', 'json')
+        
+    Returns:
+        Path to the exported report
+    """
+    # Set output path
+    if output_path is None:
+        output_path = "./memory_profile"
+    
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Initialize report content
+    report_content = ""
+    
+    if report_format == "markdown":
+        # Create Markdown report
+        report_content += "# Memory Profile Report\n\n"
+        
+        # Check if this is a comparison between FP32 and INT8
+        is_comparison = 'fp32_model' in results and 'int8_model' in results
+        
+        if is_comparison:
+            # Model comparison section
+            report_content += "## Model Comparison\n\n"
+            
+            report_content += "| Metric | FP32 Model | INT8 Model | Reduction | Reduction (%) |\n"
+            report_content += "|--------|-----------|-----------|-----------|---------------|\n"
+            
+            # Model size
+            fp32_size = results['fp32_model'].get('model_size_mb', 0)
+            int8_size = results['int8_model'].get('model_size_mb', 0)
+            size_reduction = results.get('model_size_reduction_mb', fp32_size - int8_size)
+            size_reduction_percent = results.get('model_size_reduction_percent', 0)
+            
+            report_content += f"| Model Size | {fp32_size:.2f} MB | {int8_size:.2f} MB | {size_reduction:.2f} MB | {size_reduction_percent:.2f}% |\n"
+            
+            # Parameter count
+            fp32_params = results['fp32_model'].get('param_count', 0)
+            int8_params = results['int8_model'].get('param_count', 0)
+            
+            report_content += f"| Parameters | {fp32_params:,} | {int8_params:,} | - | - |\n"
+            
+            # Compression ratio
+            compression_ratio = results.get('compression_ratio', 0)
+            report_content += f"| Compression Ratio | - | - | {compression_ratio:.2f}x | - |\n"
+            
+            # Add peak memory if available
+            if 'peak_memory_mb' in results['fp32_model'] and 'peak_memory_mb' in results['int8_model']:
+                fp32_peak = results['fp32_model'].get('peak_memory_mb', 0)
+                int8_peak = results['int8_model'].get('peak_memory_mb', 0)
+                peak_reduction = results.get('total_reduction_mb', fp32_peak - int8_peak)
+                peak_reduction_percent = results.get('total_reduction_percent', 0)
+                
+                report_content += f"| Peak Memory | {fp32_peak:.2f} MB | {int8_peak:.2f} MB | {peak_reduction:.2f} MB | {peak_reduction_percent:.2f}% |\n"
+            
+            # Add activation memory if available
+            if 'activation_memory_mb' in results['fp32_model'] and 'activation_memory_mb' in results['int8_model']:
+                fp32_act = results['fp32_model'].get('activation_memory_mb', 0)
+                int8_act = results['int8_model'].get('activation_memory_mb', 0)
+                act_reduction = results.get('activation_reduction_mb', fp32_act - int8_act)
+                act_reduction_percent = results.get('activation_reduction_percent', 0)
+                
+                report_content += f"| Activation Memory | {fp32_act:.2f} MB | {int8_act:.2f} MB | {act_reduction:.2f} MB | {act_reduction_percent:.2f}% |\n"
+            
+            report_content += "\n"
+            
+            # Add visualization references
+            report_content += "## Visualizations\n\n"
+            report_content += "### Model Size Comparison\n\n"
+            report_content += "![Model Size Comparison](model_size_comparison.png)\n\n"
+            
+            if 'peak_memory_mb' in results['fp32_model'] and 'peak_memory_mb' in results['int8_model']:
+                report_content += "### Peak Memory Usage Comparison\n\n"
+                report_content += "![Peak Memory Usage Comparison](peak_memory_comparison.png)\n\n"
+            
+            report_content += "### Memory Usage Breakdown\n\n"
+            report_content += "![Memory Usage Breakdown](memory_breakdown_comparison.png)\n\n"
+        
+        else:
+            # Single model profile
+            report_content += "## Model Profile\n\n"
+            
+            report_content += "| Metric | Value |\n"
+            report_content += "|--------|-------|\n"
+            
+            # Model size
+            model_size = results.get('model_size_mb', 0)
+            report_content += f"| Model Size | {model_size:.2f} MB |\n"
+            
+            # Parameter count
+            param_count = results.get('param_count', 0)
+            report_content += f"| Parameters | {param_count:,} |\n"
+            
+            # Parameter size
+            param_size = results.get('param_size_mb', 0)
+            report_content += f"| Parameter Size | {param_size:.2f} MB |\n"
+            
+            # Buffer size
+            buffer_size = results.get('buffer_size_mb', 0)
+            report_content += f"| Buffer Size | {buffer_size:.2f} MB |\n"
+            
+            # Add peak memory if available
+            if 'peak_memory_mb' in results:
+                peak_memory = results.get('peak_memory_mb', 0)
+                report_content += f"| Peak Memory | {peak_memory:.2f} MB |\n"
+            
+            # Add activation memory if available
+            if 'activation_memory_mb' in results:
+                activation_memory = results.get('activation_memory_mb', 0)
+                report_content += f"| Activation Memory | {activation_memory:.2f} MB |\n"
+            
+            report_content += "\n"
+            
+            # Add layer type sizes if available
+            if 'layer_type_sizes_mb' in results:
+                report_content += "## Memory Usage by Layer Type\n\n"
+                
+                report_content += "| Layer Type | Size (MB) |\n"
+                report_content += "|-----------|----------|\n"
+                
+                layer_type_sizes = results['layer_type_sizes_mb']
+                for layer_type, size in sorted(layer_type_sizes.items(), key=lambda x: x[1], reverse=True):
+                    report_content += f"| {layer_type} | {size:.2f} |\n"
+                
+                report_content += "\n"
+            
+            # Add visualization references
+            report_content += "## Visualizations\n\n"
+            
+            if 'layer_type_sizes_mb' in results:
+                report_content += "### Memory Usage by Layer Type\n\n"
+                report_content += "![Memory Usage by Layer Type](layer_type_sizes.png)\n\n"
+            
+            report_content += "### Memory Usage Breakdown\n\n"
+            report_content += "![Memory Usage Breakdown](memory_breakdown.png)\n\n"
+            
+            # Add activation profile if available
+            if 'layer_profiles' in results:
+                report_content += "## Top Layers by Activation Memory\n\n"
+                
+                report_content += "| Layer | Type | Activation Size (MB) |\n"
+                report_content += "|-------|------|---------------------|\n"
+                
+                # Sort by activation size and get top 10
+                sorted_profiles = sorted(results['layer_profiles'], key=lambda x: x['activation_size_mb'], reverse=True)
+                top_profiles = sorted_profiles[:10]
+                
+                for profile in top_profiles:
+                    report_content += f"| {profile['name']} | {profile['type']} | {profile['activation_size_mb']:.2f} |\n"
+                
+                report_content += "\n"
+                
+                # Add visualization references
+                report_content += "### Top Layers by Activation Memory\n\n"
+                report_content += "![Top Layers by Activation Memory](top_activation_memory.png)\n\n"
+                
+                report_content += "### Activation Memory by Layer Type\n\n"
+                report_content += "![Activation Memory by Layer Type](activation_by_type.png)\n\n"
+        
+        # Write report to file
+        report_path = os.path.join(output_path, "memory_profile.md")
+        with open(report_path, 'w') as f:
+            f.write(report_content)
+        
+        logger.info(f"Memory profile report saved to {report_path}")
+        
+        # Try to convert to HTML if requested
+        if report_format == "html":
+            try:
+                import markdown
+                html_content = markdown.markdown(report_content, extensions=['tables'])
+                
+                html_path = os.path.join(output_path, "memory_profile.html")
+                with open(html_path, 'w') as f:
+                    f.write(f"<!DOCTYPE html>\n<html>\n<head>\n")
+                    f.write(f"<title>Memory Profile Report</title>\n")
+                    f.write(f"<style>\n")
+                    f.write(f"body {{ font-family: Arial, sans-serif; margin: 20px; }}\n")
+                    f.write(f"table {{ border-collapse: collapse; width: 100%; }}\n")
+                    f.write(f"th, td {{ padding: 8px; text-align: left; border: 1px solid #ddd; }}\n")
+                    f.write(f"th {{ background-color: #f2f2f2; }}\n")
+                    f.write(f"img {{ max-width: 100%; }}\n")
+                    f.write(f"</style>\n</head>\n<body>\n")
+                    f.write(html_content)
+                    f.write(f"\n</body>\n</html>")
+                
+                logger.info(f"HTML report saved to {html_path}")
+                return html_path
+            except ImportError:
+                logger.warning("markdown module not found, falling back to markdown report")
+        
+        return report_path
+    
+    elif report_format == "json":
+        # Create JSON report
+        json_path = os.path.join(output_path, "memory_profile.json")
+        
+        # Save results as JSON
+        with open(json_path, 'w') as f:
+            json.dump(results, f, indent=2, default=lambda x: float(x) if isinstance(x, (np.float32, np.float64)) else x)
+        
+        logger.info(f"JSON report saved to {json_path}")
+        return json_path
+    
+    else:
+        raise ValueError(f"Unsupported report format: {report_format}")
+
+// metrics.py
+"""
+Metrics calculation for YOLOv8 QAT evaluation.
+
+This module provides functions for calculating various performance metrics
+for object detection models, with special focus on quantization effects.
+"""
+
+import torch
+import numpy as np
+from tqdm import tqdm
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+import time
+from collections import defaultdict
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def compute_map(
+    predictions: List[torch.Tensor], 
+    targets: List[torch.Tensor], 
+    num_classes: int,
+    iou_thresholds: List[float] = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+) -> Dict[str, float]:
+    """
+    Compute Mean Average Precision (mAP) for object detection.
+    
+    Args:
+        predictions: List of prediction tensors [batch_size, num_preds, 6] (x1, y1, x2, y2, conf, class_id)
+        targets: List of target tensors [batch_size, num_targets, 5] (class_id, x1, y1, x2, y2)
+        num_classes: Number of classes
+        iou_thresholds: List of IoU thresholds for mAP calculation
+        
+    Returns:
+        Dictionary with mAP values at different IoU thresholds, plus mAP@.5 and mAP@.5:.95
+    """
+    # Initialize accumulators for each class and IoU threshold
+    stats = {}
+    ap_class = []
+    
+    # Process each class
+    for class_id in range(num_classes):
+        # Extract predictions and targets for this class
+        class_preds = [p[p[:, 5] == class_id] for p in predictions]
+        class_targets = [t[t[:, 0] == class_id] for t in targets]
+        
+        # Compute AP for each IoU threshold
+        aps = []
+        for iou_threshold in iou_thresholds:
+            ap = calculate_average_precision(
+                class_preds, class_targets, iou_threshold=iou_threshold
+            )
+            aps.append(ap)
+        
+        # Store results
+        ap_class.append(aps)
+    
+    # Calculate mAP
+    ap_class = np.array(ap_class)
+    
+    # Overall mAP
+    stats["mAP@.5:.95"] = ap_class[:, 0:10].mean()
+    stats["mAP@.5"] = ap_class[:, 0].mean()
+    
+    # Class-wise mAP
+    for i, c in enumerate(range(num_classes)):
+        stats[f"AP@.5_class{c}"] = ap_class[i, 0]
+    
+    return stats
+
+def calculate_average_precision(
+    predictions: List[torch.Tensor],
+    targets: List[torch.Tensor],
+    iou_threshold: float = 0.5
+) -> float:
+    """
+    Calculate Average Precision at a specific IoU threshold.
+    
+    Args:
+        predictions: List of prediction tensors [N, 6] (x1, y1, x2, y2, conf, class_id)
+        targets: List of target tensors [M, 5] (class_id, x1, y1, x2, y2)
+        iou_threshold: IoU threshold for considering a prediction correct
+        
+    Returns:
+        Average precision at the specified IoU threshold
+    """
+    # Combine predictions across all images
+    all_preds = []
+    all_targets = []
+    
+    for batch_idx, (preds, tgts) in enumerate(zip(predictions, targets)):
+        if len(preds) == 0:
+            continue
+            
+        # Add batch index to predictions
+        preds_with_img = torch.cat([torch.full((preds.shape[0], 1), batch_idx, device=preds.device), preds], dim=1)
+        all_preds.append(preds_with_img)
+        
+        # Add batch index to targets
+        tgts_with_img = torch.cat([torch.full((tgts.shape[0], 1), batch_idx, device=tgts.device), tgts], dim=1)
+        all_targets.append(tgts_with_img)
+    
+    if not all_preds:
+        return 0.0
+    
+    # Concatenate all predictions and targets
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0) if all_targets else torch.zeros((0, 6))
+    
+    # Sort predictions by confidence
+    all_preds = all_preds[all_preds[:, 5].argsort(descending=True)]
+    
+    # Calculate precision-recall curve
+    tp = torch.zeros(len(all_preds))
+    fp = torch.zeros(len(all_preds))
+    
+    # Track which targets have been detected
+    target_detected = torch.zeros(len(all_targets))
+    
+    # For each prediction
+    for i, pred in enumerate(all_preds):
+        # Get targets for this image
+        img_idx = pred[0].long()
+        img_targets = all_targets[all_targets[:, 0] == img_idx]
+        
+        if len(img_targets) == 0:
+            fp[i] = 1
+            continue
+        
+        # Calculate IoU with all targets
+        ious = box_iou(pred[1:5].unsqueeze(0), img_targets[:, 2:6])
+        max_iou, max_idx = ious.max(dim=1)
+        
+        # Check if detection is correct
+        if max_iou >= iou_threshold and not target_detected[max_idx]:
+            tp[i] = 1
+            target_detected[max_idx] = 1
+        else:
+            fp[i] = 1
+    
+    # Calculate precision and recall
+    tp_cumsum = torch.cumsum(tp, dim=0)
+    fp_cumsum = torch.cumsum(fp, dim=0)
+    recalls = tp_cumsum / (len(all_targets) + 1e-6)
+    precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)
+    
+    # Add start and end points for PR curve
+    precisions = torch.cat([torch.tensor([1.0]), precisions])
+    recalls = torch.cat([torch.tensor([0.0]), recalls])
+    
+    # Calculate AP using precision-recall curve (area under curve)
+    ap = torch.trapz(precisions, recalls)
+    
+    return ap.item()
+
+def box_iou(box1, box2):
+    """
+    Calculate IoU between two sets of boxes.
+    
+    Args:
+        box1: First set of boxes (N, 4)
+        box2: Second set of boxes (M, 4)
+        
+    Returns:
+        IoU tensor (N, M)
+    """
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    
+    # Calculate intersection area
+    left_top = torch.max(box1[:, None, :2], box2[:, :2])
+    right_bottom = torch.min(box1[:, None, 2:], box2[:, 2:])
+    wh = (right_bottom - left_top).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    
+    # Calculate union area
+    union = area1[:, None] + area2 - inter
+    
+    # Calculate IoU
+    iou = inter / (union + 1e-6)
+    
+    return iou
+
+def compute_precision_recall(
+    predictions: List[torch.Tensor],
+    targets: List[torch.Tensor],
+    num_classes: int,
+    confidence_threshold: float = 0.5,
+    iou_threshold: float = 0.5
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compute precision and recall for each class.
+    
+    Args:
+        predictions: List of prediction tensors [batch_size, num_preds, 6] (x1, y1, x2, y2, conf, class_id)
+        targets: List of target tensors [batch_size, num_targets, 5] (class_id, x1, y1, x2, y2)
+        num_classes: Number of classes
+        confidence_threshold: Confidence threshold for predictions
+        iou_threshold: IoU threshold for matching predictions to targets
+        
+    Returns:
+        Dictionary with precision and recall for each class
+    """
+    results = {}
+    
+    for class_id in range(num_classes):
+        true_positives = 0
+        false_positives = 0
+        false_negatives = 0
+        
+        for batch_idx, (preds, tgts) in enumerate(zip(predictions, targets)):
+            # Filter predictions by confidence and class
+            class_preds = preds[(preds[:, 4] >= confidence_threshold) & (preds[:, 5] == class_id)]
+            
+            # Get targets for this class
+            class_tgts = tgts[tgts[:, 0] == class_id]
+            
+            # Track which targets have been detected
+            detected_tgts = torch.zeros(len(class_tgts))
+            
+            # For each prediction
+            for pred in class_preds:
+                if len(class_tgts) == 0:
+                    false_positives += 1
+                    continue
+                
+                # Calculate IoU with all targets
+                ious = box_iou(pred[:4].unsqueeze(0), class_tgts[:, 1:5])
+                max_iou, max_idx = ious.max(dim=1)
+                
+                # Check if detection is correct
+                if max_iou >= iou_threshold and not detected_tgts[max_idx]:
+                    true_positives += 1
+                    detected_tgts[max_idx] = 1
+                else:
+                    false_positives += 1
+            
+            # Count undetected targets as false negatives
+            false_negatives += (detected_tgts == 0).sum().item()
+        
+        # Calculate precision and recall
+        precision = true_positives / (true_positives + false_positives + 1e-6)
+        recall = true_positives / (true_positives + false_negatives + 1e-6)
+        f1_score = 2 * (precision * recall) / (precision + recall + 1e-6)
+        
+        results[f"class_{class_id}"] = {
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1_score,
+            "true_positives": true_positives,
+            "false_positives": false_positives,
+            "false_negatives": false_negatives
+        }
+    
+    return results
+
+def compute_confusion_matrix(
+    predictions: List[torch.Tensor],
+    targets: List[torch.Tensor],
+    num_classes: int,
+    confidence_threshold: float = 0.5,
+    iou_threshold: float = 0.5
+) -> np.ndarray:
+    """
+    Compute confusion matrix for multi-class object detection.
+    
+    Args:
+        predictions: List of prediction tensors [batch_size, num_preds, 6] (x1, y1, x2, y2, conf, class_id)
+        targets: List of target tensors [batch_size, num_targets, 5] (class_id, x1, y1, x2, y2)
+        num_classes: Number of classes
+        confidence_threshold: Confidence threshold for predictions
+        iou_threshold: IoU threshold for matching predictions to targets
+        
+    Returns:
+        Confusion matrix (num_classes, num_classes)
+    """
+    # Initialize confusion matrix
+    confusion_matrix = np.zeros((num_classes, num_classes))
+    
+    for batch_idx, (preds, tgts) in enumerate(zip(predictions, targets)):
+        # Filter predictions by confidence
+        preds = preds[preds[:, 4] >= confidence_threshold]
+        
+        if len(preds) == 0 or len(tgts) == 0:
+            continue
+        
+        # For each ground truth box
+        for tgt in tgts:
+            tgt_class = int(tgt[0].item())
+            tgt_box = tgt[1:5].unsqueeze(0)
+            
+            # Calculate IoU with all predictions
+            ious = box_iou(tgt_box, preds[:, :4])
+            max_iou, max_idx = ious.max(dim=1)
+            
+            # If IoU is above threshold, add to confusion matrix
+            if max_iou >= iou_threshold:
+                pred_class = int(preds[max_idx, 5].item())
+                confusion_matrix[tgt_class, pred_class] += 1
+            else:
+                # No match found, count as missed detection
+                confusion_matrix[tgt_class, -1] += 1
+    
+    return confusion_matrix
+
+def compute_f1_score(
+    precision: float,
+    recall: float
+) -> float:
+    """
+    Compute F1 score from precision and recall.
+    
+    Args:
+        precision: Precision value
+        recall: Recall value
+        
+    Returns:
+        F1 score
+    """
+    return 2 * (precision * recall) / (precision + recall + 1e-6)
+
+def calculate_accuracy(
+    predictions: List[torch.Tensor],
+    targets: List[torch.Tensor],
+    confidence_threshold: float = 0.5,
+    iou_threshold: float = 0.5
+) -> float:
+    """
+    Calculate accuracy for object detection.
+    
+    Args:
+        predictions: List of prediction tensors
+        targets: List of target tensors
+        confidence_threshold: Confidence threshold for predictions
+        iou_threshold: IoU threshold for matching predictions to targets
+        
+    Returns:
+        Accuracy as a float
+    """
+    total_gt = sum(len(t) for t in targets)
+    if total_gt == 0:
+        return 0.0
+    
+    true_positives = 0
+    
+    for batch_idx, (preds, tgts) in enumerate(zip(predictions, targets)):
+        # Filter predictions by confidence
+        preds = preds[preds[:, 4] >= confidence_threshold]
+        
+        if len(preds) == 0:
+            continue
+        
+        # Track which targets have been detected
+        detected_tgts = torch.zeros(len(tgts))
+        
+        # For each prediction
+        for pred in preds:
+            if len(tgts) == 0:
+                continue
+            
+            pred_class = pred[5].long()
+            pred_box = pred[:4].unsqueeze(0)
+            
+            # Get targets with the same class
+            same_class_tgts = tgts[tgts[:, 0] == pred_class]
+            
+            if len(same_class_tgts) == 0:
+                continue
+            
+            # Calculate IoU with targets of the same class
+            ious = box_iou(pred_box, same_class_tgts[:, 1:5])
+            max_iou, max_idx = ious.max(dim=1)
+            
+            # Check if detection is correct
+            if max_iou >= iou_threshold:
+                # Get global index in all targets
+                global_idx = torch.where(tgts[:, 0] == pred_class)[0][max_idx]
+                
+                if not detected_tgts[global_idx]:
+                    true_positives += 1
+                    detected_tgts[global_idx] = 1
+    
+    # Calculate accuracy
+    accuracy = true_positives / total_gt
+    
+    return accuracy
+
+def calculate_mean_average_precision(
+    predictions: List[torch.Tensor],
+    targets: List[torch.Tensor],
+    num_classes: int
+) -> float:
+    """
+    Calculate mean Average Precision (mAP) for object detection.
+    
+    Args:
+        predictions: List of prediction tensors
+        targets: List of target tensors
+        num_classes: Number of classes
+        
+    Returns:
+        mAP as a float
+    """
+    # Calculate mAP using compute_map function
+    map_results = compute_map(predictions, targets, num_classes)
+    
+    return map_results["mAP@.5:.95"]
+
+def compute_evaluation_metrics(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    metrics: Optional[List[str]] = None,
+    device: str = "cuda"
+) -> Dict[str, Any]:
+    """
+    Compute evaluation metrics for a model on a given dataloader.
+    
+    Args:
+        model: Model to evaluate
+        dataloader: DataLoader with evaluation dataset
+        metrics: List of metrics to compute (default: ['map', 'latency'])
+        device: Device to run evaluation on
+        
+    Returns:
+        Dictionary with evaluation results
+    """
+    if metrics is None:
+        metrics = ['map', 'latency']
+    
+    # Set model to evaluation mode
+    model.eval()
+    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model.to(device)
+    
+    # Initialize results
+    results = {}
+    
+    # Initialize lists for storing predictions and targets
+    all_predictions = []
+    all_targets = []
+    
+    # Track inference time
+    inference_times = []
+    
+    # Evaluation loop
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
+            # Process batch
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                images, targets = batch[0], batch[1]
+            else:
+                # For custom dataset formats
+                images, targets = batch['image'], batch['target']
+            
+            # Move to device
+            images = images.to(device)
+            targets = [t.to(device) for t in targets] if isinstance(targets, list) else targets.to(device)
+            
+            # Measure inference time
+            start_time = time.time()
+            predictions = model(images)
+            end_time = time.time()
+            inference_times.append(end_time - start_time)
+            
+            # Store predictions and targets
+            all_predictions.append(predictions)
+            all_targets.append(targets)
+    
+    # Calculate requested metrics
+    num_classes = dataloader.dataset.num_classes if hasattr(dataloader.dataset, 'num_classes') else 10
+    
+    if 'map' in metrics:
+        # Calculate mAP
+        results['mAP'] = compute_map(all_predictions, all_targets, num_classes)
+    
+    if 'precision_recall' in metrics:
+        # Calculate precision and recall
+        results['precision_recall'] = compute_precision_recall(all_predictions, all_targets, num_classes)
+    
+    if 'confusion_matrix' in metrics:
+        # Calculate confusion matrix
+        results['confusion_matrix'] = compute_confusion_matrix(all_predictions, all_targets, num_classes)
+    
+    if 'accuracy' in metrics:
+        # Calculate accuracy
+        results['accuracy'] = calculate_accuracy(all_predictions, all_targets)
+    
+    if 'latency' in metrics:
+        # Calculate latency
+        results['latency'] = {
+            'mean_inference_time': np.mean(inference_times),
+            'median_inference_time': np.median(inference_times),
+            'std_inference_time': np.std(inference_times),
+            'min_inference_time': np.min(inference_times),
+            'max_inference_time': np.max(inference_times),
+            'fps': 1.0 / np.mean(inference_times)
+        }
+    
+    return results
+
+def preprocess_yolo_predictions(
+    predictions: List[torch.Tensor]
+) -> List[torch.Tensor]:
+    """
+    Preprocess YOLOv8 predictions to standardized format.
+    
+    Args:
+        predictions: Raw YOLOv8 predictions
+        
+    Returns:
+        Processed predictions in format [batch_size, num_preds, 6] (x1, y1, x2, y2, conf, class_id)
+    """
+    processed = []
+    
+    for pred in predictions:
+        if isinstance(pred, (list, tuple)):
+            # Handle different YOLOv8 output formats
+            if len(pred) == 2:  # YOLOv8 format: [boxes, scores]
+                boxes, scores = pred
+                processed_pred = torch.cat([boxes, scores.unsqueeze(-1)], dim=-1)
+            elif len(pred) == 3:  # YOLOv8 format: [boxes, scores, class_ids]
+                boxes, scores, class_ids = pred
+                processed_pred = torch.cat([boxes, scores.unsqueeze(-1), class_ids.unsqueeze(-1)], dim=-1)
+            else:
+                processed_pred = pred
+        else:
+            # Already in correct format
+            processed_pred = pred
+        
+        processed.append(processed_pred)
+    
+    return processed
+
+def preprocess_yolo_targets(
+    targets: List[torch.Tensor]
+) -> List[torch.Tensor]:
+    """
+    Preprocess YOLOv8 targets to standardized format.
+    
+    Args:
+        targets: Raw YOLOv8 targets
+        
+    Returns:
+        Processed targets in format [batch_size, num_targets, 5] (class_id, x1, y1, x2, y2)
+    """
+    processed = []
+    
+    for tgt in targets:
+        if isinstance(tgt, dict):
+            # Handle different YOLOv8 target formats
+            if 'boxes' in tgt and 'labels' in tgt:
+                boxes = tgt['boxes']
+                labels = tgt['labels']
+                processed_tgt = torch.cat([labels.unsqueeze(-1), boxes], dim=-1)
+            else:
+                processed_tgt = tgt
+        else:
+            # Already in correct format
+            processed_tgt = tgt
+        
+        processed.append(processed_tgt)
+    
+    return processed
+
+// visualization.py
+"""
+Results visualization utilities for YOLOv8 QAT evaluation.
+
+This module provides functions for visualizing evaluation results,
+including detection visualization, plots for precision-recall curves,
+confusion matrices, and activation distributions.
+"""
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.colors import LinearSegmentedColormap
+import seaborn as sns
+import os
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+from PIL import Image, ImageDraw, ImageFont
+import io
+import cv2
+from pathlib import Path
+import time
+import json
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def plot_precision_recall_curve(
+    precisions: List[float],
+    recalls: List[float],
+    classes: Optional[List[str]] = None,
+    title: str = "Precision-Recall Curve",
+    output_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Plot precision-recall curve.
+    
+    Args:
+        precisions: List of precision values
+        recalls: List of recall values
+        classes: Optional list of class names
+        title: Plot title
+        output_path: Optional path to save the plot
+        
+    Returns:
+        Matplotlib figure
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    if classes is None:
+        # Single PR curve
+        ax.plot(recalls, precisions, marker='o', markersize=3, linewidth=2)
+        
+        # Calculate AP as area under curve
+        ap = np.trapz(precisions, recalls)
+        ax.set_title(f"{title} (AP: {ap:.4f})")
+    else:
+        # Multiple PR curves, one per class
+        for i, (prec, rec) in enumerate(zip(precisions, recalls)):
+            class_name = classes[i] if i < len(classes) else f"Class {i}"
+            ax.plot(rec, prec, marker='o', markersize=3, linewidth=2, label=class_name)
+            
+        ax.set_title(title)
+        ax.legend(loc="best")
+    
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    ax.grid(True, linestyle='--', alpha=0.7)
+    
+    fig.tight_layout()
+    
+    # Save figure if output path is provided
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    
+    return fig
+
+def plot_confusion_matrix(
+    confusion_matrix: np.ndarray,
+    classes: Optional[List[str]] = None,
+    normalize: bool = True,
+    title: str = "Confusion Matrix",
+    output_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Plot confusion matrix.
+    
+    Args:
+        confusion_matrix: Confusion matrix as numpy array
+        classes: Optional list of class names
+        normalize: Whether to normalize the confusion matrix
+        title: Plot title
+        output_path: Optional path to save the plot
+        
+    Returns:
+        Matplotlib figure
+    """
+    if normalize:
+        # Normalize confusion matrix
+        row_sums = confusion_matrix.sum(axis=1)
+        confusion_matrix = confusion_matrix / row_sums[:, np.newaxis]
+        confusion_matrix = np.nan_to_num(confusion_matrix)  # Replace NaNs with zeros
+    
+    # Create colormap
+    cmap = LinearSegmentedColormap.from_list("custom_cmap", ["white", "#4363d8", "#3cb44b"], N=256)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Plot confusion matrix
+    im = ax.imshow(confusion_matrix, interpolation='nearest', cmap=cmap)
+    
+    # Add colorbar
+    cbar = ax.figure.colorbar(im, ax=ax)
+    cbar.ax.set_ylabel("Normalized frequency" if normalize else "Count", rotation=-90, va="bottom")
+    
+    # Set labels
+    num_classes = confusion_matrix.shape[0]
+    if classes is None:
+        classes = [f"Class {i}" for i in range(num_classes)]
+    
+    # Add labels and ticks
+    tick_marks = np.arange(num_classes)
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(classes, rotation=45, ha="right")
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(classes)
+    
+    # Add text annotations inside cells
+    thresh = confusion_matrix.max() / 2.0
+    for i in range(num_classes):
+        for j in range(num_classes):
+            ax.text(j, i, f"{confusion_matrix[i, j]:.2f}" if normalize else f"{int(confusion_matrix[i, j])}",
+                    ha="center", va="center", 
+                    color="white" if confusion_matrix[i, j] > thresh else "black")
+    
+    # Add labels and title
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+    ax.set_title(title)
+    
+    fig.tight_layout()
+    
+    # Save figure if output path is provided
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    
+    return fig
+
+def visualize_detections(
+    image: Union[np.ndarray, torch.Tensor, str],
+    predictions: Union[np.ndarray, torch.Tensor],
+    class_names: Optional[List[str]] = None,
+    confidence_threshold: float = 0.5,
+    color_mapping: Optional[Dict[int, Tuple[int, int, int]]] = None,
+    title: str = "Detection Results",
+    output_path: Optional[str] = None,
+    show_scores: bool = True
+) -> np.ndarray:
+    """
+    Visualize object detection results on an image.
+    
+    Args:
+        image: Input image as numpy array, tensor, or path to image file
+        predictions: Prediction tensor [num_preds, 6] (x1, y1, x2, y2, conf, class_id)
+        class_names: Optional list of class names
+        confidence_threshold: Confidence threshold for visualizing predictions
+        color_mapping: Optional mapping from class indices to BGR colors
+        title: Plot title
+        output_path: Optional path to save the visualization
+        show_scores: Whether to show confidence scores
+        
+    Returns:
+        Visualization as numpy array (BGR format)
+    """
+    # Load image if it's a path
+    if isinstance(image, str):
+        image = cv2.imread(image)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Convert tensor to numpy array
+    if isinstance(image, torch.Tensor):
+        image = image.cpu().numpy()
+        
+        # Handle different tensor formats
+        if image.ndim == 4:  # batch, channels, height, width
+            image = image[0]  # Take first image in batch
+        
+        if image.shape[0] == 3:  # channels, height, width
+            image = np.transpose(image, (1, 2, 0))  # -> height, width, channels
+        
+        # Normalize if needed
+        if image.max() <= 1.0:
+            image = (image * 255).astype(np.uint8)
+        else:
+            image = image.astype(np.uint8)
+    
+    # Make a copy to avoid modifying original
+    vis_image = image.copy()
+    
+    # Convert predictions to numpy array
+    if isinstance(predictions, torch.Tensor):
+        predictions = predictions.cpu().numpy()
+    
+    # Filter predictions by confidence
+    if predictions.shape[1] >= 6:  # x1, y1, x2, y2, conf, class
+        predictions = predictions[predictions[:, 4] >= confidence_threshold]
+    
+    # Create default color mapping if not provided
+    if color_mapping is None:
+        # Generate distinct colors
+        num_classes = len(np.unique(predictions[:, 5])) if len(predictions) > 0 else 10
+        color_mapping = {}
+        for i in range(num_classes):
+            # HSV color space for more distinct colors
+            hue = i / num_classes
+            rgb = plt.cm.hsv(hue)[:3]  # Convert HSV to RGB
+            bgr = (int(rgb[2] * 255), int(rgb[1] * 255), int(rgb[0] * 255))  # Convert RGB to BGR
+            color_mapping[i] = bgr
+    
+    # Default class names if not provided
+    if class_names is None:
+        max_class = int(max(predictions[:, 5])) if len(predictions) > 0 else 9
+        class_names = [f"Class {i}" for i in range(max_class + 1)]
+    
+    # Draw predictions
+    for pred in predictions:
+        x1, y1, x2, y2 = int(pred[0]), int(pred[1]), int(pred[2]), int(pred[3])
+        conf = pred[4]
+        class_id = int(pred[5])
+        
+        # Get color and class name
+        color = color_mapping.get(class_id, (0, 255, 0))  # Default to green
+        class_name = class_names[class_id] if class_id < len(class_names) else f"Class {class_id}"
+        
+        # Draw bounding box
+        cv2.rectangle(vis_image, (x1, y1), (x2, y2), color, 2)
+        
+        # Draw label background
+        label = f"{class_name} {conf:.2f}" if show_scores else class_name
+        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(vis_image, (x1, y1 - text_height - 4), (x1 + text_width, y1), color, -1)
+        
+        # Draw label text
+        cv2.putText(vis_image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    # Add title
+    (title_width, title_height), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    title_x = (vis_image.shape[1] - title_width) // 2
+    cv2.putText(vis_image, title, (title_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+    
+    # Save visualization if output path is provided
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        cv2.imwrite(output_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+    
+    return vis_image
+
+def visualize_activation_distributions(
+    fp32_activations: Dict[str, torch.Tensor],
+    int8_activations: Dict[str, torch.Tensor],
+    layers_to_plot: Optional[List[str]] = None,
+    num_bins: int = 100,
+    title: str = "Activation Distributions",
+    output_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Visualize and compare activation distributions between FP32 and INT8 models.
+    
+    Args:
+        fp32_activations: Dictionary mapping layer names to FP32 activations
+        int8_activations: Dictionary mapping layer names to INT8 activations
+        layers_to_plot: Optional list of layer names to plot (plots all if None)
+        num_bins: Number of histogram bins
+        title: Plot title
+        output_path: Optional path to save the visualization
+        
+    Returns:
+        Matplotlib figure
+    """
+    # Select layers to plot
+    if layers_to_plot is None:
+        # Plot common layers
+        common_layers = set(fp32_activations.keys()).intersection(set(int8_activations.keys()))
+        layers_to_plot = list(common_layers)
+        
+        # Limit to at most 9 layers for readability
+        if len(layers_to_plot) > 9:
+            layers_to_plot = layers_to_plot[:9]
+    
+    # Determine subplot grid size
+    n = len(layers_to_plot)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+    
+    # Create figure
+    fig, axes = plt.subplots(nrows, ncols, figsize=(15, 4 * nrows))
+    
+    # Flatten axes for easier indexing
+    if nrows == 1 and ncols == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+    
+    # Plot activations for each layer
+    for i, layer_name in enumerate(layers_to_plot):
+        ax = axes[i]
+        
+        if layer_name in fp32_activations and layer_name in int8_activations:
+            # Get activations
+            fp32_act = fp32_activations[layer_name].flatten().cpu().numpy()
+            int8_act = int8_activations[layer_name].flatten().cpu().numpy()
+            
+            # Plot histograms
+            ax.hist(fp32_act, bins=num_bins, alpha=0.7, label="FP32", color="blue")
+            ax.hist(int8_act, bins=num_bins, alpha=0.7, label="INT8", color="red")
+            
+            # Add legend and labels
+            ax.legend()
+            ax.set_title(layer_name)
+            ax.set_xlabel("Activation Value")
+            ax.set_ylabel("Frequency")
+            
+            # Add statistics
+            fp32_mean = np.mean(fp32_act)
+            fp32_std = np.std(fp32_act)
+            int8_mean = np.mean(int8_act)
+            int8_std = np.std(int8_act)
+            
+            stats_text = f"FP32: μ={fp32_mean:.4f}, σ={fp32_std:.4f}\nINT8: μ={int8_mean:.4f}, σ={int8_std:.4f}"
+            ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, 
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # Hide unused subplots
+    for i in range(len(layers_to_plot), len(axes)):
+        fig.delaxes(axes[i])
+    
+    # Add overall title
+    fig.suptitle(title, fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust for suptitle
+    
+    # Save figure if output path is provided
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    
+    return fig
+
+def compare_detection_results(
+    image: Union[np.ndarray, torch.Tensor, str],
+    fp32_predictions: Union[np.ndarray, torch.Tensor],
+    int8_predictions: Union[np.ndarray, torch.Tensor],
+    class_names: Optional[List[str]] = None,
+    confidence_threshold: float = 0.5,
+    title: str = "FP32 vs INT8 Detection Comparison",
+    output_path: Optional[str] = None
+) -> np.ndarray:
+    """
+    Compare detection results between FP32 and INT8 models.
+    
+    Args:
+        image: Input image as numpy array, tensor, or path to image file
+        fp32_predictions: Prediction tensor from FP32 model
+        int8_predictions: Prediction tensor from INT8 model
+        class_names: Optional list of class names
+        confidence_threshold: Confidence threshold for visualizing predictions
+        title: Plot title
+        output_path: Optional path to save the visualization
+        
+    Returns:
+        Visualization as numpy array (BGR format)
+    """
+    # Visualize FP32 detections
+    fp32_vis = visualize_detections(
+        image=image,
+        predictions=fp32_predictions,
+        class_names=class_names,
+        confidence_threshold=confidence_threshold,
+        title="FP32 Model",
+        show_scores=True,
+    )
+    
+    # Visualize INT8 detections
+    int8_vis = visualize_detections(
+        image=image,
+        predictions=int8_predictions,
+        class_names=class_names,
+        confidence_threshold=confidence_threshold,
+        title="INT8 Model",
+        show_scores=True,
+    )
+    
+    # Create comparison image
+    height, width = fp32_vis.shape[:2]
+    comparison = np.zeros((height, width * 2, 3), dtype=np.uint8)
+    
+    # Add visualizations side by side
+    comparison[:, :width] = fp32_vis
+    comparison[:, width:] = int8_vis
+    
+    # Add dividing line
+    cv2.line(comparison, (width, 0), (width, height), (255, 255, 255), 2)
+    
+    # Add title
+    (title_width, title_height), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+    title_x = (comparison.shape[1] - title_width) // 2
+    cv2.putText(comparison, title, (title_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    
+    # Save comparison if output path is provided
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        cv2.imwrite(output_path, cv2.cvtColor(comparison, cv2.COLOR_RGB2BGR))
+    
+    return comparison
+
+def generate_evaluation_report(
+    evaluation_results: Dict[str, Any],
+    output_path: str = "./evaluation_report",
+    include_plots: bool = True,
+    include_images: bool = True
+) -> str:
+    """
+    Generate comprehensive evaluation report from results.
+    
+    Args:
+        evaluation_results: Dictionary with evaluation results
+        output_path: Path to save the report
+        include_plots: Whether to include plots in report
+        include_images: Whether to include detection images in report
+        
+    Returns:
+        Path to the generated report
+    """
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Initialize report parts
+    report_parts = []
+    
+    # Add report header
+    report_parts.append(f"# YOLOv8 QAT Evaluation Report\n")
+    report_parts.append(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    
+    # Model information section
+    if 'model_info' in evaluation_results:
+        report_parts.append("## Model Information\n\n")
+        model_info = evaluation_results['model_info']
+        
+        if 'fp32_model' in model_info:
+            report_parts.append(f"### FP32 Model\n")
+            fp32_info = model_info['fp32_model']
+            report_parts.append(f"- Model name: {fp32_info.get('name', 'N/A')}\n")
+            report_parts.append(f"- Model size: {fp32_info.get('size_mb', 0):.2f} MB\n")
+            report_parts.append(f"- Parameters: {fp32_info.get('num_parameters', 0):,}\n\n")
+        
+        if 'int8_model' in model_info:
+            report_parts.append(f"### INT8 Model\n")
+            int8_info = model_info['int8_model']
+            report_parts.append(f"- Model name: {int8_info.get('name', 'N/A')}\n")
+            report_parts.append(f"- Model size: {int8_info.get('size_mb', 0):.2f} MB\n")
+            report_parts.append(f"- Parameters: {int8_info.get('num_parameters', 0):,}\n")
+            report_parts.append(f"- Compression ratio: {model_info.get('compression_ratio', 0):.2f}x\n\n")
+    
+    # Performance metrics section
+    report_parts.append("## Performance Metrics\n\n")
+    
+    # Add mAP results
+    if 'mAP' in evaluation_results:
+        report_parts.append("### Mean Average Precision (mAP)\n\n")
+        map_results = evaluation_results['mAP']
+        
+        if isinstance(map_results, dict):
+            # Format mAP results as a table
+            report_parts.append("| Metric | Value |\n")
+            report_parts.append("|--------|-------|\n")
+            
+            for metric, value in map_results.items():
+                if not metric.startswith('AP@') and isinstance(value, (int, float)):
+                    report_parts.append(f"| {metric} | {value:.4f} |\n")
+            
+            report_parts.append("\n")
+            
+            # Class-specific AP
+            class_aps = {k: v for k, v in map_results.items() if k.startswith('AP@')}
+            if class_aps:
+                report_parts.append("#### Class-wise AP@.5\n\n")
+                report_parts.append("| Class | AP@.5 |\n")
+                report_parts.append("|-------|-------|\n")
+                
+                for class_name, ap in class_aps.items():
+                    report_parts.append(f"| {class_name.replace('AP@.5_class', 'Class ')} | {ap:.4f} |\n")
+                
+                report_parts.append("\n")
+    
+    # Add precision-recall results
+    if 'precision_recall' in evaluation_results:
+        report_parts.append("### Precision, Recall, and F1 Score\n\n")
+        pr_results = evaluation_results['precision_recall']
+        
+        if isinstance(pr_results, dict):
+            # Format PR results as a table
+            report_parts.append("| Class | Precision | Recall | F1 Score | TP | FP | FN |\n")
+            report_parts.append("|-------|-----------|--------|----------|----|----|----|\n")
+            
+            for class_name, metrics in pr_results.items():
+                precision = metrics.get('precision', 0)
+                recall = metrics.get('recall', 0)
+                f1 = metrics.get('f1_score', 0)
+                tp = metrics.get('true_positives', 0)
+                fp = metrics.get('false_positives', 0)
+                fn = metrics.get('false_negatives', 0)
+                
+                report_parts.append(f"| {class_name} | {precision:.4f} | {recall:.4f} | {f1:.4f} | {tp} | {fp} | {fn} |\n")
+            
+            report_parts.append("\n")
+    
+    # Add latency results
+    if 'latency' in evaluation_results:
+        report_parts.append("### Inference Performance\n\n")
+        latency = evaluation_results['latency']
+        
+        if isinstance(latency, dict):
+            # Format latency results as a table
+            report_parts.append("| Metric | Value |\n")
+            report_parts.append("|--------|-------|\n")
+            
+            mean_time = latency.get('mean_inference_time', 0)
+            report_parts.append(f"| Mean inference time | {mean_time*1000:.2f} ms |\n")
+            
+            median_time = latency.get('median_inference_time', 0)
+            report_parts.append(f"| Median inference time | {median_time*1000:.2f} ms |\n")
+            
+            std_time = latency.get('std_inference_time', 0)
+            report_parts.append(f"| Std. dev. of inference time | {std_time*1000:.2f} ms |\n")
+            
+            fps = latency.get('fps', 0)
+            report_parts.append(f"| Frames per second (FPS) | {fps:.2f} |\n")
+            
+            report_parts.append("\n")
+    
+    # Model comparison section
+    if 'comparison' in evaluation_results:
+        report_parts.append("## Model Comparison (FP32 vs INT8)\n\n")
+        comp_results = evaluation_results['comparison']
+        
+        if 'accuracy_change' in comp_results:
+            acc_change = comp_results['accuracy_change']
+            report_parts.append(f"### Accuracy Change\n\n")
+            report_parts.append(f"- FP32 mAP@.5: {acc_change.get('fp32_map50', 0):.4f}\n")
+            report_parts.append(f"- INT8 mAP@.5: {acc_change.get('int8_map50', 0):.4f}\n")
+            report_parts.append(f"- Absolute change: {acc_change.get('absolute_change', 0):.4f}\n")
+            report_parts.append(f"- Relative change: {acc_change.get('relative_change', 0)*100:.2f}%\n\n")
+        
+        if 'speed_comparison' in comp_results:
+            speed_comp = comp_results['speed_comparison']
+            report_parts.append(f"### Speed Comparison\n\n")
+            report_parts.append(f"- FP32 inference time: {speed_comp.get('fp32_time', 0)*1000:.2f} ms\n")
+            report_parts.append(f"- INT8 inference time: {speed_comp.get('int8_time', 0)*1000:.2f} ms\n")
+            report_parts.append(f"- Speedup: {speed_comp.get('speedup', 0):.2f}x\n\n")
+        
+        if 'memory_comparison' in comp_results:
+            mem_comp = comp_results['memory_comparison']
+            report_parts.append(f"### Memory Usage Comparison\n\n")
+            report_parts.append(f"- FP32 model size: {mem_comp.get('fp32_size_mb', 0):.2f} MB\n")
+            report_parts.append(f"- INT8 model size: {mem_comp.get('int8_size_mb', 0):.2f} MB\n")
+            report_parts.append(f"- Size reduction: {mem_comp.get('size_reduction_percent', 0):.2f}%\n\n")
+    
+    # Generate plots if requested
+    if include_plots and 'precision_recall' in evaluation_results:
+        report_parts.append("## Visualizations\n\n")
+        
+        # Precision-Recall curves
+        pr_data = evaluation_results['precision_recall']
+        if isinstance(pr_data, dict) and len(pr_data) > 0:
+            # Extract precision and recall values for each class
+            precisions = []
+            recalls = []
+            class_names = []
+            
+            for class_name, metrics in pr_data.items():
+                if 'precision' in metrics and 'recall' in metrics:
+                    precisions.append(metrics['precision'])
+                    recalls.append(metrics['recall'])
+                    class_names.append(class_name)
+            
+            # Generate PR curve plot
+            if precisions and recalls:
+                pr_curve_path = os.path.join(output_path, "precision_recall_curve.png")
+                plot_precision_recall_curve(precisions, recalls, class_names, 
+                                           "Precision-Recall Curves by Class", pr_curve_path)
+                report_parts.append(f"### Precision-Recall Curves\n\n")
+                report_parts.append(f"![Precision-Recall Curves](precision_recall_curve.png)\n\n")
+    
+    # Generate confusion matrix if available
+    if include_plots and 'confusion_matrix' in evaluation_results:
+        cm = evaluation_results['confusion_matrix']
+        if isinstance(cm, np.ndarray):
+            cm_path = os.path.join(output_path, "confusion_matrix.png")
+            plot_confusion_matrix(cm, normalize=True, title="Normalized Confusion Matrix", 
+                                 output_path=cm_path)
+            report_parts.append(f"### Confusion Matrix\n\n")
+            report_parts.append(f"![Confusion Matrix](confusion_matrix.png)\n\n")
+    
+    # Include example detections if available
+    if include_images and 'detection_examples' in evaluation_results:
+        examples = evaluation_results['detection_examples']
+        if isinstance(examples, list) and len(examples) > 0:
+            report_parts.append(f"### Detection Examples\n\n")
+            
+            for i, example in enumerate(examples):
+                if 'fp32_image' in example and 'int8_image' in example:
+                    comparison_path = os.path.join(output_path, f"detection_comparison_{i}.png")
+                    
+                    # Create comparison image
+                    comparison = np.hstack([example['fp32_image'], example['int8_image']])
+                    cv2.imwrite(comparison_path, cv2.cvtColor(comparison, cv2.COLOR_RGB2BGR))
+                    
+                    report_parts.append(f"#### Example {i+1}\n\n")
+                    report_parts.append(f"![Detection Comparison {i+1}](detection_comparison_{i}.png)\n\n")
+                    
+                    # Add metrics for this example if available
+                    if 'metrics' in example:
+                        metrics = example['metrics']
+                        report_parts.append("| Metric | FP32 | INT8 |\n")
+                        report_parts.append("|--------|------|------|\n")
+                        
+                        for metric_name, values in metrics.items():
+                            fp32_val = values.get('fp32', 'N/A')
+                            int8_val = values.get('int8', 'N/A')
+                            report_parts.append(f"| {metric_name} | {fp32_val} | {int8_val} |\n")
+                        
+                        report_parts.append("\n")
+    
+    # Join all report parts
+    report_content = "".join(report_parts)
+    
+    # Write report to file
+    report_path = os.path.join(output_path, "report.md")
+    with open(report_path, 'w') as f:
+        f.write(report_content)
+    
+    # Convert to HTML if possible
+    try:
+        import markdown
+        html_content = markdown.markdown(report_content, extensions=['tables'])
+        
+        html_path = os.path.join(output_path, "report.html")
+        with open(html_path, 'w') as f:
+            f.write(f"<!DOCTYPE html>\n<html>\n<head>\n")
+            f.write(f"<title>YOLOv8 QAT Evaluation Report</title>\n")
+            f.write(f"<style>\n")
+            f.write(f"body {{ font-family: Arial, sans-serif; margin: 20px; }}\n")
+            f.write(f"table {{ border-collapse: collapse; width: 100%; }}\n")
+            f.write(f"th, td {{ padding: 8px; text-align: left; border: 1px solid #ddd; }}\n")
+            f.write(f"th {{ background-color: #f2f2f2; }}\n")
+            f.write(f"img {{ max-width: 100%; }}\n")
+            f.write(f"</style>\n</head>\n<body>\n")
+            f.write(html_content)
+            f.write(f"\n</body>\n</html>")
+        
+        logger.info(f"HTML report generated at {html_path}")
+    except ImportError:
+        logger.info("Markdown module not found, skipping HTML report generation")
+    
+    logger.info(f"Evaluation report generated at {report_path}")
+    
+    return report_path

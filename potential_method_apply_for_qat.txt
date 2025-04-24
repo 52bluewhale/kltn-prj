@@ -1,0 +1,24 @@
+analyze potential techniques to improve model performance when 
+applying quantization aware training
+------------------------------------------------------------------
+method 1: Adaptive Coreset Selection (ACS)
+	- propose 2 metrics based on analysis of loss and gradient of 
+	quantized weights:
+		+ error vector score (EVS)
+		+ disagreement score (DS)
+	to quantify the importance of each sample during traning
+	=> guided by these 2 metrics, proposed a 
+	quantization aware Adaptive Coreset Selection (ACS) method 
+	to select data for current training epoch
+
+	- QAT improve inference efficiency of target model, it is 
+	computation-intensive and requires more time than full-precision training
+	=> considered cost of QAT
+	
+	- Coreset Selection techniques aim to mitigate the high training
+	cost and potential negative influence of label noise to improve
+	data efficiency and robustness for full-precision training
+	- Specially, Coreset Selection methods leverage the redundancy in 
+	training datasets and select the most informative data to build a 
+	core set for training
+	

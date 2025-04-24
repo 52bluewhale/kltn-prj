@@ -1,0 +1,263 @@
+kltn-prj/                      # Root project directory
+│
+├── dataset/                         # Data directory
+│   └── vietnam-traffic-sign-detection/
+│       ├── train/
+│       │   ├── images/           # Training images
+│       │   └── labels/           # YOLOv8 format annotations
+│       ├── valid/
+│       │   ├── images/           # Validation images
+│       │   └── labels/           # Validation annotations
+│       ├── test/
+│       │   ├── images/           # Test images
+│       │   └── labels/           # Test annotations
+│       └── dataset.yaml          # Dataset configuration file
+│
+├── models/                       # Model-related directory
+│   ├── pretrained/               # Pre-trained weights
+│   │   └── yolov8n.pt            # (or other variants like yolov8s.pt)
+│   ├── checkpoints/              # Training checkpoints
+│   │   ├── fp32/                 # Full precision checkpoints
+│   │   └── qat/                  # QAT checkpoints
+│   └── exported/                 # Exported quantized models
+│       ├── onnx/                 # ONNX format models
+│       ├── tflite/               # TFLite format (if needed)
+│       └── tensorrt/             # TensorRT optimized models
+│
+├── logs/                         # Logging directory
+│   ├── fp32/                     # Base model training logs
+│   ├── qat/                      # QAT training logs
+│   └── tensorboard/              # Tensorboard log files
+│
+├── src/                          # Source code directory
+│   ├── __init__.py
+│   ├── config.py                 # Configuration utilities
+│   │
+│   ├── data_utils/               # Data utilities
+│   │   ├── __init__.py
+│   │   ├── augmentation.py       # Custom augmentations
+│   │   ├── dataloader.py         # Data loading utilities
+│   │   └── preprocessing.py      # Pre-processing functions
+│   │
+│   ├── models/                   # Model architectures
+│   │   ├── __init__.py
+│   │   ├── yolov8_base.py        # Base YOLOv8 model extensions
+│   │   ├── yolov8_qat.py         # QAT adaptations for YOLOv8
+│   │   ├── yolov8_qat_modules.py # Custom QAT modules for YOLOv8
+│   │   ├── model_transforms.py   # Functions to transform models to QAT-ready
+│   │   └── critical_layers.py    # Handling for accuracy-critical layers
+│   │
+│   ├── quantization/             # Quantization-specific code
+│   │   ├── __init__.py
+│   │   ├── observers.py          # Custom observer implementations
+│   │   ├── fake_quantize.py      # Fake quantization operations
+│   │   ├── qconfig.py            # QConfig definitions
+│   │   ├── qat_modules.py        # QAT-ready versions of standard modules
+│   │   ├── fusion.py             # Module fusion utilities
+│   │   ├── calibration.py        # Model calibration functions
+│   │   └── utils.py              # General quantization utilities
+│   │   │
+│   │   └── schemes/              # Quantization schemes
+│   │       ├── __init__.py
+│   │       ├── symmetric.py      # Symmetric quantization
+│   │       ├── asymmetric.py     # Asymmetric quantization
+│   │       ├── per_tensor.py     # Per-tensor quantization
+│   │       └── per_channel.py    # Per-channel quantization
+│   │
+│   ├── training/                 # Training pipeline code
+│   │   ├── __init__.py
+│   │   ├── trainer.py            # Main trainer class
+│   │   ├── loss.py               # Custom loss functions for QAT
+│   │   ├── callbacks.py          # Training callbacks
+│   │   └── lr_scheduler.py       # Learning rate schedulers
+│   │
+│   ├── evaluation/               # Evaluation utilities
+│   │   ├── __init__.py
+│   │   ├── metrics.py            # Metrics calculation
+│   │   ├── visualization.py      # Results visualization 
+│   │   ├── compare_models.py     # FP32 vs INT8 comparison
+│   │   ├── latency_testing.py    # Inference speed measurement
+│   │   ├── accuracy_drift.py     # Track accuracy changes during quantization
+│   │   └── memory_profiling.py   # Profile memory usage
+│   │
+│   └── deployment/               # Deployment code
+│       ├── __init__.py
+│       ├── inference.py          # Inference utilities
+│       ├── optimize.py           # Post-training optimizations
+│       └── benchmark.py          # Benchmarking tools
+│
+├── scripts/                      # Executable scripts
+│   ├── train_fp32.py             # Train base floating-point model
+│   ├── train_qat.py              # QAT training script
+│   ├── evaluate.py               # Evaluation script
+│   ├── calibrate.py              # Calibration script
+│   ├── export.py                 # Model export script
+│   ├── analyze_quantization_error.py  # Quantization error analysis
+│   ├── sensitivity_analysis.py   # Layer quantization sensitivity
+│   └── visualize_activations.py  # Activation visualization
+│
+├── notebooks/                    # Jupyter notebooks
+│   ├── dataset_exploration.ipynb # Dataset analysis
+│   ├── model_analysis.ipynb      # Model architecture analysis
+│   ├── quantization_effects.ipynb# Analysis of quantization effects
+│   ├── error_analysis.ipynb      # Error analysis across quantized layers
+│   └── performance_comparison.ipynb  # Performance benchmarking
+│
+├── configs/                      # Configuration files
+│   ├── base_config.yaml          # Base configuration
+│   ├── qat_config.yaml           # QAT specific configuration
+│   ├── export_config.yaml        # Export configuration
+│   ├── quantization_config.yaml  # Detailed quantization parameters
+│   │
+│   └── experiments/              # Experiment-specific configs
+│       ├── exp1_symmetric_quant.yaml
+│       ├── exp2_asymmetric_quant.yaml
+│       └── exp3_mixed_precision.yaml
+│
+├── tests/                        # Unit and integration tests
+│   ├── __init__.py
+│   ├── test_quantization.py      # Tests for quantization modules
+│   ├── test_models.py            # Tests for model modifications
+│   └── test_dataloader.py        # Tests for data loading
+│
+├── requirements.txt              # Python dependencies
+├── setup.py                      # For package installation
+├── README.md                     # Project documentation
+└── main.py                       # Entry point script
+
+Key Components Description
+Quantization Implementation
+The heart of the QAT implementation lives in the src/quantization/ directory:
+
+observers.py: Implements observer classes that collect statistics about tensor values:
+
+MinMaxObserver: Records min/max values
+MovingAverageMinMaxObserver: Tracks running min/max
+HistogramObserver: For more sophisticated calibration
+
+
+fake_quantize.py: Contains fake quantization modules that simulate quantization:
+
+FakeQuantize: Base class for fake quantization
+Specialized variants for different quantization schemes
+
+
+qconfig.py: Defines quantization configurations:
+
+QConfig objects that pair weight and activation observers
+Predefined configurations for common scenarios
+
+
+qat_modules.py: QAT-ready versions of PyTorch modules:
+
+QATConv2d: Quantization-aware Conv2d
+QATLinear: Quantization-aware Linear
+And other specialized modules
+
+
+fusion.py: Implements module fusion for better quantization:
+
+Conv-BN-ReLU fusion
+Other common fusion patterns
+
+
+schemes/: Different quantization approaches:
+
+symmetric.py: Zero-centered quantization
+asymmetric.py: Range-based quantization
+per_tensor.py: Whole tensor quantization
+per_channel.py: Channel-wise quantization
+
+
+
+YOLOv8-Specific Components
+
+models/yolov8_qat.py: Adapts YOLOv8 for QAT:
+
+Modified YOLOv8 architecture with fake quantization nodes
+Specialized handling for detection heads
+
+
+models/critical_layers.py: Handles layers sensitive to quantization:
+
+Identifies critical layers that affect accuracy
+Implements special quantization schemes for these layers
+
+
+models/model_transforms.py: Functions to prepare models for QAT:
+
+Inserts fake quantization nodes
+Performs necessary fusions
+Configures layer-specific quantization parameters
+
+
+
+Training and Evaluation
+
+training/trainer.py: Main training loop with QAT support:
+
+Progressive quantization
+Specialized learning rate scheduling for QAT
+
+
+evaluation/: Comprehensive evaluation tools:
+
+accuracy_drift.py: Tracks accuracy changes during quantization
+latency_testing.py: Measures inference speed
+memory_profiling.py: Analyzes memory usage
+
+
+
+Analysis Tools
+
+scripts/analyze_quantization_error.py: Analyzes layer-wise quantization error
+scripts/sensitivity_analysis.py: Identifies layers most sensitive to quantization
+notebooks/quantization_effects.ipynb: Interactive analysis of quantization effects
+
+Summary of Enhanced YOLOv8 QAT Project
+I've designed a comprehensive project structure for implementing Quantization-Aware Training on YOLOv8 using only PyTorch's native quantization tools. Here's a summary of what's been provided:
+1. Project Structure
+The enhanced project structure follows a modular design with clear separation of concerns:
+
+Core model implementation in src/models/
+Quantization utilities in src/quantization/
+Training pipeline in src/training/
+Evaluation tools in src/evaluation/
+Configuration files in configs/
+Executable scripts in scripts/
+
+2. Key Implementation Files
+I've provided several key implementation files:
+
+Main Entry Point (main.py): Orchestrates all operations with a unified command-line interface
+QAT Configuration (configs/qat_config.yaml): Detailed configuration for quantization parameters
+QAT Training Script (scripts/train_qat.py): Implements the QAT training procedure
+YOLOv8 QAT Model (src/models/yolov8_qat.py): Core model class that adapts YOLOv8 for QAT
+
+3. Implementation Approach
+The implementation follows these key principles:
+
+Pure PyTorch Native Quantization: Using only PyTorch's built-in quantization tools without third-party libraries
+Modular Design: Clear separation of components for easy customization and extension
+Configuration-Driven: All quantization parameters are controlled via configuration files
+Comprehensive Analysis: Tools for analyzing quantization effects and performance
+Progressive Implementation: Starting with a base model and progressively adding quantization
+
+4. Development Workflow
+The project is designed to support this workflow:
+
+Initial Setup: Organize dataset and install dependencies
+Base Model Training: Train a floating-point baseline model
+QAT Implementation: Implement quantization modules and prepare model
+QAT Training: Fine-tune with QAT
+Evaluation: Compare performance with baseline
+Export: Deploy the quantized model
+
+Key Features of the Implementation
+
+Layer-Specific Quantization: Different quantization parameters for different layers
+Critical Layer Identification: Automatic detection of layers sensitive to quantization
+Customizable Observers: Enhanced observers for better statistics collection
+Module Fusion: Fusion of operations for better quantization
+Comprehensive Analysis: Tools to visualize and analyze quantization effects
+Export Options: Support for ONNX and other deployment formats

@@ -1,0 +1,140 @@
+prj-chart
+---------------------------------------------------------------------------
+1. Data Flow Between Components
+┌───────────────┐        ┌─────────────────┐        ┌─────────────────┐
+│ YAML Config   │───────►│ QConfig Objects │───────►│ Layer-specific  │
+│ Files         │        │                 │        │ Quantization    │
+└───────────────┘        └─────────────────┘        └─────────────────┘
+        │                                                    │
+        │                                                    ▼
+┌───────▼───────┐        ┌─────────────────┐        ┌─────────────────┐
+│ Base YOLOv8   │───────►│ Fused Model     │───────►│ QAT-Ready Model │
+│ Model         │        │ (fusion.py)     │        │ (fake quant)    │
+└───────────────┘        └─────────────────┘        └─────────────────┘
+                                                             │
+                                                             ▼
+┌───────────────┐        ┌─────────────────┐        ┌─────────────────┐
+│ Dataset &     │───────►│ QAT Dataloader  │───────►│ Training Process│
+│ Augmentations │        │                 │        │ (QATTrainer)    │
+└───────────────┘        └─────────────────┘        └─────────────────┘
+                                                             │
+                                                             ▼
+┌───────────────┐        ┌─────────────────┐        ┌─────────────────┐
+│ Converted     │◄───────│ Trained QAT     │◄───────│ Monitoring &    │
+│ INT8 Model    │        │ Model           │        │ Callbacks       │
+└───────────────┘        └─────────────────┘        └─────────────────┘
+        │
+        ▼
+┌───────────────┐
+│ ONNX/TensorRT │
+│ Exported Model│
+└───────────────┘
+
+Detailed Explanation
+	- Configuration Flow:
+		+ Config Files (base_config.yaml, qat_config.yaml) define parameters
+		+ QConfig Generation (qconfig.py) creates PyTorch QConfig objects
+		+ Layer-specific Mapping applies different quantization strategies to different layers
+
+	- Model Transformation Flow:
+		+ Base Model is loaded from yolov8_base.py
+		+ Fusion combines operations (Conv+BN) using fusion.py
+		+ QAT Preparation inserts fake quantization nodes via 
+		model_transforms.py
+		+ Critical Layer Handling applies special quantization to 
+		sensitive layers (critical_layers.py)
+
+	- Data Processing Flow:
+		+ Dataset Loading with specialized preprocessing (dataloader.py)
+		+ QAT-specific Augmentation that preserves statistics (augmentation.py)
+		+ Quantization-friendly Preprocessing (preprocessing.py)
+
+	- Training Flow:
+		+ QATTrainer manages the QAT process (trainer.py)
+		+ Observer Collection gathers statistics about tensors
+		+ Fake Quantization simulates INT8 precision during training
+		+ Progressive Quantization gradually applies quantization via callbacks
+		+ Error Monitoring tracks quantization impact
+
+	- Conversion & Deployment Flow:
+		+ INT8 Conversion removes fake quantization and applies real quantization
+		+ Model Export to ONNX/TensorRT via export_config.yaml
+
+2. Workflow Chart
+┌──────────────────┐
+│                  │
+│  1. Setup Phase  │
+│                  │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 2. Base FP32     │
+│    Training      │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 3. QAT Model     │
+│    Preparation   │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 4. QAT Training  │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 5. Evaluation    │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 6. Export &      │
+│    Deployment    │
+└──────────────────┘
+
+Detailed Explanation
+
+	- Setup Phase:
+		+ Prepare Vietnam traffic sign dataset
+		+ Configure project parameters in YAML files
+		+ Download pretrained YOLOv8 model (typically yolov8n.pt)
+
+	- Base FP32 Training:
+		+ Train the model using base_config.yaml
+		+ Establish baseline performance metrics
+		+ Save checkpoints in the models/checkpoints/fp32 directory
+
+	- QAT Model Preparation:
+		+ Load trained FP32 model from checkpoints
+		+ Fuse operations (Conv+BN) for better quantization
+		+ Insert fake quantization nodes
+		+ Apply special handling to critical layers like detection heads
+		+ Configure quantization parameters based on qat_config.yaml
+
+	- QAT Training:
+		+ Train using QATTrainer with specialized features:
+			-> Progressive quantization (gradually applying to more layers)
+			-> Quantization-aware loss functions with penalties
+			-> Specialized learning rate scheduling
+			-> Freezing batch normalization at appropriate times
+
+		+ Monitor quantization errors through callbacks
+		+ Save QAT checkpoints in models/checkpoints/qat
+
+	- Evaluation:
+		+ Compare FP32 vs INT8 models:
+			-> Accuracy (mAP for detection)
+			-> Model size reduction
+			-> Inference speed
+		+ Analyze per-layer quantization impact
+		+ Identify problematic layers
+
+
+	- Export & Deployment:
+		+ Convert QAT model to fully quantized INT8
+		+ Export to ONNX format using export_config.yaml
+		+ Optimize for target hardware (TensorRT, if needed)
+		+ Test deployed model on traffic sign detection task

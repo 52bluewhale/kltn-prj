@@ -1,0 +1,81 @@
+# Core dependencies
+torch>=1.13.0                  # Using newer version for better quantization support
+torchvision>=0.14.0            # Matching torch version
+ultralytics>=8.0.0             # YOLOv8
+numpy>=1.20.0
+pillow>=9.0.0
+opencv-python>=4.5.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+pyyaml>=6.0.0
+
+# Model optimization and deployment
+onnx>=1.12.0                   # For model export
+onnxruntime>=1.13.1            # For inference with ONNX models
+# Optional: For TensorRT optimization if needed
+# tensorrt>=8.4.0              # Uncomment if using NVIDIA GPUs for deployment
+
+# Data processing and analysis
+pandas>=1.3.0
+scikit-learn>=1.0.0
+albumentations>=1.0.0          # Advanced augmentations
+pycocotools>=2.0.4             # For COCO-format evaluation
+
+# Development and visualization tools
+tqdm>=4.60.0                   # Progress bars
+tensorboard>=2.8.0             # For logging training progress
+jupyter>=1.0.0                 # For notebook development
+rich>=12.0.0                   # Better console output
+typer>=0.4.0                   # CLI interface builder
+
+# Testing and code quality
+pytest>=7.0.0                  # For unit testing
+pytest-cov>=4.0.0              # For test coverage
+flake8>=4.0.0                  # Linting
+black>=22.0.0                  # Code formatting
+isort>=5.10.0                  # Import sorting
+
+# Memory profiling and optimization
+memory-profiler>=0.60.0        # For memory profiling
+psutil>=5.9.0                  # System utilization monitoring
+
+# Documentation
+sphinx>=4.3.0                  # For generating documentation
+sphinx-rtd-theme>=1.0.0        # Documentation theme
+
+Key Components by Category
+Core PyTorch Quantization Support
+The primary benefit of using PyTorch 1.13+ is improved native quantization support, which includes:
+
+Enhanced quantization observers
+Better support for fake quantization
+Improved quantization-aware training modules
+More robust fusion patterns
+
+YOLOv8 Integration
+Ultralytics 8.0.0+ provides the YOLOv8 implementation that you'll be modifying for QAT. The package includes:
+
+YOLOv8 model architecture
+Training and evaluation pipelines
+Data loading utilities
+Export functionality
+
+Model Export and Deployment
+ONNX and ONNX Runtime provide deployment capabilities for your quantized models:
+
+ONNX: Standard format for cross-platform model deployment
+ONNX Runtime: Optimized inference engine
+
+Analysis and Visualization
+Tools for analyzing quantization effects:
+
+TensorBoard: For visualizing training metrics and model graphs
+Rich: For better console output when running experiments
+Memory-profiler: For tracking memory usage differences between FP32 and INT8 models
+
+Development and Testing
+Quality assurance tools:
+
+Pytest: For unit testing quantization modules
+Flake8 and Black: For maintaining code quality
+Sphinx: For generating documentation

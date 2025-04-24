@@ -1,0 +1,57 @@
+# General QAT configuration
+qat:
+  # QAT specific parameters
+  epochs: 10
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  momentum: 0.9
+  
+  # Quantization parameters
+  quantization:
+    # Activation quantization
+    activation:
+      dtype: quint8  # quint8 or qint8
+      bit_width: 8
+      scheme: per_tensor  # per_tensor or per_channel
+      symmetric: false  # symmetric or asymmetric
+      observer: moving_average_minmax  # minmax, moving_average_minmax, histogram
+      calibration_batches: 100
+      
+    # Weight quantization
+    weight:
+      dtype: qint8  # quint8 or qint8
+      bit_width: 8
+      scheme: per_channel  # per_tensor or per_channel
+      symmetric: true  # symmetric or asymmetric
+      observer: minmax  # minmax, moving_average_minmax, histogram
+      
+    # Layer-specific configurations
+    special_layers:
+      # Detection head layers - use asymmetric per-tensor quantization
+      - pattern: "model.24"  # Layer name pattern
+        config:
+          activation:
+            observer: histogram
+          weight:
+            scheme: per_tensor
+            symmetric: false
+      
+      # First layer - use higher precision
+      - pattern: "model.0"  # First layer
+        config:
+          activation:
+            bit_width: 8
+          weight:
+            bit_width: 8
+    
+    # Skip quantization for these layers
+    skip_layers:
+      - "model.class_embedding"
+      - "model.final_projection"
+
+# Export configuration
+export:
+  format: onnx  # onnx or tflite
+  opset_version: 13
+  dynamic_batch: true
+  optimize: true

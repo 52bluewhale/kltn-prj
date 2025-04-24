@@ -1,0 +1,43 @@
+src/data_utils/
+---------------------------------------------------------------------------------
+Data Utils Implementation for YOLOv8 QAT
+----------------------------------------------------------
+1. dataloader.py
+	- This file handles loading data from your Vietnam 
+	traffic sign dataset with:
+		+ A standard dataloader for regular training
+		+ A specialized QAT dataloader with 
+		quantization-specific features
+		+ A calibration dataloader for collecting statistics 
+		to guide quantization
+	- It's designed to work smoothly with your YOLOv8 model 
+	structure and the dataset format you're using.
+	
+2. augmentation.py
+	- This file contains custom augmentation techniques that 
+	are quantization-friendly:
+		+ QAT-specific transforms that avoid introducing 
+		extreme values
+		+ Modified mosaic augmentation that preserves 
+		statistical properties
+		+ Detail-preserving augmentations that don't destroy 
+		features important for quantization
+		
+3. preprocessing.py
+	- This file handles specialized preprocessing for quantization:
+		+ Functions to normalize data in ways that reduce quantization 
+		error
+		+ Methods to clip outliers that could cause quantization issues
+		+ Calibration approaches to ensure consistent performance
+		
+Key Benefits
+
+	- Quantization Compatibility: All components are designed specifically 
+	to work well with quantization, avoiding transformations that might 
+	introduce problems during quantization.
+	- YOLOv8 Integration: The implementation works seamlessly with YOLOv8's 
+	existing data pipeline structure.
+	- Performance Optimization: Includes caching mechanisms and efficient 
+	processing for better training speed.
+	- Specialized for Your Dataset: Configured for the Vietnam traffic sign 
+	dataset with 58 classes as specified in your data.yaml file.
