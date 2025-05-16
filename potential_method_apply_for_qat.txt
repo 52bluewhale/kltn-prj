@@ -1,0 +1,32 @@
+analyze potential techniques to improve model performance when 
+applying quantization aware training
+------------------------------------------------------------------
+method 1: Adaptive Coreset Selection (ACS)
+	- traditional: consider all training set are equally important
+	- acs: consider information within different samples is different 
+	for full-precision training
+	- Coreset selection involves choosing a representative subset of 
+	the training data that can approximate the full dataset's performance. 
+	This approach aims to reduce training costs while maintaining model 
+	accuracy
+	- acs uses 2 metrics, Error Vector Score (EVS) and 
+	Disagreement Score (DS), to identify important samples, potentially 
+	reducing training time and improving accuracy
+	- evidence suggests acs work for object detection task like 
+	RetinaNet on COCO, so with YOLOv8 model, this method may also 
+	work well
+	=> implementation involves calculating EVS and DS on YOLOv8's 
+	classification outputs, selecting a coreset preiodcially, and 
+	training on it, which may streamline QAT
+	- The ACS method introduces two metrics to evaluate the importance 
+	of each training sample:
+		1. Error Vector Score (EVS): Measures the discrepancy between 
+		the quantized model's predictions and the ground truth labels.
+		2. Disagreement Score (DS): Assesses the divergence between 
+		the predictions of the quantized model and a full-precision 
+		teacher model, incorporating knowledge distillation principles.
+	=> By computing these scores, ACS dynamically selects a subset of 
+	training samples that are most informative for the current training 
+	epoch. This adaptive approach ensures that the model focuses on 
+	learning from the most impactful data points.
+	

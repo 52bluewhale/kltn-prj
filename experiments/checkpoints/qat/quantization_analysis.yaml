@@ -1,0 +1,10 @@
+mixed_precision_analysis: null
+quantization_analysis:
+  quantized_modules: 0
+  quantized_ratio: 0.0
+  total_modules: 225
+size_comparison:
+  compression_ratio: 1.0445923594770552
+  fp32_size_mb: 12.084602355957031
+  int8_size_mb: 11.5687255859375
+  size_reduction_percent: 4.268876664901045

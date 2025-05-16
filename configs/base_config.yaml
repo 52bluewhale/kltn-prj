@@ -1,0 +1,86 @@
+# YOLOv8 Base Training Configuration
+
+# Basic training settings
+training:
+  epochs: 10   # Total number of training epochs (50)
+  batch_size: 16 # Number of images per batch 
+  learning_rate: 0.01 # Initial learning rate
+  weight_decay: 0.0005 
+  optimizer: SGD # Optimization algorithm 
+  lr_scheduler: cosine # Learning rate scheduler type
+  warmup_epochs: 3 #  Number of epochs for learning rate warmup
+  momentum: 0.937
+  nbs: 64  # Nominal batch size
+  dropout: 0.0
+
+# Model settings
+model:
+  name: "yolov8n"  # Model variant, Options: yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
+  pretrained: true # Whether to use pretrained weights
+  pretrained_weights: "models/pretrained/yolov8n.pt"
+  nc: 10           # Number of classes for Vietnam traffic sign dataset
+  input_size: [640, 640]  # Input resolution for the model
+
+# Data settings
+data:
+  path: "dataset/vietnam-traffic-sign-detection/dataset.yaml"
+  cache: true
+  workers: 8
+  rect: false  # Rectangular training
+
+# Loss function weights
+loss:
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5
+  
+# Data augmentation settings
+augmentation:
+  enabled: true
+  mosaic: 1.0 # Probability of applying mosaic augmentation
+  mixup: 0.1 # Probability of applying mixup augmentation 
+  degree: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
+  flip_ud: 0.0
+  flip_lr: 0.5
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  
+# Callback settings
+callbacks:
+  save_period: 10  # Save checkpoint every X epochs
+  save_best: true  # Save best model
+
+# Validation settings
+validation:
+  split: 0.1
+  frequency: 1     # Validate every X epochs
+  imgsz: 640
+  conf_thres: 0.001
+  iou_thres: 0.6
+  max_det: 300
+  
+# Checkpoint and saving settings
+save:
+  dir: "./models/checkpoints/fp32"
+  best: "./models/checkpoints/fp32/best.pt"
+  last: "./models/checkpoints/fp32/last.pt"
+  
+# Logging settings
+logging:
+  dir: "./logs/fp32"
+  tensorboard: true
+  save_metrics: true
+  verbose: true
+  log_imgs: 20  # Log N images to W&B or TensorBoard
+  
+# Debugging settings
+debug:
+  visualize_transforms: false
+  visualize_batch: false
+  visualize_gradients: false
+  profile: false    # Profile model FLOPS and parameters

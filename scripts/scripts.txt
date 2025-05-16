@@ -1,0 +1,3539 @@
+// analyze_quantization_error.py
+# Analyzes layer-wise quantization error
+
+import torch
+import argparse
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+
+from src.models.yolov8_qat import YOLOv8QAT
+from ultralytics.data import build_dataloader
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Analyze quantization error")
+    parser.add_argument("--model", type=str, required=True, help="Path to QAT model checkpoint")
+    parser.add_argument("--data", type=str, default="data/vietnam-traffic-sign-detection/dataset.yaml", help="Dataset YAML")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
+    parser.add_argument("--output", type=str, default="logs/quantization_analysis", help="Output directory")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    
+    # Create output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load model
+    model = YOLOv8QAT(args.model)
+    model.eval()
+    
+    # Load data
+    val_loader = build_dataloader(args.data, batch_size=args.batch_size, mode="val")
+    
+    # Get a batch
+    batch = next(iter(val_loader))
+    images = batch["img"]
+    
+    # Register hooks to capture activations
+    activations = {}
+    quantized_activations = {}
+    
+    def _register_hooks(module, name):
+        def _pre_hook(module, input):
+            activations[name] = input[0].detach().cpu().numpy()
+            return input
+        
+        def _post_hook(module, input, output):
+            quantized_activations[name] = output.detach().cpu().numpy()
+            return output
+        
+        module.register_forward_pre_hook(_pre_hook)
+        module.register_forward_hook(_post_hook)
+    
+    # Register hooks for all FakeQuantize modules
+    for name, module in model.named_modules():
+        if "fake_quantize" in name:
+            _register_hooks(module, name)
+    
+    # Forward pass
+    with torch.no_grad():
+        _ = model(images)
+    
+    # Calculate quantization errors
+    errors = {}
+    for name in activations.keys():
+        # Ensure we have both pre and post quantization activations
+        if name in quantized_activations:
+            # Calculate mean squared error
+            mse = np.mean((activations[name] - quantized_activations[name]) ** 2)
+            
+            # Calculate relative error
+            norm_orig = np.linalg.norm(activations[name])
+            norm_diff = np.linalg.norm(activations[name] - quantized_activations[name])
+            rel_error = norm_diff / norm_orig if norm_orig > 0 else 0
+            
+            errors[name] = (mse, rel_error)
+    
+    # Plot results
+    plt.figure(figsize=(12, 10))
+    
+    # Sort layers by relative error
+    sorted_errors = sorted(errors.items(), key=lambda x: x[1][1], reverse=True)
+    layer_names = [name.split('.')[-2] for name, _ in sorted_errors]
+    rel_errors = [error[1] for _, error in sorted_errors]
+    
+    # Create bar plot
+    plt.bar(range(len(layer_names)), rel_errors)
+    plt.xticks(range(len(layer_names)), layer_names, rotation=90)
+    plt.xlabel('Layer')
+    plt.ylabel('Relative Error')
+    plt.title('Quantization Error by Layer')
+    plt.tight_layout()
+    
+    # Save plot
+    plt.savefig(output_dir / "quantization_error.png")
+    
+    # Save detailed results
+    with open(output_dir / "quantization_error.txt", "w") as f:
+        for name, (mse, rel_error) in sorted_errors:
+            f.write(f"{name}: MSE={mse:.6f}, Relative Error={rel_error:.6f}\n")
+    
+    print(f"Analysis results saved to {output_dir}")
+
+if __name__ == "__main__":
+    main()
+
+// calibrate.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Calibration script for YOLOv8 quantization.
+
+This script performs model calibration to determine appropriate quantization
+parameters based on a representative dataset. It's a pre-step to quantization-aware
+training that helps set the initial scaling factors and zero points.
+"""
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+import torch
+import time
+from pathlib import Path
+from tqdm import tqdm
+
+# Add project root to path to allow imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(script_dir))
+sys.path.append(project_root)
+
+from src.models import (
+    create_yolov8_model,
+    prepare_model_for_qat
+)
+from src.data_utils import (
+    create_dataloader,
+    create_calibration_dataloader,
+    get_dataset_from_yaml
+)
+from src.quantization import (
+    load_quantization_config,
+    calibrate_model,
+    build_calibrator,
+    create_qat_config_from_config_file
+)
+from src.evaluation import (
+    evaluate_model,
+    measure_quantization_error
+)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('calibrate')
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Calibrate YOLOv8 model for quantization')
+    
+    # Dataset settings
+    parser.add_argument('--data', type=str, default='dataset/vietnam-traffic-sign-detection/dataset.yaml',
+                        help='path to dataset configuration yaml file')
+    
+    # Model settings
+    parser.add_argument('--model', type=str, default='yolov8n', 
+                        help='YOLOv8 model variant (yolov8n, yolov8s, yolov8m, etc)')
+    parser.add_argument('--weights', type=str, required=True,
+                        help='path to pretrained FP32 model weights')
+    parser.add_argument('--img-size', type=int, default=640, 
+                        help='input image size')
+    
+    # Calibration settings
+    parser.add_argument('--calib-config', type=str, default='configs/quantization_config.yaml',
+                        help='path to calibration/quantization configuration file')
+    parser.add_argument('--method', type=str, default='histogram', 
+                        choices=['minmax', 'histogram', 'percentile', 'entropy'],
+                        help='calibration method')
+    parser.add_argument('--num-batches', type=int, default=100,
+                        help='number of batches to use for calibration')
+    parser.add_argument('--percentile', type=float, default=99.99,
+                        help='percentile value for percentile calibration method')
+    parser.add_argument('--batch-size', type=int, default=16, 
+                        help='batch size for calibration')
+    parser.add_argument('--workers', type=int, default=8, 
+                        help='number of data loading workers')
+    parser.add_argument('--device', type=str, default='', 
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    
+    # Output settings
+    parser.add_argument('--output-dir', type=str, default='models/checkpoints/calibrated', 
+                        help='path to save calibrated model')
+    parser.add_argument('--export-config', action='store_true',
+                        help='export calibration configuration')
+    
+    # Analysis settings
+    parser.add_argument('--analyze', action='store_true',
+                        help='analyze calibration results')
+    parser.add_argument('--error-threshold', type=float, default=0.1,
+                        help='error threshold for layer analysis')
+    
+    return parser.parse_args()
+
+
+def load_fp32_model(args):
+    """
+    Load the pretrained FP32 model.
+    
+    Args:
+        args: Command line arguments
+    
+    Returns:
+        Pretrained FP32 model
+    """
+    # Get dataset information to determine number of classes
+    dataset_info = get_dataset_from_yaml(args.data)
+    num_classes = dataset_info.get('nc', 80)  # Default to 80 classes (COCO) if not specified
+    
+    logger.info(f"Loading pretrained FP32 model: {args.model} with {num_classes} classes")
+    
+    # Create model
+    model = create_yolov8_model(
+        model_name=args.model,
+        num_classes=num_classes,
+        pretrained=False,
+        pretrained_path=args.weights
+    )
+    
+    logger.info(f"Model loaded successfully")
+    return model, num_classes
+
+
+def create_calibration_dataset(args):
+    """
+    Create dataset for calibration.
+    
+    Args:
+        args: Command line arguments
+    
+    Returns:
+        Calibration dataloader
+    """
+    logger.info(f"Creating calibration dataset from {args.data}")
+    
+    # Get dataset information
+    dataset_info = get_dataset_from_yaml(args.data)
+    
+    # Check if validation set exists
+    if 'val' not in dataset_info:
+        raise ValueError("Validation set not found in dataset YAML")
+    
+    # Get validation image path
+    val_img_path = dataset_info['val']
+    
+    # Create calibration dataloader
+    calibration_loader = create_calibration_dataloader(
+        img_path=val_img_path,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        workers=args.workers,
+        cache=False
+    )
+    
+    logger.info(f"Created calibration dataloader with {len(calibration_loader)} batches")
+    return calibration_loader
+
+
+def prepare_model_for_calibration(model, args):
+    """
+    Prepare model for calibration.
+    
+    Args:
+        model: FP32 model
+        args: Command line arguments
+    
+    Returns:
+        Model prepared for calibration
+    """
+    logger.info(f"Preparing model for calibration")
+    
+    # Load quantization configuration
+    try:
+        quant_config = load_quantization_config(args.calib_config)
+        logger.info(f"Loaded quantization configuration from {args.calib_config}")
+    except Exception as e:
+        logger.warning(f"Failed to load quantization configuration: {e}. Using default configuration.")
+        quant_config = None
+    
+    # Prepare model for QAT (which includes preparation for calibration)
+    prepared_model = prepare_model_for_qat(
+        model=model,
+        config_path=args.calib_config if quant_config is not None else None
+    )
+    
+    logger.info(f"Model prepared for calibration")
+    return prepared_model
+
+
+def run_calibration(model, calibration_loader, args):
+    """
+    Run calibration on the model.
+    
+    Args:
+        model: Model prepared for calibration
+        calibration_loader: Calibration dataloader
+        args: Command line arguments
+    
+    Returns:
+        Calibrated model
+    """
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Running calibration using {args.method} method on {device}")
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Build calibrator with specific method
+    calibrator_kwargs = {
+        'device': device,
+        'num_batches': min(args.num_batches, len(calibration_loader))
+    }
+    
+    if args.method == 'percentile':
+        calibrator_kwargs['percentile'] = args.percentile
+    
+    calibrator = build_calibrator(
+        model=model,
+        dataloader=calibration_loader,
+        method=args.method,
+        **calibrator_kwargs
+    )
+    
+    # Start calibration
+    start_time = time.time()
+    calibrated_model = calibrator.calibrate(progress=True)
+    calibration_time = time.time() - start_time
+    
+    logger.info(f"Calibration completed in {calibration_time:.2f} seconds")
+    return calibrated_model
+
+
+def analyze_calibration(model, calibrated_model, args):
+    """
+    Analyze calibration results.
+    
+    Args:
+        model: Original FP32 model
+        calibrated_model: Calibrated model
+        args: Command line arguments
+    
+    Returns:
+        Analysis results
+    """
+    logger.info(f"Analyzing calibration results")
+    
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create a random test input for analysis
+    test_input = torch.randn(1, 3, args.img_size, args.img_size).to(device)
+    
+    # Measure quantization error
+    error_results = measure_quantization_error(
+        fp32_model=model.to(device),
+        int8_model=calibrated_model,
+        test_input=test_input
+    )
+    
+    # Find layers with high error
+    high_error_layers = []
+    for layer_name, error in error_results.items():
+        if error['abs_error'] > args.error_threshold:
+            high_error_layers.append((layer_name, error['abs_error']))
+    
+    # Sort by error
+    high_error_layers.sort(key=lambda x: x[1], reverse=True)
+    
+    # Log results
+    logger.info(f"Found {len(high_error_layers)} layers with error above threshold {args.error_threshold}")
+    
+    for layer_name, error in high_error_layers[:10]:  # Show top 10
+        logger.info(f"Layer {layer_name}: Error = {error:.6f}")
+    
+    # Create analysis report
+    analysis_report = {
+        'high_error_layers': high_error_layers,
+        'error_results': error_results,
+        'error_threshold': args.error_threshold
+    }
+    
+    return analysis_report
+
+
+def save_calibrated_model(calibrated_model, analysis_report, args):
+    """
+    Save calibrated model and analysis report.
+    
+    Args:
+        calibrated_model: Calibrated model
+        analysis_report: Analysis report
+        args: Command line arguments
+    
+    Returns:
+        Path to saved model
+    """
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Save calibrated model
+    model_path = os.path.join(args.output_dir, f'yolov8_{args.model}_calibrated_{args.method}.pt')
+    
+    # Save model with metadata
+    metadata = {
+        'calibration_method': args.method,
+        'img_size': args.img_size,
+        'num_batches': args.num_batches,
+        'batch_size': args.batch_size,
+        'device': args.device,
+        'percentile': args.percentile if args.method == 'percentile' else None,
+        'calibration_config': args.calib_config,
+        'original_weights': args.weights,
+        'timestamp': time.strftime('%Y%m%d-%H%M%S')
+    }
+    
+    # We need to save both the model state and the quantization parameters
+    torch.save({
+        'model_state_dict': calibrated_model.state_dict(),
+        'metadata': metadata,
+        'analysis': analysis_report if args.analyze else None
+    }, model_path)
+    
+    logger.info(f"Calibrated model saved to {model_path}")
+    
+    # Export quantization configuration if requested
+    if args.export_config:
+        # Extract quantization parameters
+        quant_params = {}
+        for name, module in calibrated_model.named_modules():
+            if hasattr(module, 'activation_post_process') and hasattr(module.activation_post_process, 'min_val'):
+                observer = module.activation_post_process
+                
+                if hasattr(observer, 'min_val') and hasattr(observer, 'max_val'):
+                    quant_params[name] = {
+                        'min_val': observer.min_val.item() if hasattr(observer.min_val, 'item') else float(observer.min_val),
+                        'max_val': observer.max_val.item() if hasattr(observer.max_val, 'item') else float(observer.max_val)
+                    }
+        
+        # Create configuration file
+        config_path = os.path.join(args.output_dir, f'calibration_config_{args.method}.yaml')
+        
+        # Load existing configuration if available
+        if os.path.exists(args.calib_config):
+            with open(args.calib_config, 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            config = {'quantization': {}}
+        
+        # Add calibration parameters
+        config['quantization']['calibration'] = {
+            'method': args.method,
+            'parameters': quant_params,
+            'metadata': metadata
+        }
+        
+        # Add high error layers if available
+        if args.analyze and 'high_error_layers' in analysis_report:
+            config['quantization']['critical_layers'] = [
+                name for name, _ in analysis_report['high_error_layers']
+            ]
+        
+        # Save configuration
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
+        
+        logger.info(f"Calibration configuration saved to {config_path}")
+    
+    return model_path
+
+
+def main():
+    """Main calibration function"""
+    # Parse arguments
+    args = parse_args()
+    
+    # Load pretrained FP32 model
+    model, num_classes = load_fp32_model(args)
+    
+    # Create calibration dataset
+    calibration_loader = create_calibration_dataset(args)
+    
+    # Prepare model for calibration
+    prepared_model = prepare_model_for_calibration(model, args)
+    
+    # Run calibration
+    calibrated_model = run_calibration(prepared_model, calibration_loader, args)
+    
+    # Analyze calibration results if requested
+    if args.analyze:
+        analysis_report = analyze_calibration(model, calibrated_model, args)
+    else:
+        analysis_report = None
+    
+    # Save calibrated model
+    model_path = save_calibrated_model(calibrated_model, analysis_report, args)
+    
+    logger.info(f"Calibration process completed successfully")
+    
+    return model_path
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"Error during calibration: {e}")
+        sys.exit(1)
+
+// evaluate.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Evaluation script for YOLOv8 models (FP32 and INT8).
+
+This script evaluates YOLOv8 models on validation/test datasets,
+providing comprehensive metrics for both floating-point and quantized models.
+It also supports comparison between both model types to analyze the
+impact of quantization on model performance.
+"""
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+import torch
+import time
+import json
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+
+# Add project root to path to allow imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(script_dir))
+sys.path.append(project_root)
+
+from src.models import (
+    create_yolov8_model,
+    convert_yolov8_to_quantized
+)
+from src.data_utils import (
+    create_dataloader,
+    get_dataset_from_yaml
+)
+from src.evaluation import (
+    evaluate_model,
+    compare_fp32_int8_models,
+    generate_evaluation_report
+)
+from src.deployment import (
+    create_inference_engine,
+    benchmark_inference,
+    measure_layer_wise_quantization_error
+)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('evaluate')
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Evaluate YOLOv8 models (FP32 and INT8)')
+    
+    # Dataset settings
+    parser.add_argument('--data', type=str, default='dataset/vietnam-traffic-sign-detection/dataset.yaml',
+                        help='path to dataset configuration yaml file')
+    
+    # Model settings
+    parser.add_argument('--model', type=str, default=None,
+                        help='path to model file (can be FP32 or INT8)')
+    parser.add_argument('--fp32-model', type=str, default=None,
+                        help='path to FP32 model file (for comparison)')
+    parser.add_argument('--int8-model', type=str, default=None,
+                        help='path to INT8 model file (for comparison)')
+    parser.add_argument('--img-size', type=int, default=640,
+                        help='input image size')
+    
+    # Evaluation settings
+    parser.add_argument('--batch-size', type=int, default=16,
+                        help='batch size for evaluation')
+    parser.add_argument('--workers', type=int, default=8,
+                        help='number of data loading workers')
+    parser.add_argument('--device', type=str, default='',
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--conf-thres', type=float, default=0.25,
+                        help='confidence threshold for detection')
+    parser.add_argument('--iou-thres', type=float, default=0.5,
+                        help='NMS IoU threshold')
+    parser.add_argument('--num-samples', type=int, default=None,
+                        help='number of samples to evaluate (default: all)')
+    
+    # Comparison settings
+    parser.add_argument('--compare', action='store_true',
+                        help='compare FP32 and INT8 models')
+    parser.add_argument('--benchmark', action='store_true',
+                        help='benchmark model inference speed')
+    parser.add_argument('--error-analysis', action='store_true',
+                        help='analyze quantization error')
+    
+    # Output settings
+    parser.add_argument('--output-dir', type=str, default='logs/evaluation',
+                        help='path to save evaluation results')
+    parser.add_argument('--save-plots', action='store_true',
+                        help='save visualization plots')
+    parser.add_argument('--num-vis', type=int, default=5,
+                        help='number of images to visualize')
+    
+    return parser.parse_args()
+
+
+def load_model(model_path, device, is_quantized=False):
+    """
+    Load model from file.
+    
+    Args:
+        model_path: Path to model file
+        device: Device to load model on
+        is_quantized: Whether the model is quantized
+    
+    Returns:
+        Loaded model
+    """
+    logger.info(f"Loading model from {model_path}")
+    
+    try:
+        # Load checkpoint
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # Extract model from checkpoint
+        if isinstance(checkpoint, dict):
+            if 'model' in checkpoint:
+                model = checkpoint['model']
+            elif 'model_state_dict' in checkpoint:
+                # Need to initialize model first
+                # Try to determine model name and number of classes
+                model_name = 'yolov8n'  # Default
+                num_classes = 80  # Default
+                
+                # Check if metadata exists
+                if 'metadata' in checkpoint:
+                    metadata = checkpoint['metadata']
+                    if 'model_name' in metadata:
+                        model_name = metadata['model_name']
+                    if 'num_classes' in metadata:
+                        num_classes = metadata['num_classes']
+                
+                # Create model
+                model = create_yolov8_model(
+                    model_name=model_name,
+                    num_classes=num_classes,
+                    pretrained=False
+                )
+                
+                # Load state dict
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                # Try to load as a state dict directly
+                model = checkpoint
+        else:
+            model = checkpoint
+        
+        # Convert to quantized model if specified
+        if is_quantized and not _is_already_quantized(model):
+            logger.info("Converting model to quantized format")
+            model = convert_yolov8_to_quantized(model)
+        
+        # Move model to device
+        model = model.to(device)
+        
+        # Set model to evaluation mode
+        model.eval()
+        
+        return model
+        
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        raise
+
+
+def _is_already_quantized(model):
+    """
+    Check if model is already quantized.
+    
+    Args:
+        model: Model to check
+        
+    Returns:
+        True if model is quantized, False otherwise
+    """
+    # Check if any module has quantized parameters
+    for module in model.modules():
+        if hasattr(module, '_is_quantized') and module._is_quantized:
+            return True
+        if hasattr(module, 'weight_fake_quant') or hasattr(module, 'activation_post_process'):
+            # This is likely a QAT model, not a fully quantized model
+            return False
+    
+    # Check for quantized modules patterns
+    quantized_module_types = [
+        'QuantizedConv2d',
+        'QuantizedLinear',
+        'QuantizedBatchNorm2d'
+    ]
+    
+    for name, module in model.named_modules():
+        module_type = module.__class__.__name__
+        if any(qtype in module_type for qtype in quantized_module_types):
+            return True
+    
+    return False
+
+
+def create_dataloader_from_args(args, mode='val'):
+    """
+    Create dataloader from arguments.
+    
+    Args:
+        args: Command line arguments
+        mode: Dataset mode ('val' or 'test')
+        
+    Returns:
+        DataLoader object
+    """
+    logger.info(f"Creating {mode} dataloader from {args.data}")
+    
+    dataloader, dataset = create_dataloader(
+        dataset_yaml=args.data,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        augment=False,
+        shuffle=False,
+        workers=args.workers,
+        mode=mode
+    )
+    
+    # If num_samples is specified, limit the dataset
+    if args.num_samples is not None and args.num_samples < len(dataset):
+        logger.info(f"Limiting evaluation to {args.num_samples} samples")
+        
+        # Create subset
+        from torch.utils.data import Subset
+        indices = torch.randperm(len(dataset))[:args.num_samples]
+        dataset = Subset(dataset, indices)
+        
+        # Create new dataloader with subset
+        from torch.utils.data import DataLoader
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            collate_fn=getattr(dataset, 'collate_fn', None)
+        )
+    
+    return dataloader
+
+
+def evaluate_single_model(model, dataloader, args):
+    """
+    Evaluate a single model.
+    
+    Args:
+        model: Model to evaluate
+        dataloader: DataLoader for evaluation
+        args: Command line arguments
+        
+    Returns:
+        Evaluation metrics
+    """
+    logger.info("Evaluating model...")
+    
+    # Create device
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Perform evaluation
+    start_time = time.time()
+    
+    metrics = evaluate_model(
+        model=model, 
+        dataloader=dataloader,
+        conf_threshold=args.conf_thres,
+        iou_threshold=args.iou_thres,
+        device=device
+    )
+    
+    evaluation_time = time.time() - start_time
+    logger.info(f"Evaluation completed in {evaluation_time:.2f} seconds")
+    
+    # Log results
+    logger.info("Evaluation results:")
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)):
+            logger.info(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+    
+    # Add benchmark if requested
+    if args.benchmark:
+        logger.info("Benchmarking model inference speed...")
+        benchmark_results = benchmark_inference(
+            model=model,
+            input_shape=(1, 3, args.img_size, args.img_size),
+            num_runs=100,
+            device=device
+        )
+        
+        # Add benchmark results to metrics
+        metrics['benchmark'] = benchmark_results
+        
+        # Log benchmark results
+        logger.info(f"Inference time: {benchmark_results['mean_inference_time']*1000:.2f} ms")
+        logger.info(f"Frames per second: {benchmark_results['fps']:.2f}")
+    
+    return metrics
+
+
+def compare_models(fp32_model, int8_model, dataloader, args):
+    """
+    Compare FP32 and INT8 models.
+    
+    Args:
+        fp32_model: FP32 model
+        int8_model: INT8 model
+        dataloader: DataLoader for evaluation
+        args: Command line arguments
+        
+    Returns:
+        Comparison results
+    """
+    logger.info("Comparing FP32 and INT8 models...")
+    
+    # Create device
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Define metrics to compute
+    metrics = ['accuracy', 'latency']
+    if args.error_analysis:
+        metrics.append('output_error')
+        metrics.append('layer_outputs')
+    
+    # Perform comparison
+    start_time = time.time()
+    
+    results = compare_fp32_int8_models(
+        fp32_model=fp32_model,
+        int8_model=int8_model,
+        dataloader=dataloader,
+        metrics=metrics,
+        device=device,
+        num_samples=args.num_samples
+    )
+    
+    comparison_time = time.time() - start_time
+    logger.info(f"Comparison completed in {comparison_time:.2f} seconds")
+    
+    # Log comparison results
+    if 'accuracy_comparison' in results:
+        acc_comp = results['accuracy_comparison']
+        logger.info(f"FP32 mAP@.5: {acc_comp.get('fp32_map50', 0):.4f}")
+        logger.info(f"INT8 mAP@.5: {acc_comp.get('int8_map50', 0):.4f}")
+        logger.info(f"Absolute change: {acc_comp.get('absolute_change', 0):.4f}")
+        logger.info(f"Relative change: {acc_comp.get('relative_change', 0)*100:.2f}%")
+    
+    if 'latency_comparison' in results:
+        lat_comp = results['latency_comparison']
+        logger.info(f"FP32 inference time: {lat_comp.get('fp32_time', 0)*1000:.2f} ms")
+        logger.info(f"INT8 inference time: {lat_comp.get('int8_time', 0)*1000:.2f} ms")
+        logger.info(f"Speedup: {lat_comp.get('speedup', 0):.2f}x")
+        logger.info(f"FP32 FPS: {lat_comp.get('fp32_fps', 0):.2f}")
+        logger.info(f"INT8 FPS: {lat_comp.get('int8_fps', 0):.2f}")
+    
+    # Perform error analysis if requested
+    if args.error_analysis and 'layer_comparison' in results:
+        # Sort layers by error
+        layer_errors = [(name, data['mean_error']) for name, data in results['layer_comparison'].items()]
+        layer_errors.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log top 10 layers with highest error
+        logger.info("Top 10 layers with highest quantization error:")
+        for i, (name, error) in enumerate(layer_errors[:10]):
+            logger.info(f"{i+1}. {name}: {error:.6f}")
+    
+    return results
+
+
+def analyze_quantization_error(fp32_model, int8_model, args):
+    """
+    Analyze quantization error between FP32 and INT8 models.
+    
+    Args:
+        fp32_model: FP32 model
+        int8_model: INT8 model
+        args: Command line arguments
+        
+    Returns:
+        Error analysis results
+    """
+    logger.info("Analyzing quantization error...")
+    
+    # Create device
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create test input
+    test_input = torch.randn(1, 3, args.img_size, args.img_size).to(device)
+    
+    # Measure layer-wise quantization error
+    error_results = measure_layer_wise_quantization_error(fp32_model, int8_model, test_input)
+    
+    # Sort layers by error
+    sorted_errors = sorted(error_results.items(), key=lambda x: x[1]['abs_error'], reverse=True)
+    
+    # Log top 10 layers with highest error
+    logger.info("Top 10 layers with highest quantization error:")
+    for i, (name, error) in enumerate(sorted_errors[:10]):
+        logger.info(f"{i+1}. {name}: abs_error={error['abs_error']:.6f}, rel_error={error['rel_error']:.6f}")
+    
+    return error_results
+
+
+def save_results(results, args, name_suffix=""):
+    """
+    Save evaluation results to file.
+    
+    Args:
+        results: Evaluation results
+        args: Command line arguments
+        name_suffix: Suffix for filename
+        
+    Returns:
+        Path to saved results
+    """
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Create results filename
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    results_file = os.path.join(args.output_dir, f"evaluation_results_{timestamp}{name_suffix}.json")
+    
+    # Convert numpy types to native Python types for JSON serialization
+    def convert_for_json(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, torch.Tensor):
+            return obj.cpu().detach().numpy().tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_for_json(i) for i in obj]
+        else:
+            return obj
+    
+    # Convert results to JSON-serializable format
+    serializable_results = convert_for_json(results)
+    
+    # Save results
+    with open(results_file, 'w') as f:
+        json.dump(serializable_results, f, indent=2)
+    
+    logger.info(f"Results saved to {results_file}")
+    
+    # If save_plots is True and comparison results, generate visual report
+    if args.save_plots and 'accuracy_comparison' in results:
+        report_dir = os.path.join(args.output_dir, f"report_{timestamp}")
+        report_path = generate_evaluation_report(results, output_path=report_dir)
+        logger.info(f"Evaluation report generated at {report_path}")
+    
+    return results_file
+
+
+def main():
+    """Main evaluation function"""
+    # Parse command line arguments
+    args = parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Create device
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+    
+    # Create evaluation dataloader
+    dataloader = create_dataloader_from_args(args, mode='val')
+    
+    # Determine which model(s) to evaluate
+    if args.compare:
+        # Both FP32 and INT8 models need to be provided for comparison
+        if not args.fp32_model or not args.int8_model:
+            raise ValueError("Both --fp32-model and --int8-model must be provided for comparison")
+        
+        # Load FP32 model
+        fp32_model = load_model(args.fp32_model, device, is_quantized=False)
+        
+        # Load INT8 model
+        int8_model = load_model(args.int8_model, device, is_quantized=True)
+        
+        # Compare models
+        comparison_results = compare_models(fp32_model, int8_model, dataloader, args)
+        
+        # Save comparison results
+        save_results(comparison_results, args, name_suffix="_comparison")
+        
+        # Perform error analysis if requested
+        if args.error_analysis:
+            error_results = analyze_quantization_error(fp32_model, int8_model, args)
+            save_results(error_results, args, name_suffix="_error_analysis")
+    else:
+        # Single model evaluation
+        if not args.model:
+            raise ValueError("--model must be provided for single model evaluation")
+        
+        # Determine if model is quantized based on filename
+        is_quantized = "int8" in args.model.lower() or "quantized" in args.model.lower()
+        
+        # Load model
+        model = load_model(args.model, device, is_quantized=is_quantized)
+        
+        # Evaluate model
+        eval_results = evaluate_single_model(model, dataloader, args)
+        
+        # Save evaluation results
+        model_type = "int8" if is_quantized else "fp32"
+        save_results(eval_results, args, name_suffix=f"_{model_type}")
+    
+    logger.info("Evaluation completed successfully!")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"Error during evaluation: {e}")
+        sys.exit(1)
+
+// export.py
+import torch
+import argparse
+from pathlib import Path
+
+from src.models.yolov8_qat import YOLOv8QAT
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Export YOLOv8-QAT model")
+    parser.add_argument("--model", type=str, required=True, help="Path to QAT model checkpoint")
+    parser.add_argument("--format", type=str, default="onnx", choices=["onnx", "tflite"], help="Export format")
+    parser.add_argument("--output", type=str, default="models/exported", help="Output directory")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    
+    # Load model
+    model = YOLOv8QAT(args.model)
+    model.eval()
+    
+    # Create output directory
+    output_dir = Path(args.output) / args.format
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Export model
+    if args.format == "onnx":
+        # Export to ONNX
+        model.export_onnx(output_dir / "yolov8_qat.onnx")
+    elif args.format == "tflite":
+        # Export to TFLite (you'll need to implement this)
+        pass
+    
+    print(f"Model exported to {output_dir}")
+
+if __name__ == "__main__":
+    main()
+
+// sensitive_analysis.py
+# Identifies layers most sensitive to quantization
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Sensitivity analysis for YOLOv8 quantization.
+
+This script performs sensitivity analysis to identify which layers are most
+sensitive to quantization in a YOLOv8 model. It helps prioritize layers that 
+need special handling during quantization-aware training, such as using 
+different quantization schemes or precision levels.
+"""
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+import time
+
+# Add project root to path to allow imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(script_dir))
+sys.path.append(project_root)
+
+from src.models import create_yolov8_model, prepare_model_for_qat
+from src.data_utils import create_dataloader, get_dataset_from_yaml
+from src.evaluation import evaluate_model, measure_quantization_error
+from src.quantization import load_quantization_config
+from src.quantization.qconfig import get_qconfig_by_name
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('sensitivity_analysis')
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Perform sensitivity analysis for YOLOv8 quantization")
+    
+    # Model settings
+    parser.add_argument('--model', type=str, required=True, 
+                        help='Path to FP32 model file to analyze')
+    parser.add_argument('--img-size', type=int, default=640, 
+                        help='Input image size')
+    
+    # Dataset settings
+    parser.add_argument('--data', type=str, default='dataset/vietnam-traffic-sign-detection/dataset.yaml',
+                        help='Path to dataset configuration yaml file')
+    parser.add_argument('--batch-size', type=int, default=1, 
+                        help='Batch size for evaluation')
+    parser.add_argument('--num-samples', type=int, default=50,
+                        help='Number of samples to use for sensitivity analysis')
+    
+    # Analysis settings
+    parser.add_argument('--target-layers', type=str, default=None,
+                        help='Comma-separated list of layer patterns to analyze (regex supported)')
+    parser.add_argument('--qconfig', type=str, default='default',
+                        help='Base quantization configuration to use')
+    parser.add_argument('--device', type=str, default='',
+                        help='Device to run analysis on')
+    parser.add_argument('--metric', type=str, default='map',
+                        choices=['map', 'loss', 'error'],
+                        help='Metric to use for sensitivity measurement')
+    parser.add_argument('--quant-type', type=str, default='per_tensor',
+                        choices=['per_tensor', 'per_channel', 'symmetric', 'asymmetric'],
+                        help='Type of quantization to test')
+    
+    # Output settings
+    parser.add_argument('--output-dir', type=str, default='logs/sensitivity_analysis',
+                        help='Directory to save results')
+    parser.add_argument('--recommend-config', action='store_true',
+                        help='Generate recommended QAT configuration file')
+    
+    return parser.parse_args()
+
+
+def load_model(model_path, device):
+    """
+    Load model from file.
+    
+    Args:
+        model_path: Path to model file
+        device: Device to load model on
+        
+    Returns:
+        Loaded model
+    """
+    logger.info(f"Loading model from {model_path}")
+    
+    try:
+        # Load checkpoint
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # Extract model from checkpoint
+        if isinstance(checkpoint, dict):
+            if 'model' in checkpoint:
+                model = checkpoint['model']
+            elif 'model_state_dict' in checkpoint:
+                # Need to initialize model first
+                # Try to determine model name and number of classes
+                model_name = 'yolov8n'  # Default
+                num_classes = 80  # Default
+                
+                # Try to extract from metadata if available
+                if 'metadata' in checkpoint:
+                    metadata = checkpoint['metadata']
+                    if 'model_name' in metadata:
+                        model_name = metadata['model_name']
+                    if 'num_classes' in metadata:
+                        num_classes = metadata['num_classes']
+                
+                # Create model with detected architecture
+                model = create_yolov8_model(
+                    model_name=model_name,
+                    num_classes=num_classes,
+                    pretrained=False
+                )
+                
+                # Load state dict
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                # Try to load as a state dict directly
+                model = checkpoint
+        else:
+            model = checkpoint
+        
+        # Move model to device
+        model = model.to(device)
+        
+        # Set model to evaluation mode
+        model.eval()
+        
+        return model
+    
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        raise
+
+
+def get_target_layers(model, patterns=None):
+    """
+    Get layers to analyze based on patterns.
+    
+    Args:
+        model: Model to analyze
+        patterns: List of regex patterns to match layer names
+        
+    Returns:
+        List of (name, module) tuples for target layers
+    """
+    import re
+    
+    # Default patterns if none provided
+    if patterns is None:
+        patterns = [
+            r'.*\.conv\d+$',  # Convolution layers
+            r'.*\.linear$',   # Linear layers
+            r'.*\.bn\d+$',    # Batch normalization layers
+            r'.*\.cv\d+$',    # YOLOv8 specific conv layers
+            r'.*\.m\.\d+$'    # YOLOv8 bottleneck layers
+        ]
+    elif isinstance(patterns, str):
+        patterns = patterns.split(',')
+    
+    # Find all layers matching the patterns
+    target_layers = []
+    
+    for name, module in model.named_modules():
+        if any(re.match(pattern, name) for pattern in patterns):
+            # Only add modules that contain parameters
+            if any(p.requires_grad for p in module.parameters()):
+                # Skip certain layer types that shouldn't be quantized
+                if not any(t in type(module).__name__.lower() for t in 
+                          ['relu', 'sigmoid', 'tanh', 'pool', 'upsample']):
+                    target_layers.append((name, module))
+    
+    logger.info(f"Found {len(target_layers)} target layers to analyze")
+    return target_layers
+
+
+def prepare_layer_for_quantization(model, layer_name, qconfig):
+    """
+    Prepare a specific layer for quantization.
+    
+    Args:
+        model: Model to modify
+        layer_name: Name of layer to quantize
+        qconfig: Quantization configuration to apply
+        
+    Returns:
+        Prepared model
+    """
+    # Make a deep copy of the model
+    model_copy = type(model)()
+    model_copy.load_state_dict(model.state_dict())
+    model_copy.eval()
+    
+    # Avoid modifying the input model
+    model = model_copy
+    
+    # First, make sure no layers are prepared for quantization
+    for name, module in model.named_modules():
+        if hasattr(module, 'qconfig'):
+            module.qconfig = None
+    
+    # Then, prepare only the target layer
+    for name, module in model.named_modules():
+        if name == layer_name:
+            logger.debug(f"Applying qconfig to layer: {name}")
+            module.qconfig = qconfig
+            
+            # For Conv and Linear layers, ensure all parent modules also have qconfig
+            # to support proper quantization
+            parent_name = '.'.join(name.split('.')[:-1])
+            while parent_name:
+                parent = dict(model.named_modules()).get(parent_name)
+                if parent is not None and hasattr(parent, 'qconfig'):
+                    parent.qconfig = qconfig
+                parent_name = '.'.join(parent_name.split('.')[:-1])
+    
+    # Prepare model with PyTorch's quantization utilities
+    try:
+        from torch.quantization import prepare_qat
+        prepared_model = prepare_qat(model, inplace=True)
+        return prepared_model
+    except Exception as e:
+        logger.error(f"Error preparing layer {layer_name} for quantization: {e}")
+        return model
+
+
+def evaluate_layer_sensitivity(model, layer_name, layer, dataloader, qconfig, args):
+    """
+    Evaluate sensitivity of a layer to quantization.
+    
+    Args:
+        model: Base model
+        layer_name: Name of layer to evaluate
+        layer: Module to evaluate
+        dataloader: DataLoader for evaluation
+        qconfig: Quantization configuration to apply
+        args: Command line arguments
+        
+    Returns:
+        Sensitivity score and metrics
+    """
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Set model to eval mode
+    model.eval()
+    
+    # Get baseline performance
+    logger.debug(f"Measuring baseline performance for {layer_name}")
+    
+    # Create a model copy for baseline
+    baseline_model = type(model)()
+    baseline_model.load_state_dict(model.state_dict())
+    baseline_model.to(device)
+    baseline_model.eval()
+    
+    # Get baseline metric
+    baseline_metrics = evaluate_model(
+        model=baseline_model,
+        dataloader=dataloader,
+        conf_threshold=0.25,
+        iou_threshold=0.5,
+        device=device
+    )
+    
+    # Get baseline score based on selected metric
+    if args.metric == 'map':
+        baseline_score = baseline_metrics.get('mAP@.5', 0)
+    elif args.metric == 'loss':
+        baseline_score = baseline_metrics.get('val_loss', 0)
+    else:  # 'error'
+        # Just use a perfect score as baseline
+        baseline_score = 0
+    
+    # Prepare the single layer for quantization
+    logger.debug(f"Preparing layer {layer_name} for quantization with {args.quant_type}")
+    quantized_model = prepare_layer_for_quantization(model, layer_name, qconfig)
+    quantized_model.to(device)
+    quantized_model.eval()
+    
+    # Create a test input for error measurement
+    test_batch = next(iter(dataloader))
+    if isinstance(test_batch, (tuple, list)) and len(test_batch) >= 1:
+        test_input = test_batch[0]
+    elif isinstance(test_batch, dict) and 'img' in test_batch:
+        test_input = test_batch['img']
+    elif isinstance(test_batch, dict) and 'image' in test_batch:
+        test_input = test_batch['image']
+    else:
+        logger.warning(f"Unexpected batch format: {type(test_batch)}")
+        # Create a dummy input as fallback
+        test_input = torch.randn(1, 3, args.img_size, args.img_size)
+    
+    test_input = test_input.to(device)
+    
+    # Measure quantization error for this layer
+    if args.metric == 'error':
+        # Get activations from both models to compare
+        original_output = None
+        quantized_output = None
+        
+        def _get_original_activation(module, input, output):
+            nonlocal original_output
+            if isinstance(output, torch.Tensor):
+                original_output = output.detach()
+            
+        def _get_quantized_activation(module, input, output):
+            nonlocal quantized_output
+            if isinstance(output, torch.Tensor):
+                quantized_output = output.detach()
+        
+        # Register hooks to get outputs
+        original_layer = dict(baseline_model.named_modules()).get(layer_name)
+        quantized_layer = dict(quantized_model.named_modules()).get(layer_name)
+        
+        if original_layer is not None and quantized_layer is not None:
+            hook1 = original_layer.register_forward_hook(_get_original_activation)
+            hook2 = quantized_layer.register_forward_hook(_get_quantized_activation)
+            
+            # Run forward passes
+            with torch.no_grad():
+                _ = baseline_model(test_input)
+                _ = quantized_model(test_input)
+            
+            # Remove hooks
+            hook1.remove()
+            hook2.remove()
+            
+            # Calculate error if outputs are available
+            if original_output is not None and quantized_output is not None:
+                # Calculate relative error
+                abs_diff = torch.abs(original_output - quantized_output)
+                abs_original = torch.abs(original_output) + torch.finfo(torch.float32).eps
+                rel_error = torch.mean((abs_diff / abs_original)).item()
+                
+                # Calculate MSE
+                mse = torch.mean((original_output - quantized_output) ** 2).item()
+                
+                quantized_score = rel_error  # Use relative error as score
+            else:
+                logger.warning(f"Could not get activations for layer {layer_name}")
+                quantized_score = 0
+                mse = 0
+        else:
+            logger.warning(f"Layer {layer_name} not found in one of the models")
+            quantized_score = 0
+            mse = 0
+    else:
+        # Evaluate quantized model performance
+        logger.debug(f"Measuring quantized performance for {layer_name}")
+        
+        quantized_metrics = evaluate_model(
+            model=quantized_model,
+            dataloader=dataloader,
+            conf_threshold=0.25,
+            iou_threshold=0.5,
+            device=device
+        )
+        
+        # Get quantized score based on selected metric
+        if args.metric == 'map':
+            quantized_score = quantized_metrics.get('mAP@.5', 0)
+        else:  # 'loss'
+            quantized_score = quantized_metrics.get('val_loss', 0)
+        
+    # Calculate sensitivity
+    if args.metric == 'map':
+        # For mAP, sensitivity is the decrease in mAP
+        sensitivity = baseline_score - quantized_score
+    elif args.metric == 'loss':
+        # For loss, sensitivity is the increase in loss
+        sensitivity = quantized_score - baseline_score
+    else:  # 'error'
+        # For error, sensitivity is directly the relative error
+        sensitivity = quantized_score
+    
+    # Clean up to prevent CUDA OOM
+    del quantized_model
+    del baseline_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    logger.info(f"Layer {layer_name} sensitivity: {sensitivity:.6f}")
+    
+    # Return sensitivity and additional metrics
+    result = {
+        'layer': layer_name,
+        'layer_type': type(layer).__name__,
+        'sensitivity': sensitivity,
+        'baseline_score': baseline_score,
+        'quantized_score': quantized_score
+    }
+    
+    # Add MSE if calculated
+    if args.metric == 'error':
+        result['mse'] = mse
+    
+    return result
+
+
+def analyze_sensitivity(model, dataloader, args):
+    """
+    Analyze sensitivity of layers to quantization.
+    
+    Args:
+        model: Model to analyze
+        dataloader: DataLoader for evaluation
+        args: Command line arguments
+        
+    Returns:
+        Sensitivity results
+    """
+    # Get target layers to analyze
+    target_layers = get_target_layers(model, args.target_layers)
+    
+    # Get quantization configuration
+    qconfig = get_qconfig_by_name(args.qconfig)
+    
+    # Customize qconfig based on quantization type
+    if args.quant_type == 'per_channel':
+        # Override with per-channel quantization
+        from torch.quantization import default_per_channel_qconfig
+        qconfig = default_per_channel_qconfig
+    elif args.quant_type == 'symmetric':
+        # Use symmetric quantization
+        from src.quantization.qconfig import create_qconfig
+        from src.quantization.observers import MinMaxObserver
+        qconfig = create_qconfig(
+            weight_qscheme=torch.per_tensor_symmetric,
+            activation_qscheme=torch.per_tensor_symmetric
+        )
+    elif args.quant_type == 'asymmetric':
+        # Use asymmetric quantization
+        from src.quantization.qconfig import create_qconfig
+        from src.quantization.observers import MinMaxObserver
+        qconfig = create_qconfig(
+            weight_qscheme=torch.per_tensor_affine,
+            activation_qscheme=torch.per_tensor_affine
+        )
+    
+    # Sample a subset of layers if there are too many
+    max_layers = args.num_samples if args.num_samples > 0 else len(target_layers)
+    if len(target_layers) > max_layers:
+        logger.info(f"Sampling {max_layers} layers out of {len(target_layers)}")
+        import random
+        random.shuffle(target_layers)
+        target_layers = target_layers[:max_layers]
+    
+    # Analyze each layer
+    results = []
+    
+    for i, (layer_name, layer) in enumerate(tqdm(target_layers, desc="Analyzing layers")):
+        try:
+            # Evaluate layer sensitivity
+            layer_result = evaluate_layer_sensitivity(
+                model=model,
+                layer_name=layer_name,
+                layer=layer,
+                dataloader=dataloader,
+                qconfig=qconfig,
+                args=args
+            )
+            
+            # Add layer result
+            results.append(layer_result)
+            
+            # Log progress
+            logger.debug(f"Processed {i+1}/{len(target_layers)} layers")
+            
+        except Exception as e:
+            logger.error(f"Error analyzing layer {layer_name}: {e}")
+    
+    # Sort results by sensitivity
+    results.sort(key=lambda x: x['sensitivity'], reverse=True)
+    
+    # Return results
+    return results
+
+
+def visualize_results(results, output_dir):
+    """
+    Visualize sensitivity analysis results.
+    
+    Args:
+        results: Sensitivity analysis results
+        output_dir: Directory to save visualizations
+        
+    Returns:
+        Path to saved visualizations
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create DataFrame from results
+    df = pd.DataFrame(results)
+    
+    # Save to CSV
+    csv_path = os.path.join(output_dir, "sensitivity_analysis.csv")
+    df.to_csv(csv_path, index=False)
+    
+    # Create bar plot of top 20 most sensitive layers
+    plt.figure(figsize=(12, 8))
+    top_n = min(20, len(results))
+    
+    # Get top N layers
+    top_layers = df.head(top_n)
+    
+    # Create bar chart
+    bars = plt.barh(
+        top_layers['layer'],
+        top_layers['sensitivity'],
+        color='blue'
+    )
+    
+    # Add labels
+    plt.xlabel('Sensitivity Score')
+    plt.ylabel('Layer')
+    plt.title(f'Top {top_n} Layers Most Sensitive to Quantization')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = os.path.join(output_dir, "sensitivity_top_layers.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create grouped bar chart by layer type
+    plt.figure(figsize=(12, 8))
+    
+    # Group by layer type and calculate mean sensitivity
+    layer_type_sensitivity = df.groupby('layer_type')['sensitivity'].mean().reset_index()
+    layer_type_sensitivity = layer_type_sensitivity.sort_values('sensitivity', ascending=False)
+    
+    # Create bar chart
+    plt.bar(
+        layer_type_sensitivity['layer_type'],
+        layer_type_sensitivity['sensitivity'],
+        color='green'
+    )
+    
+    # Add labels
+    plt.xlabel('Layer Type')
+    plt.ylabel('Average Sensitivity')
+    plt.title('Sensitivity to Quantization by Layer Type')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    # Save plot
+    type_plot_path = os.path.join(output_dir, "sensitivity_by_layer_type.png")
+    plt.savefig(type_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create histogram of sensitivity scores
+    plt.figure(figsize=(10, 6))
+    
+    plt.hist(df['sensitivity'], bins=20, color='purple', alpha=0.7)
+    plt.xlabel('Sensitivity Score')
+    plt.ylabel('Number of Layers')
+    plt.title('Distribution of Quantization Sensitivity Across Layers')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    
+    # Save plot
+    hist_path = os.path.join(output_dir, "sensitivity_distribution.png")
+    plt.savefig(hist_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create summary report
+    summary_path = os.path.join(output_dir, "sensitivity_summary.txt")
+    
+    with open(summary_path, 'w') as f:
+        f.write("Quantization Sensitivity Analysis Summary\n")
+        f.write("========================================\n\n")
+        
+        # Overall statistics
+        f.write(f"Total layers analyzed: {len(results)}\n")
+        f.write(f"Average sensitivity: {df['sensitivity'].mean():.6f}\n")
+        f.write(f"Maximum sensitivity: {df['sensitivity'].max():.6f}\n\n")
+        
+        f.write("Top 10 Most Sensitive Layers:\n")
+        f.write("-----------------------------\n")
+        
+        for i, row in df.head(10).iterrows():
+            f.write(f"{i+1}. {row['layer']} ({row['layer_type']}):\n")
+            f.write(f"   Sensitivity: {row['sensitivity']:.6f}\n")
+            f.write(f"   Baseline Score: {row['baseline_score']:.6f}\n")
+            f.write(f"   Quantized Score: {row['quantized_score']:.6f}\n")
+            f.write("\n")
+        
+        f.write("Layer Types Ranked by Average Sensitivity:\n")
+        f.write("-----------------------------------------\n")
+        
+        for i, (index, row) in enumerate(layer_type_sensitivity.iterrows()):
+            f.write(f"{i+1}. {row['layer_type']}: {row['sensitivity']:.6f}\n")
+    
+    logger.info(f"Results saved to {output_dir}")
+    return summary_path
+
+
+def generate_recommended_config(results, args):
+    """
+    Generate recommended QAT configuration based on sensitivity analysis.
+    
+    Args:
+        results: Sensitivity analysis results
+        args: Command line arguments
+        
+    Returns:
+        Path to saved configuration file
+    """
+    # Create DataFrame from results
+    df = pd.DataFrame(results)
+    
+    # Define sensitivity thresholds
+    high_threshold = df['sensitivity'].quantile(0.9)  # Top 10%
+    medium_threshold = df['sensitivity'].quantile(0.75)  # Top 25%
+    
+    # Categorize layers by sensitivity
+    high_sensitivity = df[df['sensitivity'] >= high_threshold]
+    medium_sensitivity = df[(df['sensitivity'] >= medium_threshold) & (df['sensitivity'] < high_threshold)]
+    
+    # Create configuration
+    config = {
+        "quantization": {
+            "default_qconfig": "default",
+            "skip_layers": [],
+            "layer_configs": []
+        }
+    }
+    
+    # Add high sensitivity layers with specialized configuration
+    for _, row in high_sensitivity.iterrows():
+        layer_name = row['layer']
+        layer_type = row['layer_type']
+        
+        # Escape special characters for regex pattern
+        escaped_name = layer_name.replace('.', r'\.')
+        
+        if 'conv' in layer_type.lower():
+            # For conv layers, use per-channel quantization
+            config["quantization"]["layer_configs"].append({
+                "pattern": escaped_name,
+                "qconfig": "sensitive"
+            })
+        else:
+            # For other layers, use higher precision
+            config["quantization"]["layer_configs"].append({
+                "pattern": escaped_name,
+                "qconfig": "sensitive"
+            })
+    
+    # Add medium sensitivity layers
+    for _, row in medium_sensitivity.iterrows():
+        layer_name = row['layer']
+        
+        # Escape special characters for regex pattern
+        escaped_name = layer_name.replace('.', r'\.')
+        
+        config["quantization"]["layer_configs"].append({
+            "pattern": escaped_name,
+            "qconfig": "default"
+        })
+    
+    # Add special handling for first and last layers
+    config["quantization"]["layer_configs"].append({
+        "pattern": r"model\.0\.conv",
+        "qconfig": "first_layer"
+    })
+    
+    config["quantization"]["layer_configs"].append({
+        "pattern": r"model\.\d+\.detect",
+        "qconfig": "sensitive"
+    })
+    
+    # Save configuration
+    config_path = os.path.join(args.output_dir, "recommended_qat_config.yaml")
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    
+    logger.info(f"Recommended QAT configuration saved to {config_path}")
+    return config_path
+
+
+def main():
+    """Main function"""
+    # Parse arguments
+    args = parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Set device
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+    
+    # Load model
+    model = load_model(args.model, device)
+    
+    # Create dataloader for evaluation
+    dataloader, _ = create_dataloader(
+        dataset_yaml=args.data,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        augment=False,
+        shuffle=True,  # Shuffle to get diverse samples
+        workers=4,
+        mode='val'  # Use validation set
+    )
+    
+    # Analyze sensitivity
+    start_time = time.time()
+    results = analyze_sensitivity(model, dataloader, args)
+    analysis_time = time.time() - start_time
+    logger.info(f"Sensitivity analysis completed in {analysis_time:.2f} seconds")
+    
+    # Visualize results
+    visualize_results(results, args.output_dir)
+    
+    # Generate recommended configuration if requested
+    if args.recommend_config:
+        config_path = generate_recommended_config(results, args)
+        logger.info(f"Recommended QAT configuration saved to {config_path}")
+    
+    logger.info("Sensitivity analysis completed successfully")
+    
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"Error during sensitivity analysis: {e}")
+        sys.exit(1)
+
+// train_fp32.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Train YOLOv8 model in standard FP32 mode.
+This script provides the first step in the QAT process by training a base model.
+"""
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+import torch
+from pathlib import Path
+
+# Add project root to path to allow imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(script_dir))
+sys.path.append(project_root)
+
+from src.models import (
+    create_yolov8_model, 
+    prepare_model_for_qat
+)
+from src.data_utils import (
+    create_dataloader, 
+    get_dataset_from_yaml
+)
+from src.training import (
+    Trainer,
+    build_loss_function,
+    create_lr_scheduler
+)
+from src.evaluation import evaluate_model
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('train_fp32')
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Train YOLOv8 model in FP32 mode')
+    
+    # Dataset settings
+    parser.add_argument('--data', type=str, default='dataset/vietnam-traffic-sign-detection/dataset.yaml',
+                        help='path to dataset configuration yaml file')
+    
+    # Model settings
+    parser.add_argument('--model', type=str, default='yolov8n', 
+                        help='YOLOv8 model variant (yolov8n, yolov8s, yolov8m, etc)')
+    parser.add_argument('--weights', type=str, default=None,
+                        help='initial weights path (default: None uses pretrained weights)')
+    parser.add_argument('--img-size', type=int, default=640, 
+                        help='input image size')
+    
+    # Training settings
+    parser.add_argument('--batch-size', type=int, default=16, 
+                        help='total batch size for all GPUs')
+    parser.add_argument('--epochs', type=int, default=100, 
+                        help='number of total epochs to run')
+    parser.add_argument('--workers', type=int, default=8, 
+                        help='number of data loading workers')
+    parser.add_argument('--device', type=str, default='', 
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    
+    # Optimizer settings
+    parser.add_argument('--lr', type=float, default=0.01, 
+                        help='learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.0005, 
+                        help='weight decay')
+    parser.add_argument('--momentum', type=float, default=0.937, 
+                        help='SGD momentum')
+    parser.add_argument('--optimizer', type=str, default='SGD', 
+                        help='optimizer type (SGD, Adam, AdamW)')
+    
+    # Loss function settings
+    parser.add_argument('--loss', type=str, default='focal', 
+                        help='loss function type (focal, cross_entropy)')
+    
+    # Learning rate scheduler settings
+    parser.add_argument('--scheduler', type=str, default='cosine', 
+                        help='LR scheduler (cosine, step, plateau)')
+    
+    # Saving settings
+    parser.add_argument('--output-dir', type=str, default='models/checkpoints/fp32', 
+                        help='path to save models')
+    parser.add_argument('--save-period', type=int, default=10, 
+                        help='save checkpoint every x epochs (disabled if < 1)')
+    
+    # Logging settings
+    parser.add_argument('--log-dir', type=str, default='logs/fp32', 
+                        help='path to save logs')
+    
+    return parser.parse_args()
+
+
+def setup_training(args):
+    """Setup training configuration based on arguments"""
+    # Create configuration dictionary
+    config = {
+        'model': {
+            'name': args.model,
+            'img_size': args.img_size,
+            'pretrained_weights': args.weights
+        },
+        'data': {
+            'yaml_path': args.data,
+            'img_size': args.img_size,
+            'batch_size': args.batch_size,
+            'workers': args.workers
+        },
+        'optimizer': {
+            'type': args.optimizer.lower(),
+            'lr': args.lr,
+            'weight_decay': args.weight_decay,
+            'momentum': args.momentum
+        },
+        'loss': {
+            'type': args.loss
+        },
+        'scheduler': {
+            'type': args.scheduler
+        },
+        'training': {
+            'epochs': args.epochs,
+            'device': args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
+        },
+        'output': {
+            'dir': args.output_dir,
+            'save_period': args.save_period
+        },
+        'logging': {
+            'dir': args.log_dir
+        }
+    }
+    
+    # Customize scheduler configuration based on type
+    if args.scheduler == 'cosine':
+        config['scheduler'].update({
+            'T_0': 10,
+            'T_mult': 2,
+            'eta_min': 1e-5
+        })
+    elif args.scheduler == 'step':
+        config['scheduler'].update({
+            'step_size': 30,
+            'gamma': 0.1
+        })
+    elif args.scheduler == 'plateau':
+        config['scheduler'].update({
+            'patience': 5,
+            'factor': 0.1
+        })
+    
+    # Setup callbacks
+    config['callbacks'] = [
+        {
+            'type': 'checkpoint',
+            'filepath': os.path.join(args.output_dir, 'model_{epoch:02d}_{val_loss:.4f}.pt'),
+            'monitor': 'val_loss',
+            'save_best_only': True
+        },
+        {
+            'type': 'early_stopping',
+            'monitor': 'val_loss',
+            'patience': 15
+        },
+        {
+            'type': 'tensorboard',
+            'log_dir': os.path.join(args.log_dir, 'tensorboard')
+        }
+    ]
+    
+    return config
+
+
+def create_dataloaders(config):
+    """Create train and validation dataloaders"""
+    data_config = config['data']
+    
+    logger.info(f"Loading dataset from {data_config['yaml_path']}")
+    dataset_info = get_dataset_from_yaml(data_config['yaml_path'])
+    
+    # Verify dataset has required splits
+    required_keys = ['train', 'val']
+    missing_keys = [key for key in required_keys if key not in dataset_info]
+    if missing_keys:
+        raise ValueError(f"Dataset YAML missing required keys: {missing_keys}")
+    
+    # Create train dataloader
+    train_loader, _ = create_dataloader(
+        dataset_yaml=data_config['yaml_path'],
+        batch_size=data_config['batch_size'],
+        img_size=data_config['img_size'],
+        augment=True,
+        shuffle=True,
+        workers=data_config['workers'],
+        mode='train'
+    )
+    
+    # Create validation dataloader
+    val_loader, _ = create_dataloader(
+        dataset_yaml=data_config['yaml_path'],
+        batch_size=data_config['batch_size'],
+        img_size=data_config['img_size'],
+        augment=False,
+        shuffle=False,
+        workers=data_config['workers'],
+        mode='val'
+    )
+    
+    logger.info(f"Created dataloaders: {len(train_loader)} training batches, {len(val_loader)} validation batches")
+    
+    return train_loader, val_loader, dataset_info
+
+
+def main():
+    """Main training function"""
+    # Parse arguments
+    args = parse_args()
+    
+    # Setup training configuration
+    config = setup_training(args)
+    
+    # Create output directories
+    os.makedirs(config['output']['dir'], exist_ok=True)
+    os.makedirs(config['logging']['dir'], exist_ok=True)
+    
+    # Create dataloaders
+    train_loader, val_loader, dataset_info = create_dataloaders(config)
+    
+    # Determine number of classes from dataset
+    num_classes = dataset_info.get('nc', 0)
+    if num_classes <= 0:
+        raise ValueError(f"Invalid number of classes: {num_classes}")
+    
+    logger.info(f"Training YOLOv8 model for {num_classes} classes")
+    
+    # Create model
+    model = create_yolov8_model(
+        model_name=config['model']['name'],
+        num_classes=num_classes,
+        pretrained=True,
+        pretrained_path=config['model']['pretrained_weights']
+    )
+    
+    # Output model summary
+    logger.info(f"Model created: {config['model']['name']} with {num_classes} classes")
+    
+    # Create optimizer
+    optimizer_config = config['optimizer']
+    if optimizer_config['type'] == 'sgd':
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=optimizer_config['lr'],
+            momentum=optimizer_config['momentum'],
+            weight_decay=optimizer_config['weight_decay']
+        )
+    elif optimizer_config['type'] == 'adam':
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=optimizer_config['lr'],
+            weight_decay=optimizer_config['weight_decay']
+        )
+    elif optimizer_config['type'] == 'adamw':
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=optimizer_config['lr'],
+            weight_decay=optimizer_config['weight_decay']
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer type: {optimizer_config['type']}")
+    
+    # Create loss function
+    criterion = build_loss_function(config['loss']['type'])
+    
+    # Create learning rate scheduler
+    scheduler = create_lr_scheduler(optimizer, config['scheduler']['type'], config['scheduler'])
+    
+    # Create trainer
+    trainer_config = {
+        'optimizer': optimizer,
+        'criterion': criterion,
+        'scheduler': scheduler,
+        'callbacks': config['callbacks'],
+        'device': config['training']['device']
+    }
+    
+    trainer = Trainer(model, trainer_config)
+    
+    # Train model
+    logger.info(f"Starting training for {config['training']['epochs']} epochs")
+    trainer.train(train_loader, val_loader, config['training']['epochs'])
+    
+    # Save final model
+    final_model_path = os.path.join(config['output']['dir'], 'yolov8_fp32_final.pt')
+    trainer.save_model(final_model_path)
+    logger.info(f"Final model saved to {final_model_path}")
+    
+    # Evaluate model
+    logger.info("Evaluating model...")
+    metrics = evaluate_model(model, val_loader)
+    
+    # Log evaluation results
+    result_str = "Evaluation results:\n"
+    for k, v in metrics.items():
+        result_str += f"{k}: {v}\n"
+    logger.info(result_str)
+    
+    # Save evaluation results
+    eval_path = os.path.join(config['logging']['dir'], 'evaluation_results.txt')
+    with open(eval_path, 'w') as f:
+        f.write(result_str)
+    
+    # Save config
+    config_path = os.path.join(config['logging']['dir'], 'training_config.yaml')
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f)
+    
+    logger.info(f"Training completed. Model saved to {final_model_path}")
+    
+    return final_model_path
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"Error during training: {e}")
+        sys.exit(1)
+
+// train_qat.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Train YOLOv8 model with Quantization-Aware Training (QAT).
+This script builds upon the base FP32 model to create a quantization-ready version.
+"""
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+import torch
+from pathlib import Path
+import time
+
+# Add project root to path to allow imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(script_dir))
+sys.path.append(project_root)
+
+from src.models import (
+    create_yolov8_model, 
+    prepare_model_for_qat,
+    apply_qat_transforms
+)
+from src.data_utils import (
+    create_qat_dataloader, 
+    get_dataset_from_yaml
+)
+from src.training import (
+    QATTrainer,
+    build_loss_function,
+    create_lr_scheduler
+)
+from src.evaluation import (
+    evaluate_model,
+    compare_fp32_int8_models
+)
+from src.quantization import (
+    prepare_qat_model,
+    create_qat_config_from_config_file,
+    calibrate_model
+)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('train_qat')
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Train YOLOv8 model with Quantization-Aware Training')
+    
+    # Dataset settings
+    parser.add_argument('--data', type=str, default='dataset/vietnam-traffic-sign-detection/dataset.yaml',
+                        help='path to dataset configuration yaml file')
+    
+    # Model settings
+    parser.add_argument('--model', type=str, default='yolov8n', 
+                        help='YOLOv8 model variant (yolov8n, yolov8s, yolov8m, etc)')
+    parser.add_argument('--weights', type=str, required=True,
+                        help='path to pretrained FP32 model weights')
+    parser.add_argument('--img-size', type=int, default=640, 
+                        help='input image size')
+    
+    # QAT specific settings
+    parser.add_argument('--qat-config', type=str, default='configs/quantization_config.yaml',
+                        help='path to quantization configuration file')
+    parser.add_argument('--start-epoch', type=int, default=10,
+                        help='epoch to start applying quantization')
+    parser.add_argument('--calibrate', action='store_true',
+                        help='perform calibration before QAT')
+    parser.add_argument('--calibration-batches', type=int, default=100,
+                        help='number of batches to use for calibration')
+    
+    # Training settings
+    parser.add_argument('--batch-size', type=int, default=16, 
+                        help='total batch size for all GPUs')
+    parser.add_argument('--epochs', type=int, default=50, 
+                        help='number of total epochs to run')
+    parser.add_argument('--workers', type=int, default=8, 
+                        help='number of data loading workers')
+    parser.add_argument('--device', type=str, default='', 
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    
+    # Optimizer settings
+    parser.add_argument('--lr', type=float, default=0.001, 
+                        help='learning rate (lower than standard training)')
+    parser.add_argument('--weight-decay', type=float, default=0.0005, 
+                        help='weight decay')
+    parser.add_argument('--optimizer', type=str, default='AdamW', 
+                        help='optimizer type (SGD, Adam, AdamW)')
+    
+    # QAT distillation settings
+    parser.add_argument('--distillation', action='store_true',
+                        help='use knowledge distillation from FP32 model')
+    parser.add_argument('--temperature', type=float, default=2.0,
+                        help='temperature for knowledge distillation')
+    
+    # Learning rate scheduler settings
+    parser.add_argument('--scheduler', type=str, default='qat', 
+                        help='LR scheduler (qat, cosine, step, plateau)')
+    
+    # Saving settings
+    parser.add_argument('--output-dir', type=str, default='models/checkpoints/qat', 
+                        help='path to save models')
+    parser.add_argument('--save-period', type=int, default=5, 
+                        help='save checkpoint every x epochs (disabled if < 1)')
+    parser.add_argument('--export', action='store_true',
+                        help='export final quantized model')
+    parser.add_argument('--export-format', type=str, default='onnx',
+                        help='export format (onnx, tensorrt, openvino)')
+    
+    # Logging settings
+    parser.add_argument('--log-dir', type=str, default='logs/qat', 
+                        help='path to save logs')
+    
+    return parser.parse_args()
+
+
+def setup_training(args):
+    """Setup training configuration based on arguments"""
+    # Create configuration dictionary
+    config = {
+        'model': {
+            'name': args.model,
+            'img_size': args.img_size,
+            'pretrained_weights': args.weights
+        },
+        'data': {
+            'yaml_path': args.data,
+            'img_size': args.img_size,
+            'batch_size': args.batch_size,
+            'workers': args.workers
+        },
+        'optimizer': {
+            'type': args.optimizer.lower(),
+            'lr': args.lr,
+            'weight_decay': args.weight_decay
+        },
+        'qat': {
+            'config_path': args.qat_config,
+            'start_epoch': args.start_epoch,
+            'calibrate': args.calibration_batches if args.calibrate else 0,
+            'use_penalty': True,
+            'penalty_factor': 0.01,
+            'distillation': args.distillation,
+            'temperature': args.temperature,
+            'use_qat_scheduler': args.scheduler == 'qat',
+            'monitor_error': True,
+            'error_log_dir': os.path.join(args.log_dir, 'error_maps'),
+            'save_error_maps': True,
+            'progressive_stages': [
+                {
+                    'epoch': 0,  # Start immediately
+                    'layers': ['model.0.conv'],  # First layer
+                    'qconfig': 'first_layer'
+                },
+                {
+                    'epoch': 5,  # After 5 epochs
+                    'layers': ['model.\\d+\\.cv\\d+\\.conv'],  # Backbone layers
+                    'qconfig': 'default'
+                },
+                {
+                    'epoch': 15,  # After 15 epochs
+                    'layers': ['model.\\d+\\.m\\.\\d+\\.cv\\d+\\.conv'],  # Feature layers
+                    'qconfig': 'default'
+                },
+                {
+                    'epoch': 25,  # After 25 epochs
+                    'layers': ['model.\\d+\\.detect'],  # Detection head
+                    'qconfig': 'sensitive'
+                }
+            ],
+            'freeze_bn_epochs': 10  # Epochs after which to freeze BN
+        },
+        'scheduler': {
+            'type': args.scheduler
+        },
+        'training': {
+            'epochs': args.epochs,
+            'device': args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
+        },
+        'output': {
+            'dir': args.output_dir,
+            'save_period': args.save_period,
+            'export': args.export,
+            'export_format': args.export_format
+        },
+        'logging': {
+            'dir': args.log_dir
+        }
+    }
+    
+    # Customize scheduler configuration based on type
+    if args.scheduler == 'qat':
+        config['scheduler'].update({
+            'warmup_epochs': 5,
+            'initial_lr': args.lr / 10,
+            'peak_lr': args.lr,
+            'final_lr': args.lr / 100,
+            'total_epochs': args.epochs
+        })
+    elif args.scheduler == 'cosine':
+        config['scheduler'].update({
+            'T_0': 10,
+            'T_mult': 2,
+            'eta_min': 1e-5
+        })
+    elif args.scheduler == 'step':
+        config['scheduler'].update({
+            'step_size': 20,
+            'gamma': 0.1
+        })
+    elif args.scheduler == 'plateau':
+        config['scheduler'].update({
+            'patience': 5,
+            'factor': 0.1
+        })
+    
+    # Setup callbacks
+    config['callbacks'] = [
+        {
+            'type': 'checkpoint',
+            'filepath': os.path.join(args.output_dir, 'model_qat_{epoch:02d}_{val_loss:.4f}.pt'),
+            'monitor': 'val_loss',
+            'save_best_only': True
+        },
+        {
+            'type': 'early_stopping',
+            'monitor': 'val_loss',
+            'patience': 20
+        },
+        {
+            'type': 'tensorboard',
+            'log_dir': os.path.join(args.log_dir, 'tensorboard')
+        }
+    ]
+    
+    return config
+
+
+def create_dataloaders(config):
+    """Create train and validation dataloaders optimized for QAT"""
+    data_config = config['data']
+    
+    logger.info(f"Loading dataset from {data_config['yaml_path']}")
+    dataset_info = get_dataset_from_yaml(data_config['yaml_path'])
+    
+    # Verify dataset has required splits
+    required_keys = ['train', 'val']
+    missing_keys = [key for key in required_keys if key not in dataset_info]
+    if missing_keys:
+        raise ValueError(f"Dataset YAML missing required keys: {missing_keys}")
+    
+    # Create train dataloader with QAT-specific augmentations
+    train_loader, _ = create_qat_dataloader(
+        dataset_yaml=data_config['yaml_path'],
+        batch_size=data_config['batch_size'],
+        img_size=data_config['img_size'],
+        augment=True,
+        shuffle=True,
+        workers=data_config['workers'],
+        mode='train',
+        use_qat_transforms=True
+    )
+    
+    # Create validation dataloader
+    val_loader, _ = create_qat_dataloader(
+        dataset_yaml=data_config['yaml_path'],
+        batch_size=data_config['batch_size'],
+        img_size=data_config['img_size'],
+        augment=False,
+        shuffle=False,
+        workers=data_config['workers'],
+        mode='val',
+        use_qat_transforms=False
+    )
+    
+    # Create calibration dataloader (smaller subset for calibration)
+    if config['qat']['calibrate'] > 0:
+        # Use a subset of the validation set for calibration
+        calibration_loader, _ = create_qat_dataloader(
+            dataset_yaml=data_config['yaml_path'],
+            batch_size=data_config['batch_size'],
+            img_size=data_config['img_size'],
+            augment=False,
+            shuffle=True,  # Shuffle to get diverse samples
+            workers=data_config['workers'],
+            mode='val',
+            use_qat_transforms=False
+        )
+    else:
+        calibration_loader = None
+    
+    logger.info(f"Created dataloaders: {len(train_loader)} training batches, {len(val_loader)} validation batches")
+    
+    return train_loader, val_loader, calibration_loader, dataset_info
+
+
+def load_and_prepare_model(config, num_classes):
+    """Load FP32 model and prepare it for QAT"""
+    model_config = config['model']
+    qat_config = config['qat']
+    device = torch.device(config['training']['device'])
+    
+    # Step 1: Load the pretrained FP32 model
+    logger.info(f"Loading pretrained model from {model_config['pretrained_weights']}")
+    model = create_yolov8_model(
+        model_name=model_config['name'],
+        num_classes=num_classes,
+        pretrained=False,
+        pretrained_path=model_config['pretrained_weights']
+    )
+    
+    # Step 2: Load the QAT configuration
+    logger.info(f"Loading QAT configuration from {qat_config['config_path']}")
+    try:
+        with open(qat_config['config_path'], 'r') as f:
+            quant_config = yaml.safe_load(f)
+    except Exception as e:
+        logger.warning(f"Could not load QAT config: {e}. Using default configuration.")
+        quant_config = {
+            "quantization": {
+                "default_qconfig": "default",
+                "skip_layers": [
+                    "model.\\d+\\.forward",
+                    "model.\\d+\\.detect"
+                ],
+                "layer_configs": [
+                    {
+                        "pattern": "model.0.conv",
+                        "qconfig": "first_layer"
+                    },
+                    {
+                        "pattern": "model.\\d+\\.detect",
+                        "qconfig": "sensitive"
+                    }
+                ]
+            }
+        }
+    
+    # Step 3: Prepare the model for QAT
+    logger.info("Preparing model for Quantization-Aware Training...")
+    
+    # First, apply model transformations (fusions, etc.)
+    model = apply_qat_transforms(model)
+    
+    # Then prepare for QAT with the configuration
+    qat_model = prepare_model_for_qat(
+        model=model,
+        config_path=qat_config['config_path'] if os.path.exists(qat_config['config_path']) else None,
+        skip_layers=quant_config.get("quantization", {}).get("skip_layers", [])
+    )
+    
+    # Move model to device
+    qat_model = qat_model.to(device)
+    
+    return qat_model, model  # Return both QAT model and original FP32 model
+
+
+def calibrate_qat_model(model, calibration_loader, num_batches, device):
+    """Calibrate the QAT model to set initial quantization parameters"""
+    logger.info(f"Calibrating model with {num_batches} batches...")
+    
+    # Set model to evaluation mode for calibration
+    model.eval()
+    
+    # Process calibration batches
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(calibration_loader):
+            if batch_idx >= num_batches:
+                break
+                
+            # Extract images
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                images = batch[0]
+            else:
+                images = batch['image'] if 'image' in batch else batch['images']
+                
+            # Move to device
+            images = images.to(device)
+            
+            # Forward pass to update observers
+            _ = model(images)
+            
+            # Log progress
+            if (batch_idx + 1) % 10 == 0:
+                logger.info(f"Calibrated with {batch_idx + 1}/{num_batches} batches")
+    
+    logger.info("Calibration complete")
+    return model
+
+
+def main():
+    """Main training function"""
+    # Parse arguments
+    args = parse_args()
+    
+    # Setup training configuration
+    config = setup_training(args)
+    
+    # Create output directories
+    os.makedirs(config['output']['dir'], exist_ok=True)
+    os.makedirs(config['logging']['dir'], exist_ok=True)
+    os.makedirs(config['qat']['error_log_dir'], exist_ok=True)
+    
+    # Create dataloaders
+    train_loader, val_loader, calibration_loader, dataset_info = create_dataloaders(config)
+    
+    # Determine number of classes from dataset
+    num_classes = dataset_info.get('nc', 0)
+    if num_classes <= 0:
+        raise ValueError(f"Invalid number of classes: {num_classes}")
+    
+    logger.info(f"Training YOLOv8 model with QAT for {num_classes} classes")
+    
+    # Load and prepare model for QAT
+    qat_model, fp32_model = load_and_prepare_model(config, num_classes)
+    
+    # Perform calibration if requested
+    if config['qat']['calibrate'] > 0 and calibration_loader is not None:
+        calibration_batches = min(config['qat']['calibrate'], len(calibration_loader))
+        qat_model = calibrate_qat_model(
+            qat_model, 
+            calibration_loader, 
+            calibration_batches, 
+            config['training']['device']
+        )
+    
+    # Create QAT loss function
+    if config['qat']['distillation']:
+        from src.training.loss import DistillationLoss
+        criterion = DistillationLoss(
+            teacher_model=fp32_model,
+            temperature=config['qat']['temperature'],
+            alpha=0.5  # Balance between distillation and task loss
+        )
+        logger.info("Using knowledge distillation loss")
+    else:
+        criterion = build_loss_function(
+            loss_type='qat_penalty',
+            config={'penalty_factor': config['qat']['penalty_factor']}
+        )
+        logger.info("Using QAT penalty loss")
+    
+    # Create optimizer
+    optimizer_config = config['optimizer']
+    if optimizer_config['type'] == 'sgd':
+        optimizer = torch.optim.SGD(
+            qat_model.parameters(),
+            lr=optimizer_config['lr'],
+            momentum=0.937,  # Default momentum
+            weight_decay=optimizer_config['weight_decay']
+        )
+    elif optimizer_config['type'] == 'adam':
+        optimizer = torch.optim.Adam(
+            qat_model.parameters(),
+            lr=optimizer_config['lr'],
+            weight_decay=optimizer_config['weight_decay']
+        )
+    elif optimizer_config['type'] == 'adamw':
+        optimizer = torch.optim.AdamW(
+            qat_model.parameters(),
+            lr=optimizer_config['lr'],
+            weight_decay=optimizer_config['weight_decay']
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer type: {optimizer_config['type']}")
+    
+    # Create learning rate scheduler
+    scheduler = create_lr_scheduler(optimizer, config['scheduler']['type'], config['scheduler'])
+    
+    # Prepare QAT trainer configuration
+    trainer_config = {
+        'optimizer': optimizer,
+        'criterion': criterion,
+        'scheduler': scheduler,
+        'callbacks': config['callbacks'],
+        'device': config['training']['device'],
+        'qat': config['qat']
+    }
+    
+    # Create QAT trainer
+    trainer = QATTrainer(qat_model, trainer_config)
+    
+    # Train model
+    logger.info(f"Starting QAT training for {config['training']['epochs']} epochs")
+    start_time = time.time()
+    trainer.train(train_loader, val_loader, config['training']['epochs'])
+    training_time = time.time() - start_time
+    logger.info(f"QAT training completed in {training_time:.2f} seconds")
+    
+    # Save final QAT model
+    final_qat_model_path = os.path.join(config['output']['dir'], 'yolov8_qat_final.pt')
+    trainer.save_model(final_qat_model_path)
+    logger.info(f"Final QAT model saved to {final_qat_model_path}")
+    
+    # Convert to fully quantized model
+    logger.info("Converting QAT model to fully quantized model...")
+    quantized_model = trainer.convert_model_to_quantized()
+    
+    # Save quantized model
+    quantized_model_path = os.path.join(config['output']['dir'], 'yolov8_int8_quantized.pt')
+    torch.save(quantized_model.state_dict(), quantized_model_path)
+    logger.info(f"Quantized model saved to {quantized_model_path}")
+    
+    # Evaluate and compare models
+    logger.info("Evaluating models...")
+    
+    # Move models to appropriate device
+    device = torch.device(config['training']['device'])
+    fp32_model = fp32_model.to(device)
+    fp32_model.eval()
+    quantized_model = quantized_model.to(device)
+    quantized_model.eval()
+    
+    # Evaluate FP32 model
+    fp32_metrics = evaluate_model(fp32_model, val_loader)
+    
+    # Evaluate quantized model
+    int8_metrics = evaluate_model(quantized_model, val_loader)
+    
+    # Compare models
+    comparison = compare_fp32_int8_models(
+        fp32_model=fp32_model,
+        int8_model=quantized_model,
+        dataloader=val_loader,
+        metrics=['accuracy', 'latency', 'output_error'],
+        device=config['training']['device']
+    )
+    
+    # Log evaluation results
+    result_str = "Evaluation results:\n\n"
+    result_str += "FP32 Model:\n"
+    for k, v in fp32_metrics.items():
+        result_str += f"{k}: {v}\n"
+    
+    result_str += "\nINT8 Model:\n"
+    for k, v in int8_metrics.items():
+        result_str += f"{k}: {v}\n"
+    
+    result_str += "\nComparison:\n"
+    if 'accuracy_comparison' in comparison:
+        acc_comp = comparison['accuracy_comparison']
+        result_str += f"Accuracy change: {acc_comp.get('absolute_change', 0):.4f} ({acc_comp.get('relative_change', 0)*100:.2f}%)\n"
+    
+    if 'latency_comparison' in comparison:
+        lat_comp = comparison['latency_comparison']
+        result_str += f"Speedup: {lat_comp.get('speedup', 0):.2f}x\n"
+        result_str += f"FP32 FPS: {lat_comp.get('fp32_fps', 0):.2f}\n"
+        result_str += f"INT8 FPS: {lat_comp.get('int8_fps', 0):.2f}\n"
+    
+    logger.info(result_str)
+    
+    # Save evaluation results
+    eval_path = os.path.join(config['logging']['dir'], 'qat_evaluation_results.txt')
+    with open(eval_path, 'w') as f:
+        f.write(result_str)
+    
+    # Export model if requested
+    if config['output']['export']:
+        export_format = config['output']['export_format'].lower()
+        export_path = os.path.join(config['output']['dir'], f'yolov8_int8.{export_format}')
+        
+        logger.info(f"Exporting quantized model to {export_format} format...")
+        
+        try:
+            from src.deployment.optimize import convert_to_target_format
+            
+            # Create export configuration
+            export_config = {
+                "model_input_shape": [1, 3, config['model']['img_size'], config['model']['img_size']],
+                "opset_version": 13,
+                "simplify": True,
+                "dynamic": True
+            }
+            
+            # Export model
+            export_result = convert_to_target_format(
+                model=quantized_model,
+                output_path=export_path,
+                target_format=export_format,
+                config_path=None  # Use default export settings
+            )
+            
+            if export_result:
+                logger.info(f"Model exported successfully to {export_path}")
+            else:
+                logger.error(f"Failed to export model to {export_format} format")
+        except Exception as e:
+            logger.error(f"Error exporting model: {e}")
+    
+    logger.info(f"QAT process completed. Final model saved to {quantized_model_path}")
+    
+    return quantized_model_path
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"Error during QAT training: {e}")
+        sys.exit(1)
+
+// visualize_activation.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Visualize activations of YOLOv8 models.
+
+This script captures and visualizes activations from different layers
+of YOLOv8 models, allowing comparison between FP32 and quantized versions
+to understand the effects of quantization.
+"""
+
+import os
+import sys
+import argparse
+import logging
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import cv2
+import seaborn as sns
+
+# Add project root to path to allow imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(script_dir))
+sys.path.append(project_root)
+
+from src.models.yolov8_qat import YOLOv8QAT
+from ultralytics.data import build_dataloader
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('visualize_activation')
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Visualize layer activations in YOLOv8 models")
+    
+    # Model settings
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--model", type=str, help="Path to a single model checkpoint")
+    group.add_argument("--compare", action="store_true", help="Compare FP32 and INT8 models")
+    
+    parser.add_argument("--fp32-model", type=str, help="Path to FP32 model checkpoint (for comparison)")
+    parser.add_argument("--int8-model", type=str, help="Path to quantized INT8 model checkpoint (for comparison)")
+    
+    # Data settings
+    parser.add_argument("--data", type=str, default="data/vietnam-traffic-sign-detection/dataset.yaml", 
+                        help="Dataset YAML")
+    parser.add_argument("--image", type=str, default=None, 
+                        help="Path to a single image for visualization")
+    parser.add_argument("--batch-size", type=int, default=1, 
+                        help="Batch size")
+    
+    # Visualization settings
+    parser.add_argument("--layers", type=str, default=None, 
+                        help="Comma-separated list of layers to visualize")
+    parser.add_argument("--max-images", type=int, default=5, 
+                        help="Maximum number of images to process")
+    parser.add_argument("--max-features", type=int, default=16, 
+                        help="Maximum number of features to visualize per layer")
+    parser.add_argument("--show-layer-types", action="store_true", 
+                        help="Show available layer types in the model")
+    
+    # Output settings
+    parser.add_argument("--output", type=str, default="logs/activations", 
+                        help="Output directory")
+    
+    return parser.parse_args()
+
+def load_model(model_path, device="cuda"):
+    """
+    Load model from checkpoint.
+    
+    Args:
+        model_path: Path to model checkpoint
+        device: Device to load model on
+    
+    Returns:
+        Loaded model
+    """
+    logger.info(f"Loading model from {model_path}")
+    
+    try:
+        if "int8" in model_path.lower() or "quantized" in model_path.lower():
+            # Load quantized model
+            model = YOLOv8QAT(model_path)
+        else:
+            # Load standard model
+            checkpoint = torch.load(model_path, map_location="cpu")
+            
+            if isinstance(checkpoint, dict):
+                if "model" in checkpoint:
+                    model = checkpoint["model"]
+                elif "model_state_dict" in checkpoint:
+                    from src.models import create_yolov8_model
+                    # Try to determine model name and number of classes
+                    model_name = 'yolov8n'  # Default
+                    num_classes = 80  # Default
+                    
+                    # Check if metadata exists
+                    if 'metadata' in checkpoint:
+                        metadata = checkpoint['metadata']
+                        if 'model_name' in metadata:
+                            model_name = metadata['model_name']
+                        if 'num_classes' in metadata:
+                            num_classes = metadata['num_classes']
+                    
+                    model = create_yolov8_model(
+                        model_name=model_name,
+                        num_classes=num_classes,
+                        pretrained=False
+                    )
+                    model.load_state_dict(checkpoint["model_state_dict"])
+                else:
+                    model = checkpoint
+            else:
+                model = checkpoint
+        
+        # Set model to evaluation mode
+        model.eval()
+        
+        # Move to device
+        device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+        model = model.to(device)
+        
+        return model
+    
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        raise
+
+def register_activation_hooks(model, target_layers=None):
+    """
+    Register hooks to capture activations from model layers.
+    
+    Args:
+        model: Model to register hooks on
+        target_layers: Optional list of layer names to capture (all conv/linear layers if None)
+    
+    Returns:
+        Dictionary of hooks and dictionary to store activations
+    """
+    activations = {}
+    hooks = []
+    
+    # Function to capture activations
+    def hook_fn(name):
+        def hook(module, input, output):
+            # Store output tensor
+            activations[name] = output.detach()
+        return hook
+    
+    # Register hooks for target layers
+    if target_layers:
+        for name, module in model.named_modules():
+            if any(layer in name for layer in target_layers):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+                logger.info(f"Registered hook for layer: {name}")
+    else:
+        # Default: register for all conv and linear layers
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+                logger.info(f"Registered hook for layer: {name}")
+    
+    return hooks, activations
+
+def visualize_activation_maps(activation, layer_name, output_dir, img_idx=0, max_features=16):
+    """
+    Visualize activation maps for a layer.
+    
+    Args:
+        activation: Activation tensor
+        layer_name: Name of the layer
+        output_dir: Directory to save visualizations
+        img_idx: Index of the image in the batch
+        max_features: Maximum number of features to visualize
+    
+    Returns:
+        Path to saved visualization
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Handle different activation shapes
+    if len(activation.shape) == 4:  # Conv layer: [batch_size, channels, height, width]
+        # Get activation for the specified image
+        act = activation[img_idx].cpu().numpy()
+        num_features = min(act.shape[0], max_features)
+        
+        # Create plot grid
+        rows = int(np.ceil(np.sqrt(num_features)))
+        cols = int(np.ceil(num_features / rows))
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*3))
+        if rows * cols == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        # Plot each feature map
+        for i in range(num_features):
+            feature_map = act[i]
+            axes[i].imshow(feature_map, cmap='viridis')
+            axes[i].set_title(f"Channel {i}")
+            axes[i].axis('off')
+        
+        # Hide unused subplots
+        for i in range(num_features, len(axes)):
+            axes[i].axis('off')
+        
+        plt.suptitle(f"Activation Maps for {layer_name}")
+        plt.tight_layout()
+        
+        # Save figure
+        safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+        output_path = os.path.join(output_dir, f"{safe_layer_name}_activation_maps.png")
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    elif len(activation.shape) == 2:  # Linear layer: [batch_size, features]
+        # Get activation for the specified image
+        act = activation[img_idx].cpu().numpy()
+        
+        # Create bar plot for activation values
+        plt.figure(figsize=(10, 6))
+        plt.bar(range(len(act)), act)
+        plt.title(f"Activation Values for {layer_name}")
+        plt.xlabel("Feature Index")
+        plt.ylabel("Activation Value")
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Save figure
+        safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+        output_path = os.path.join(output_dir, f"{safe_layer_name}_activation_values.png")
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    else:
+        logger.warning(f"Unsupported activation shape: {activation.shape} for layer {layer_name}")
+        return None
+
+def visualize_activation_distributions(activations, layer_name, output_dir, title=None):
+    """
+    Visualize activation value distributions for a layer.
+    
+    Args:
+        activations: Activation tensor
+        layer_name: Name of the layer
+        output_dir: Directory to save visualizations
+        title: Optional title for the plot
+    
+    Returns:
+        Path to saved visualization
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Flatten activations to 1D array
+    act_flat = activations.flatten().cpu().numpy()
+    
+    # Create distribution plot
+    plt.figure(figsize=(10, 6))
+    sns.histplot(act_flat, bins=50, kde=True)
+    
+    if title:
+        plt.title(title)
+    else:
+        plt.title(f"Activation Distribution for {layer_name}")
+    
+    plt.xlabel("Activation Value")
+    plt.ylabel("Frequency")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add summary statistics
+    stats_text = f"Mean: {np.mean(act_flat):.4f}\nStd: {np.std(act_flat):.4f}\n"
+    stats_text += f"Min: {np.min(act_flat):.4f}\nMax: {np.max(act_flat):.4f}"
+    plt.figtext(0.02, 0.02, stats_text, fontsize=10,
+                bbox=dict(facecolor='white', alpha=0.8))
+    
+    # Save figure
+    safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+    output_path = os.path.join(output_dir, f"{safe_layer_name}_distribution.png")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return output_path
+
+def compare_activation_distributions(fp32_activation, int8_activation, layer_name, output_dir):
+    """
+    Compare activation distributions between FP32 and INT8 models.
+    
+    Args:
+        fp32_activation: Activation tensor from FP32 model
+        int8_activation: Activation tensor from INT8 model
+        layer_name: Name of the layer
+        output_dir: Directory to save visualizations
+    
+    Returns:
+        Path to saved visualization
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Flatten activations to 1D arrays
+    fp32_flat = fp32_activation.flatten().cpu().numpy()
+    int8_flat = int8_activation.flatten().cpu().numpy()
+    
+    # Create distribution plot
+    plt.figure(figsize=(12, 7))
+    
+    sns.histplot(fp32_flat, bins=50, kde=True, color='blue', alpha=0.6, label='FP32')
+    sns.histplot(int8_flat, bins=50, kde=True, color='red', alpha=0.6, label='INT8')
+    
+    plt.title(f"Activation Distribution Comparison for {layer_name}")
+    plt.xlabel("Activation Value")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add summary statistics
+    fp32_stats = f"FP32 - Mean: {np.mean(fp32_flat):.4f}, Std: {np.std(fp32_flat):.4f}"
+    int8_stats = f"INT8 - Mean: {np.mean(int8_flat):.4f}, Std: {np.std(int8_flat):.4f}"
+    
+    # Calculate mean and std differences
+    mean_diff = np.abs(np.mean(fp32_flat) - np.mean(int8_flat))
+    std_diff = np.abs(np.std(fp32_flat) - np.std(int8_flat))
+    diff_stats = f"Mean Diff: {mean_diff:.4f}, Std Diff: {std_diff:.4f}"
+    
+    plt.figtext(0.02, 0.02, fp32_stats + '\n' + int8_stats + '\n' + diff_stats, 
+                fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
+    
+    # Save figure
+    safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+    output_path = os.path.join(output_dir, f"{safe_layer_name}_comparison.png")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return output_path
+
+def visualize_quantization_error(fp32_activation, int8_activation, layer_name, output_dir):
+    """
+    Visualize quantization error between FP32 and INT8 activations.
+    
+    Args:
+        fp32_activation: Activation tensor from FP32 model
+        int8_activation: Activation tensor from INT8 model
+        layer_name: Name of the layer
+        output_dir: Directory to save visualizations
+    
+    Returns:
+        Path to saved visualization
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Calculate absolute error
+    error = torch.abs(fp32_activation - int8_activation).cpu().numpy()
+    rel_error = torch.abs((fp32_activation - int8_activation) / 
+                         (torch.abs(fp32_activation) + 1e-8)).cpu().numpy()
+    
+    # Create error visualization based on activation shape
+    if len(error.shape) == 4:  # Conv layer [B, C, H, W]
+        # Get error for first image
+        err_img = error[0]
+        rel_err_img = rel_error[0]
+        
+        # Calculate channel-wise error
+        channel_errors = np.mean(err_img, axis=(1, 2))
+        channel_rel_errors = np.mean(rel_err_img, axis=(1, 2))
+        
+        # Create heatmap of error
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot channel-wise absolute error
+        axes[0, 0].bar(range(len(channel_errors)), channel_errors)
+        axes[0, 0].set_title("Channel-wise Absolute Error")
+        axes[0, 0].set_xlabel("Channel Index")
+        axes[0, 0].set_ylabel("Mean Absolute Error")
+        axes[0, 0].grid(True, linestyle='--', alpha=0.7)
+        
+        # Plot channel-wise relative error
+        axes[0, 1].bar(range(len(channel_rel_errors)), channel_rel_errors)
+        axes[0, 1].set_title("Channel-wise Relative Error")
+        axes[0, 1].set_xlabel("Channel Index")
+        axes[0, 1].set_ylabel("Mean Relative Error")
+        axes[0, 1].grid(True, linestyle='--', alpha=0.7)
+        
+        # Plot absolute error distribution
+        sns.histplot(error.flatten(), bins=50, kde=True, ax=axes[1, 0])
+        axes[1, 0].set_title("Absolute Error Distribution")
+        axes[1, 0].set_xlabel("Absolute Error")
+        axes[1, 0].set_ylabel("Frequency")
+        axes[1, 0].grid(True, linestyle='--', alpha=0.7)
+        
+        # Plot relative error distribution
+        sns.histplot(rel_error.flatten(), bins=50, kde=True, ax=axes[1, 1])
+        axes[1, 1].set_title("Relative Error Distribution")
+        axes[1, 1].set_xlabel("Relative Error")
+        axes[1, 1].set_ylabel("Frequency")
+        axes[1, 1].grid(True, linestyle='--', alpha=0.7)
+        
+        plt.suptitle(f"Quantization Error for {layer_name}")
+        plt.tight_layout()
+        
+        # Save figure
+        safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+        output_path = os.path.join(output_dir, f"{safe_layer_name}_quantization_error.png")
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    elif len(error.shape) == 2:  # Linear layer [B, F]
+        # Get error for first image
+        err_vec = error[0]
+        rel_err_vec = rel_error[0]
+        
+        # Create error visualization
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # Plot absolute error
+        axes[0].bar(range(len(err_vec)), err_vec)
+        axes[0].set_title("Absolute Error")
+        axes[0].set_xlabel("Feature Index")
+        axes[0].set_ylabel("Absolute Error")
+        axes[0].grid(True, linestyle='--', alpha=0.7)
+        
+        # Plot relative error
+        axes[1].bar(range(len(rel_err_vec)), rel_err_vec)
+        axes[1].set_title("Relative Error")
+        axes[1].set_xlabel("Feature Index")
+        axes[1].set_ylabel("Relative Error")
+        axes[1].grid(True, linestyle='--', alpha=0.7)
+        
+        plt.suptitle(f"Quantization Error for {layer_name}")
+        plt.tight_layout()
+        
+        # Add summary statistics
+        mean_error = np.mean(err_vec)
+        max_error = np.max(err_vec)
+        mean_rel_error = np.mean(rel_err_vec)
+        stats_text = f"Mean Abs Error: {mean_error:.4f}\nMax Abs Error: {max_error:.4f}\nMean Rel Error: {mean_rel_error:.4f}"
+        plt.figtext(0.02, 0.02, stats_text, fontsize=10,
+                    bbox=dict(facecolor='white', alpha=0.8))
+        
+        # Save figure
+        safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+        output_path = os.path.join(output_dir, f"{safe_layer_name}_quantization_error.png")
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return output_path
+    
+    else:
+        logger.warning(f"Unsupported error shape: {error.shape} for layer {layer_name}")
+        return None
+
+def load_image(image_path, input_size=(640, 640)):
+    """
+    Load and preprocess an image.
+    
+    Args:
+        image_path: Path to image file
+        input_size: Size to resize the image to (width, height)
+    
+    Returns:
+        Preprocessed image
+    """
+    # Read image
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Failed to load image from {image_path}")
+    
+    # Convert BGR to RGB
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Resize image
+    img = cv2.resize(img, input_size)
+    
+    # Normalize and convert to tensor
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))  # HWC to CHW
+    img = np.expand_dims(img, axis=0)  # Add batch dimension
+    img = torch.from_numpy(img)
+    
+    return img
+
+def generate_summary_report(visualizations, output_dir):
+    """
+    Generate a summary report of all visualizations.
+    
+    Args:
+        visualizations: Dictionary of visualization paths
+        output_dir: Directory to save the report
+    
+    Returns:
+        Path to summary report
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize HTML content
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Activation Visualization Report</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            h1 { color: #333; }
+            h2 { color: #555; margin-top: 30px; }
+            .visualization { margin-bottom: 30px; }
+            img { max-width: 100%; border: 1px solid #ddd; }
+            .description { margin-top: 10px; color: #666; }
+        </style>
+    </head>
+    <body>
+        <h1>Activation Visualization Report</h1>
+    """
+    
+    # Group visualizations by layer
+    layer_visualizations = {}
+    
+    for vis_type, paths in visualizations.items():
+        for layer_name, path in paths.items():
+            if layer_name not in layer_visualizations:
+                layer_visualizations[layer_name] = {}
+            
+            layer_visualizations[layer_name][vis_type] = path
+    
+    # Add each layer's visualizations to the report
+    for layer_name, vis_dict in layer_visualizations.items():
+        html_content += f"<h2>Layer: {layer_name}</h2>\n"
+        
+        for vis_type, path in vis_dict.items():
+            rel_path = os.path.relpath(path, output_dir)
+            html_content += f"""
+            <div class="visualization">
+                <h3>{vis_type.replace('_', ' ').title()}</h3>
+                <img src="{rel_path}" alt="{vis_type} for {layer_name}">
+                <div class="description">
+                    {vis_type.replace('_', ' ').title()} visualization for layer {layer_name}
+                </div>
+            </div>
+            """
+    
+    # Close HTML content
+    html_content += """
+    </body>
+    </html>
+    """
+    
+    # Write report to file
+    report_path = os.path.join(output_dir, "activation_report.html")
+    with open(report_path, 'w') as f:
+        f.write(html_content)
+    
+    logger.info(f"Summary report generated at {report_path}")
+    return report_path
+
+def main():
+    """Main function"""
+    # Parse arguments
+    args = parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output, exist_ok=True)
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    # Load models
+    fp32_model = None
+    int8_model = None
+    
+    if args.compare:
+        # Load both models for comparison
+        if not args.fp32_model or not args.int8_model:
+            logger.error("Both --fp32-model and --int8-model must be provided for comparison")
+            return 1
+        
+        fp32_model = load_model(args.fp32_model, device=device)
+        int8_model = load_model(args.int8_model, device=device)
+    else:
+        # Load single model
+        model_path = args.model
+        if not model_path:
+            logger.error("No model path provided. Use --model or --compare with --fp32-model and --int8-model")
+            return 1
+        
+        fp32_model = load_model(model_path, device=device)
+    
+    # Print layer types if requested
+    if args.show_layer_types:
+        layer_types = {}
+        for name, module in fp32_model.named_modules():
+            module_type = str(type(module).__name__)
+            if module_type not in layer_types:
+                layer_types[module_type] = []
+            layer_types[module_type].append(name)
+        
+        print("\nAvailable layer types and examples:")
+        for layer_type, names in layer_types.items():
+            print(f"\n{layer_type}:")
+            for name in names[:3]:  # Show only first 3 examples
+                print(f"  - {name}")
+            if len(names) > 3:
+                print(f"  - ... ({len(names)-3} more)")
+        
+        print("\nSpecify layers to visualize with --layers")
+        return 0
+    
+    # Parse target layers
+    target_layers = None
+    if args.layers:
+        target_layers = args.layers.split(',')
+        logger.info(f"Targeting specific layers: {target_layers}")
+    
+    # Register hooks for FP32 model
+    fp32_hooks, fp32_activations = register_activation_hooks(fp32_model, target_layers)
+    
+    # Register hooks for INT8 model if comparing
+    int8_hooks = []
+    int8_activations = {}
+    if args.compare:
+        int8_hooks, int8_activations = register_activation_hooks(int8_model, target_layers)
+    
+    # Process images
+    if args.image:
+        # Single image mode
+        img = load_image(args.image)
+        img = img.to(device)
+        
+        # Process through FP32 model
+        with torch.no_grad():
+            _ = fp32_model(img)
+        
+        # Process through INT8 model if comparing
+        if args.compare:
+            with torch.no_grad():
+                _ = int8_model(img)
+        
+        # Image source for report
+        image_source = f"Single image: {args.image}"
+    else:
+        # Dataset mode
+        # Create dataloader
+        val_loader = build_dataloader(args.data, batch_size=args.batch_size, mode="val")
+        
+        # Process images from dataloader
+        for batch_idx, batch in enumerate(val_loader):
+            if batch_idx >= args.max_images:
+                break
+            
+            # Extract images
+            images = batch["img"]
+            images = images.to(device)
+            
+            # Process through FP32 model
+            with torch.no_grad():
+                _ = fp32_model(images)
+            
+            # Process through INT8 model if comparing
+            if args.compare:
+                with torch.no_grad():
+                    _ = int8_model(images)
+        
+        # Image source for report
+        image_source = f"Dataset: {args.data}, first {min(args.max_images, len(val_loader))} images"
+    
+    # Remove hooks
+    for hook in fp32_hooks:
+        hook.remove()
+    
+    for hook in int8_hooks:
+        hook.remove()
+    
+    # Create visualizations
+    all_visualizations = {
+        'activation_maps': {},
+        'distributions': {},
+        'comparisons': {},
+        'quantization_error': {}
+    }
+    
+    # Process FP32 activations
+    for layer_name, activation in fp32_activations.items():
+        # Skip if activation is empty or invalid
+        if activation is None or activation.numel() == 0:
+            continue
+        
+        # Create layer output directory
+        layer_dir = os.path.join(args.output, "layers", layer_name.replace('.', '_').replace('/', '_'))
+        os.makedirs(layer_dir, exist_ok=True)
+        
+        # Visualize activation maps
+        map_path = visualize_activation_maps(
+            activation, layer_name, layer_dir, 
+            img_idx=0, max_features=args.max_features
+        )
+        if map_path:
+            all_visualizations['activation_maps'][layer_name] = map_path
+        
+        # Visualize activation distribution
+        dist_path = visualize_activation_distributions(
+            activation, layer_name, layer_dir, 
+            title=f"FP32 Activation Distribution for {layer_name}"
+        )
+        if dist_path:
+            all_visualizations['distributions'][layer_name] = dist_path
+        
+        # If comparing models, create comparison visualizations
+        if args.compare and layer_name in int8_activations:
+            int8_activation = int8_activations[layer_name]
+            
+            # Compare distributions
+            comp_path = compare_activation_distributions(
+                activation, int8_activation, layer_name, layer_dir
+            )
+            if comp_path:
+                all_visualizations['comparisons'][layer_name] = comp_path
+            
+            # Visualize quantization error
+            error_path = visualize_quantization_error(
+                activation, int8_activation, layer_name, layer_dir
+            )
+            if error_path:
+                all_visualizations['quantization_error'][layer_name] = error_path
+    
+    # Generate summary report
+    report_path = generate_summary_report(all_visualizations, args.output)
+    
+    logger.info(f"Visualization complete. Report available at {report_path}")
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

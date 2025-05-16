@@ -1,0 +1,38 @@
+requirements.txt
+
+Key Components by Category
+Core PyTorch Quantization Support
+The primary benefit of using PyTorch 1.13+ is improved native quantization support, which includes:
+
+Enhanced quantization observers
+Better support for fake quantization
+Improved quantization-aware training modules
+More robust fusion patterns
+
+YOLOv8 Integration
+Ultralytics 8.0.0+ provides the YOLOv8 implementation that you'll be modifying for QAT. The package includes:
+
+YOLOv8 model architecture
+Training and evaluation pipelines
+Data loading utilities
+Export functionality
+
+Model Export and Deployment
+ONNX and ONNX Runtime provide deployment capabilities for your quantized models:
+
+ONNX: Standard format for cross-platform model deployment
+ONNX Runtime: Optimized inference engine
+
+Analysis and Visualization
+Tools for analyzing quantization effects:
+
+TensorBoard: For visualizing training metrics and model graphs
+Rich: For better console output when running experiments
+Memory-profiler: For tracking memory usage differences between FP32 and INT8 models
+
+Development and Testing
+Quality assurance tools:
+
+Pytest: For unit testing quantization modules
+Flake8 and Black: For maintaining code quality
+Sphinx: For generating documentation

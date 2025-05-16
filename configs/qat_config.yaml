@@ -1,0 +1,123 @@
+# Enhanced QAT Configuration File optimized for YOLOv8 traffic sign recognition
+
+# Model settings
+model:
+  architecture: "yolov8"
+  variant: "n"
+  pretrained_path: "models/pretrained/yolov8n.pt"
+
+# QAT phased training parameters
+qat_phased_training:
+  enabled: true
+  phase1_weight_only:
+    proportion: 0.3      # 30% of total epochs
+    lr_factor: 1.0
+    description: "Initial epochs with partial quantization (weights only)"
+  phase2_activations:
+    proportion: 0.4      # 40% of total epochs
+    lr_factor: 1.0
+    description: "Enable more quantizers gradually (activations)"
+  phase3_full_quant:
+    proportion: 0.2      # 20% of total epochs
+    lr_factor: 1.0
+    description: "Full network quantization enabled"
+  phase4_fine_tuning:
+    proportion: 0.1      # 10% of total epochs
+    lr_factor: 0.1       # Reduced learning rate for fine-tuning
+    description: "Lower LR to recover accuracy"
+
+# Quantization penalty loss parameters
+quant_penalty_loss:
+  enabled: true
+  alpha: 0.01
+  description: "Task Loss + Quant Penalty"
+
+# Quantization parameters
+quantization:
+  default_qconfig: "default"
+  
+  # Weight quantization settings
+  weight:
+    dtype: "qint8"
+    scheme: "per_channel"
+    observer: "minmax"
+    symmetric: true
+    bit_width: 8
+    channel_axis: 0
+    
+  # Activation quantization settings
+  activation:
+    dtype: "quint8"
+    scheme: "per_tensor"
+    observer: "moving_average_minmax"
+    symmetric: false
+    bit_width: 8
+  
+  # Fake quantization settings - critical for STE implementation
+  fake_quantize:
+    type: "custom"
+    grad_factor: 1.0     # Important for STE in Image 1 diagram
+    
+  # Layer-specific configurations
+  layer_configs:
+    # First convolution layer
+    - pattern: "model.0.conv"
+      config:
+        activation:
+          observer: "histogram"
+        weight:
+          observer: "per_channel_minmax"
+      fake_quantize:
+        type: "custom"
+    
+    # Detection head - use LSQ for better accuracy
+    - pattern: "model.[0-9]+.detect"
+      config:
+        activation:
+          observer: "histogram"
+        weight:
+          observer: "per_channel_minmax" 
+      fake_quantize:
+        type: "lsq"
+        
+    # Backbone layers - standard quantization
+    - pattern: "model.[0-9]+.cv[0-9]"
+      config:
+        activation:
+          observer: "moving_average_minmax"
+        weight:
+          observer: "minmax"
+      fake_quantize:
+        type: "per_channel"
+
+# Calibration parameters
+calibration:
+  method: "histogram"        # As shown in diagram 1
+  num_batches: 50            # Reduced from 100 for faster calibration
+  percentile: 99.99
+
+# QAT parameters
+qat_params:
+  skip_detection_head: false
+  fuse_modules: true
+  fusion_patterns:
+    - {pattern: "model\\.\\d+\\.conv", modules: ["conv", "bn"], fuser_method: "fuse_conv_bn"}
+    - {pattern: "model\\.\\d+\\.cv\\d+\\.conv", modules: ["conv", "bn", "silu"], fuser_method: "fuse_conv_bn_silu"}
+  analyze_quantization_effects: true
+
+# Training parameters - optimized for traffic sign recognition
+train_params:
+  epochs: 10                # Adjusted for faster training cycle
+  batch_size: 16
+  lr: 0.0005                # Lowered for QAT
+  lr_scheduler: "cosine"
+  warmup_epochs: 1
+  optimizer: "SGD"
+  momentum: 0.937
+  weight_decay: 0.0005
+
+# Export settings
+export:
+  formats: ["onnx"]
+  simplify: true
+  validate: true

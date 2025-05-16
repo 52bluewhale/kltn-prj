@@ -1,0 +1,42 @@
+configs/
+---------------------------------------------------------------------------------
+Key Points About Quantization Configuration
+	- Per-Channel vs Per-Tensor: Your configuration uses 
+	per-channel quantization for weights (weight.qscheme: per_channel_symmetric) 
+	and per-tensor for activations (activation.qscheme: per_tensor_affine).
+		=>  This is the recommended approach as per-channel 
+		provides better accuracy for weights.
+		
+	- Layer-Specific Quantization: Your configuration identifies 
+	critical layers via regex patterns and applies special quantization settings:
+		+ Detection head layers (model\.24\.*)
+		+ First convolutional layer (model\.0\.conv)
+		+ Concat layers and YOLO detection layers
+		
+	- Observer Types:
+		+ minmax: Basic observer that tracks minimum and maximum values
+		+ moving_average_minmax: Updates statistics with momentum for stability
+		+ histogram: More precise, used for accuracy-critical layers
+		
+	- Fusion Patterns: You've defined patterns to fuse:
+		+ Conv + BatchNorm + SiLU
+		+ Conv + BatchNorm
+		
+	- Debugging Features: Your configuration includes extensive debugging options:
+		+ log_histograms: Track tensor distributions
+		+ per_layer_metrics: Monitor quantization effects per layer
+		+ save_quantization_error_map: Generate error maps
+		
+Relationship Between Files
+	- base_config.yaml: Used by train_fp32.py to train your floating-point 
+	baseline model
+	- qat_config.yaml: Used by train_qat.py to perform quantization-aware 
+	training
+	- export_config.yaml: Used by export.py to export your trained QAT model
+	quantization_config.yaml: Contains detailed quantization parameters, 
+	used by both QAT training and export
+	
+User guide:
+	- Train baseline FP32 model using base_config.yaml
+	- Fine-tune with QAT using qat_config.yaml
+	- Export the quantized model using export_config.yaml

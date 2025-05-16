@@ -1,0 +1,126 @@
+kltn-prj/                      # Root project directory
+│
+├── datasets/                         # Data directory
+│   └── vietnam-traffic-sign-detection/
+│       ├── train/
+│       │   ├── images/           # Training images
+│       │   └── labels/           # YOLOv8 format annotations
+│       ├── valid/
+│       │   ├── images/           # Validation images
+│       │   └── labels/           # Validation annotations
+│       ├── test/
+│       │   ├── images/           # Test images
+│       │   └── labels/           # Test annotations
+│       └── dataset.yaml          # Dataset configuration file
+│
+├── models/                       # Model-related directory
+│   ├── pretrained/               # Pre-trained weights
+│   │   └── yolov8n.pt            # (or other variants like yolov8s.pt)
+│   ├── checkpoints/              # Training checkpoints
+│   │   ├── fp32/                 # Full precision checkpoints
+│   │   └── qat/                  # QAT checkpoints
+│   └── exported/                 # Exported quantized models
+│       ├── onnx/                 # ONNX format models
+│       ├── tflite/               # TFLite format (if needed)
+│       └── tensorrt/             # TensorRT optimized models
+│
+├── logs/                         # Logging directory
+│   ├── fp32/                     # Base model training logs
+│   ├── qat/                      # QAT training logs
+│   └── tensorboard/              # Tensorboard log files
+│
+├── src/                          # Source code directory
+│   ├── __init__.py
+│   ├── config.py                 # Configuration utilities
+│   │
+│   ├── data_utils/               # Data utilities
+│   │   ├── __init__.py
+│   │   ├── augmentation.py       # Custom augmentations
+│   │   ├── dataloader.py         # Data loading utilities
+│   │   └── preprocessing.py      # Pre-processing functions
+│   │
+│   ├── models/                   # Model architectures
+│   │   ├── __init__.py
+│   │   ├── yolov8_base.py        # Base YOLOv8 model extensions
+│   │   ├── yolov8_qat.py         # QAT adaptations for YOLOv8
+│   │   ├── yolov8_qat_modules.py # Custom QAT modules for YOLOv8
+│   │   ├── model_transforms.py   # Functions to transform models to QAT-ready
+│   │   └── critical_layers.py    # Handling for accuracy-critical layers
+│   │
+│   ├── quantization/             # Quantization-specific code
+│   │   ├── __init__.py
+│   │   ├── observers.py          # Custom observer implementations
+│   │   ├── fake_quantize.py      # Fake quantization operations
+│   │   ├── qconfig.py            # QConfig definitions
+│   │   ├── qat_modules.py        # QAT-ready versions of standard modules
+│   │   ├── fusion.py             # Module fusion utilities
+│   │   ├── calibration.py        # Model calibration functions
+│   │   └── utils.py              # General quantization utilities
+│   │   │
+│   │   └── schemes/              # Quantization schemes
+│   │       ├── __init__.py
+│   │       ├── symmetric.py      # Symmetric quantization
+│   │       ├── asymmetric.py     # Asymmetric quantization
+│   │       ├── per_tensor.py     # Per-tensor quantization
+│   │       └── per_channel.py    # Per-channel quantization
+│   │
+│   ├── training/                 # Training pipeline code
+│   │   ├── __init__.py
+│   │   ├── trainer.py            # Main trainer class
+│   │   ├── loss.py               # Custom loss functions for QAT
+│   │   ├── callbacks.py          # Training callbacks
+│   │   └── lr_scheduler.py       # Learning rate schedulers
+│   │
+│   ├── evaluation/               # Evaluation utilities
+│   │   ├── __init__.py
+│   │   ├── metrics.py            # Metrics calculation
+│   │   ├── visualization.py      # Results visualization 
+│   │   ├── compare_models.py     # FP32 vs INT8 comparison
+│   │   ├── latency_testing.py    # Inference speed measurement
+│   │   ├── accuracy_drift.py     # Track accuracy changes during quantization
+│   │   └── memory_profiling.py   # Profile memory usage
+│   │
+│   └── deployment/               # Deployment code
+│       ├── __init__.py
+│       ├── inference.py          # Inference utilities
+│       ├── optimize.py           # Post-training optimizations
+│       └── benchmark.py          # Benchmarking tools
+│
+├── scripts/                      # Executable scripts
+│   ├── train_fp32.py             # Train base floating-point model
+│   ├── train_qat.py              # QAT training script
+│   ├── evaluate.py               # Evaluation script
+│   ├── calibrate.py              # Calibration script
+│   ├── export.py                 # Model export script
+│   ├── analyze_quantization_error.py  # Quantization error analysis
+│   ├── sensitivity_analysis.py   # Layer quantization sensitivity
+│   └── visualize_activations.py  # Activation visualization
+│
+├── notebooks/                    # Jupyter notebooks
+│   ├── dataset_exploration.ipynb # Dataset analysis
+│   ├── model_analysis.ipynb      # Model architecture analysis
+│   ├── quantization_effects.ipynb# Analysis of quantization effects
+│   ├── error_analysis.ipynb      # Error analysis across quantized layers
+│   └── performance_comparison.ipynb  # Performance benchmarking
+│
+├── configs/                      # Configuration files
+│   ├── base_config.yaml          # Base configuration
+│   ├── qat_config.yaml           # QAT specific configuration
+│   ├── export_config.yaml        # Export configuration
+│   ├── quantization_config.yaml  # Detailed quantization parameters
+│   │
+│   └── experiments/              # Experiment-specific configs
+│       ├── exp1_symmetric_quant.yaml
+│       ├── exp2_asymmetric_quant.yaml
+│       └── exp3_mixed_precision.yaml
+│
+├── tests/                        # Unit and integration tests
+│   ├── __init__.py
+│   ├── test_quantization.py      # Tests for quantization modules
+│   ├── test_models.py            # Tests for model modifications
+│   └── test_dataloader.py        # Tests for data loading
+│
+├── requirements.txt              # Python dependencies
+├── setup.py                      # For package installation
+├── README.md                     # Project documentation
+└── main.py                       # Entry point script

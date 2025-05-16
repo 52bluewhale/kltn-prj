@@ -1,0 +1,58 @@
+# YOLOv8 Model Export Configuration
+
+# Export format settings
+format: onnx  # Options: onnx, tensorrt, openvino, tflite, coreml, saved_model
+
+# ONNX export settings
+onnx:
+  opset: 13             # ONNX opset version
+  simplify: true        # Simplify ONNX model
+  dynamic: true         # Dynamic axes
+  fp16: false           # Half precision
+  int8: true            # Integer quantization (post-training)
+  verbose: false        # Detailed output
+
+# TensorRT export settings (if needed)
+tensorrt:
+  workspace: 4          # Workspace size in GB
+  fp16: false           # Half precision
+  int8: true            # INT8 quantization
+  dynamic: true         # Dynamic batch size
+
+# Post-quantization settings (for non-QAT methods)
+post_quantization:
+  enabled: false        # Only used for post-training quantization
+  calibration_method: "entropy"  # Options: minmax, entropy, percentile
+  calibration_samples: 100       # Number of calibration samples
+  calibration_batch_size: 8      # Batch size for calibration
+
+# Save settings
+save:
+  dir: "./models/exported"
+  include_fp32: true    # Also save FP32 version
+  include_metadata: true # Include metadata in exported model
+  
+# Input/output specifications
+io:
+  input_shape: [1, 3, 640, 640]  # [batch, channels, height, width]
+  explicit_input_names: ["images"]
+  explicit_output_names: ["output0", "output1"]
+  
+# Optimization options
+optimization:
+  fuse: true          # Fuse Conv+BN+Activation layers
+  inplace: true       # Use inplace operations where possible
+  remove_grid: true   # Remove grid computation
+
+# Deployment target
+target:
+  device: "general"   # Options: general, nvidia_jetson, intel_ncs, edgetpu, snapdragon
+  platform: "desktop" # Options: desktop, mobile, edge, web
+
+# Testing exported model
+test:
+  enabled: true       # Test exported model
+  batch_size: 1       # Batch size for testing
+  img_size: 640       # Image size for testing
+  verbose: true       # Show detailed output
+  compare_with_pytorch: true  # Compare with PyTorch model

@@ -1,0 +1,70 @@
+src/quantization/
+---------------------------------------------------------------------------------
+1. Core Quantization Components
+	- observers.py
+		+ Collects statistics about tensors (min/max values, distributions)
+		+ Implemented 3 observer types:
+			-> CustomMinMaxObserver: Basic min/max tracking
+			-> PerChannelMinMaxObserver: Track min/max per channel for 
+			weights
+			-> HistogramObserver: More precise, uses value distribution 
+			for better calibration
+			
+	- fake_quantize.py
+		+ Simulates quantization during training
+		+ Implemented 3 quantizer types:
+			-> CustomFakeQuantize: Standard fake quantization with improved gradients
+			-> PerChannelFakeQuantize: Channel-wise quantization for weights
+			-> LSQFakeQuantize: Learned Step Size quantization - learns scale factors
+	
+	- qat_modules.py
+		+ Quantization-aware versions of PyTorch modules
+		+ Implemented modules:
+			-> QATConv2d: Quantization-aware convolution
+			-> QATBatchNorm2d: Quantization-aware batch normalization
+			-> QATLinear: Quantization-aware linear layer
+			-> QATReLU: Quantization-aware ReLU
+			
+2. Quantization Schemes
+	- symmetric.py: Zero-centered quantization (good for weights)
+	- asymmetric.py: Range-based quantization (good for activations)
+	- per_tensor.py: Applies same parameters to entire tensor
+	- per_channel.py: Channel-wise quantization (better for weights)
+	
+3. Supporting Functionality
+	- qconfig.py
+		+ Creates and manages quantization configurations
+		+ Handles configs for different layer types
+		+ Translates YAML configs to PyTorch QConfigs
+	- fusion.py
+		+ Fuses operations to improve performance
+		+ Supports common patterns like Conv+BN+ReLU
+		+ YOLOv8-specific fusion patterns
+	- calibration.py
+		+ Calibrates observer statistics with representative data
+		+ Implements multiple methods
+			-> Standard calibration
+			-> Percentile calibration (finds good thresholds)
+			-> Entropy calibration (minimizes information loss)
+	- utils.py
+		+ Helper functions for the QAT workflow
+		+ Model preparation, conversion, analysis, etc.
+		+ Layer-specific quantization management
+		
+How to Use This Implementation
+	1. 
+	
+	
+Key Features
+	1. Layer-Specific Quantization: Different quantization schemes for critical layers
+	2. Multiple Observer Types: Choose the right observer for each layer's sensitivity
+	3. Fusion Support: Automatic pattern detection and fusion
+	4. Comprehensive Analysis: Tools to measure quantization effects
+	5. Configurable: Driven by YAML configuration files
+	
+Best Practices Implemented
+	1. Per-Channel for Weights: Using per-channel quantization for weights (better accuracy)
+	2. Per-Tensor for Activations: Using per-tensor for activations (better performance)
+	3. Special Handling for Critical Layers: Detection heads and first layers get more precise quantization
+	4. Smooth Gradient Approximation: Improved gradient flow during QAT training
+	5. Progressive Quantization: Ability to gradually introduce quantization to different parts of the model

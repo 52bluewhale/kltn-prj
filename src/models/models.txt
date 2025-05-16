@@ -1,0 +1,1790 @@
+// __init__.py
+"""
+YOLOv8 model implementations with quantization-aware training support.
+This module provides the core model components for YOLOv8 QAT implementation.
+"""
+
+from .yolov8_base import (
+    YOLOv8BaseModel,
+    load_yolov8_from_ultralytics,
+    get_yolov8_model
+)
+
+from .yolov8_qat import (
+    YOLOv8QATModel,
+    prepare_yolov8_for_qat,
+    convert_yolov8_to_quantized
+)
+
+from .yolov8_qat_modules import (
+    QATDetectionHead,
+    QATCSPLayer,
+    QATBottleneckCSP
+)
+
+from .model_transforms import (
+    apply_qat_transforms,
+    insert_fake_quantize_nodes,
+    fuse_yolov8_model_modules
+)
+
+from .critical_layers import (
+    get_critical_layers,
+    apply_special_quantization,
+    skip_critical_layers_from_quantization
+)
+
+# Main API functions for easy access
+def create_yolov8_model(model_name="yolov8n", num_classes=10, pretrained=True, pretrained_path=None):
+    """
+    Create YOLOv8 model with specified parameters.
+    
+    Args:
+        model_name: YOLOv8 model variant (yolov8n, yolov8s, yolov8m, etc.)
+        num_classes: Number of classes for classification head
+        pretrained: Whether to use pretrained weights
+        pretrained_path: Path to pretrained weights
+        
+    Returns:
+        YOLOv8BaseModel instance
+    """
+    return get_yolov8_model(
+        model_name=model_name,
+        num_classes=num_classes,
+        pretrained=pretrained,
+        pretrained_path=pretrained_path
+    )
+
+def prepare_model_for_qat(model, config_path=None, critical_layers=True, fuse_modules=True):
+    """
+    Prepare YOLOv8 model for QAT.
+    
+    Args:
+        model: YOLOv8 model to prepare
+        config_path: Path to QAT configuration file
+        critical_layers: Whether to handle critical layers
+        fuse_modules: Whether to fuse modules (Conv+BN, etc.)
+        
+    Returns:
+        YOLOv8QATModel instance
+    """
+    if fuse_modules:
+        model = fuse_yolov8_model_modules(model)
+    
+    qat_model = prepare_yolov8_for_qat(model, config_path)
+    
+    if critical_layers:
+        qat_model = apply_special_quantization(qat_model)
+    
+    return qat_model
+
+def convert_to_quantized(qat_model):
+    """
+    Convert QAT model to fully quantized model.
+    
+    Args:
+        qat_model: QAT model to convert
+        
+    Returns:
+        Fully quantized model
+    """
+    return convert_yolov8_to_quantized(qat_model)
+
+// critical_layers.py
+# Handles layers sensitive to quantization:
+#     - Identifies critical layers that affect accuracy
+#     - Implements special quantization schemes for these layers
+
+"""
+Critical layer management for YOLOv8 QAT.
+
+This module provides utilities for identifying and handling layers that
+are critical for model accuracy during quantization-aware training.
+"""
+
+import torch
+import torch.nn as nn
+import re
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+
+from ..quantization.qconfig import (
+    get_qconfig_by_name,
+    create_qconfig_mapping
+)
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def get_critical_layers(
+    model: nn.Module
+) -> List[Tuple[str, nn.Module]]:
+    """
+    Get list of layers critical for model accuracy.
+    
+    Args:
+        model: YOLOv8 model
+        
+    Returns:
+        List of (name, module) tuples for critical layers
+    """
+    critical_layers = []
+    
+    # Get layer patterns
+    patterns = _get_critical_layer_patterns()
+    
+    # Find layers matching patterns
+    for name, module in model.named_modules():
+        for pattern in patterns:
+            if re.match(pattern, name):
+                critical_layers.append((name, module))
+                break
+    
+    logger.info(f"Found {len(critical_layers)} critical layers")
+    
+    return critical_layers
+
+
+def apply_special_quantization(
+    model: nn.Module,
+    qconfig_mapping: Optional[Dict[str, Any]] = None
+) -> nn.Module:
+    """
+    Apply special quantization to critical layers.
+    
+    Args:
+        model: YOLOv8 model
+        qconfig_mapping: Mapping of layer names to QConfigs
+        
+    Returns:
+        Model with special quantization applied to critical layers
+    """
+    # Get critical layers
+    critical_layers = get_critical_layers(model)
+    
+    # Get configuration for each category of critical layers
+    if qconfig_mapping is None:
+        qconfig_mapping = _get_default_qconfig_mapping()
+    
+    # Apply specialized QConfig to each critical layer
+    for name, module in critical_layers:
+        # Find appropriate QConfig
+        qconfig = None
+        for pattern, config in qconfig_mapping.items():
+            if re.match(pattern, name):
+                qconfig = config
+                break
+        
+        # Apply QConfig if found
+        if qconfig is not None and hasattr(module, 'qconfig'):
+            module.qconfig = qconfig
+            logger.info(f"Applied special quantization to {name}")
+    
+    return model
+
+
+def skip_critical_layers_from_quantization(
+    model: nn.Module,
+    skip_patterns: Optional[List[str]] = None
+) -> nn.Module:
+    """
+    Skip specified critical layers from quantization.
+    
+    Args:
+        model: YOLOv8 model
+        skip_patterns: List of regex patterns for layers to skip
+        
+    Returns:
+        Model with layers skipped from quantization
+    """
+    if skip_patterns is None:
+        skip_patterns = _get_layers_to_skip()
+    
+    # Find layers matching patterns
+    for name, module in model.named_modules():
+        for pattern in skip_patterns:
+            if re.match(pattern, name):
+                # Remove QConfig to skip quantization
+                if hasattr(module, 'qconfig'):
+                    module.qconfig = None
+                    logger.info(f"Skipped layer from quantization: {name}")
+                break
+    
+    return model
+
+
+def analyze_layer_sensitivity(
+    model: nn.Module,
+    calibration_fn: callable,
+    test_fn: callable,
+    num_trials: int = 3
+) -> Dict[str, float]:
+    """
+    Analyze sensitivity of model layers to quantization.
+    
+    This function quantizes each layer individually and measures the
+    impact on model accuracy to identify the most sensitive layers.
+    
+    Args:
+        model: YOLOv8 model
+        calibration_fn: Function to calibrate model
+        test_fn: Function to test model accuracy
+        num_trials: Number of trials for each layer
+        
+    Returns:
+        Dictionary mapping layer names to sensitivity scores
+    """
+    # Get baseline accuracy
+    model_copy = torch.quantization.quantize_dynamic(
+        model.to('cpu').eval(),
+        {nn.Conv2d, nn.Linear},
+        dtype=torch.qint8
+    )
+    baseline_accuracy = test_fn(model_copy)
+    
+    # Test each layer
+    sensitivity = {}
+    critical_layers = get_critical_layers(model)
+    
+    for name, module in critical_layers:
+        # Skip layers that can't be quantized
+        if not isinstance(module, (nn.Conv2d, nn.Linear, nn.BatchNorm2d)):
+            continue
+        
+        # Measure accuracy impact
+        accuracies = []
+        for _ in range(num_trials):
+            # Create model with only this layer quantized
+            model_copy = model.copy()
+            
+            # Skip all layers except this one
+            for n, m in model_copy.named_modules():
+                if hasattr(m, 'qconfig'):
+                    m.qconfig = None
+            
+            # Enable quantization for this layer
+            for n, m in model_copy.named_modules():
+                if n == name and hasattr(m, 'qconfig'):
+                    m.qconfig = torch.quantization.default_qconfig
+            
+            # Calibrate and test
+            model_copy = calibration_fn(model_copy)
+            accuracy = test_fn(model_copy)
+            accuracies.append(accuracy)
+        
+        # Calculate average accuracy drop
+        avg_accuracy = sum(accuracies) / len(accuracies)
+        sensitivity[name] = baseline_accuracy - avg_accuracy
+        
+        logger.info(f"Layer {name} sensitivity: {sensitivity[name]:.4f}")
+    
+    return sensitivity
+
+
+def _get_critical_layer_patterns() -> List[str]:
+    """
+    Get regex patterns for critical layers.
+    
+    Returns:
+        List of regex patterns
+    """
+    return [
+        # First layer is critical for accuracy
+        r"model\.0\.conv",
+        # Detection head is critical for accuracy
+        r"model\.\d+\.detect",
+        r"model\.\d+\.Detect",
+        # Bottleneck layers in detection head are critical
+        r"model\.\d+\.cv\d+",
+        # Spatial pyramid pooling layers are critical
+        r"model\.\d+\.m\.\d+\.cv\d+",
+        r"model\.\d+\.SPPF",
+        # Channel attention layers are critical
+        r".*\.ca",
+        # C2f blocks are critical connection points
+        r"model\.\d+\.C2f"
+    ]
+
+
+def _get_layers_to_skip() -> List[str]:
+    """
+    Get regex patterns for layers to skip from quantization.
+    
+    Returns:
+        List of regex patterns
+    """
+    return [
+        # Skip detection head to preserve accuracy
+        r"model\.\d+\.detect",
+        r"model\.\d+\.Detect",
+        # Skip forward method
+        r"model\.\d+\.forward",
+        # Skip distribution focal loss
+        r"model\.\d+\.dfl\.conv"
+    ]
+
+
+def _get_default_qconfig_mapping() -> Dict[str, Any]:
+    """
+    Get default QConfig mapping for critical layers.
+    
+    Returns:
+        Dictionary mapping patterns to QConfigs
+    """
+    return {
+        # First convolution layer uses sensitive layer QConfig
+        r"model\.0\.conv": get_qconfig_by_name("first_layer"),
+        # Detection head uses sensitive layer QConfig
+        r"model\.\d+\.detect": get_qconfig_by_name("sensitive"),
+        r"model\.\d+\.Detect": get_qconfig_by_name("sensitive"),
+        # DFL needs higher precision
+        r"model\.\d+\.dfl\.conv": get_qconfig_by_name("sensitive"),
+        # Other critical layers use default QConfig
+        r"model\.\d+\.m\.\d+\.cv\d+": get_qconfig_by_name("default"),
+        r"model\.\d+\.SPPF": get_qconfig_by_name("default"),
+        r"model\.\d+\.C2f": get_qconfig_by_name("default")
+    }
+
+// model_transforms.py
+# Functions to prepare models for QAT:
+#     - Inserts fake quantization nodes
+#     - Performs necessary fusions
+#     - Configures layer-specific quantization parameters
+
+"""
+Model transformation utilities for YOLOv8 QAT.
+
+This module provides functions to transform YOLOv8 models for quantization-aware 
+training, including fusion of operations and insertion of fake quantization nodes.
+"""
+
+import torch
+import torch.nn as nn
+import re
+import logging
+from typing import Dict, List, Optional, Union, Tuple, Any
+
+from ..quantization.fusion import (
+    fuse_conv_bn,
+    fuse_conv_bn_relu,
+    fuse_conv_bn_silu,
+    fuse_yolov8_modules,
+    find_modules_to_fuse
+)
+from ..quantization.qconfig import (
+    create_qconfig_mapping,
+    get_qconfig_by_name
+)
+from .yolov8_qat_modules import (
+    QATDetectionHead,
+    QATCSPLayer,
+    QATBottleneckCSP
+)
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def apply_qat_transforms(
+    model: nn.Module,
+    qconfig_dict: Optional[Dict] = None,
+    fusion_patterns: Optional[List[Dict]] = None,
+    convert_custom_modules: bool = True
+) -> nn.Module:
+    """
+    Apply all necessary transformations for QAT to a YOLOv8 model.
+    
+    Args:
+        model: YOLOv8 model to transform
+        qconfig_dict: Quantization configuration dictionary
+        fusion_patterns: List of fusion patterns
+        convert_custom_modules: Whether to convert YOLOv8-specific modules
+        
+    Returns:
+        Transformed model
+    """
+    # Step 1: Fuse modules (Conv+BN, etc.)
+    if fusion_patterns is None:
+        fusion_patterns = _get_default_fusion_patterns()
+    
+    logger.info("Fusing modules for quantization...")
+    model = fuse_yolov8_model_modules(model, fusion_patterns)
+    
+    # Step 2: Insert fake quantize nodes
+    logger.info("Inserting fake quantization nodes...")
+    model = insert_fake_quantize_nodes(model, qconfig_dict)
+    
+    # Step 3: Convert custom YOLOv8 modules to QAT versions
+    if convert_custom_modules:
+        logger.info("Converting custom YOLOv8 modules to QAT versions...")
+        model = convert_yolov8_modules_to_qat(model, qconfig_dict)
+    
+    return model
+
+
+def fuse_yolov8_model_modules(
+    model: nn.Module,
+    fusion_patterns: Optional[List[Dict]] = None
+) -> nn.Module:
+    """
+    Fuse modules in YOLOv8 model for better quantization.
+    
+    Args:
+        model: YOLOv8 model
+        fusion_patterns: List of fusion patterns
+        
+    Returns:
+        Model with fused modules
+    """
+    # Use default patterns if none provided
+    if fusion_patterns is None:
+        fusion_patterns = _get_default_fusion_patterns()
+    
+    # Fuse modules using fusion utility
+    return fuse_yolov8_modules(model, fusion_patterns)
+
+
+def insert_fake_quantize_nodes(
+    model: nn.Module,
+    qconfig_dict: Optional[Dict] = None
+) -> nn.Module:
+    """
+    Insert fake quantization nodes into the model.
+    
+    Args:
+        model: YOLOv8 model
+        qconfig_dict: Quantization configuration dictionary
+        
+    Returns:
+        Model with fake quantization nodes
+    """
+    from torch.quantization import prepare_qat
+    
+    # Use default QConfig if not provided
+    if qconfig_dict is None:
+        from torch.quantization import get_default_qat_qconfig
+        qconfig_dict = {"": get_default_qat_qconfig()}
+    
+    # Prepare model for QAT using PyTorch's utility
+    model = prepare_qat(model, qconfig_dict, inplace=True)
+    
+    return model
+
+
+def convert_yolov8_modules_to_qat(
+    model: nn.Module,
+    qconfig_dict: Optional[Dict] = None
+) -> nn.Module:
+    """
+    Convert YOLOv8-specific modules to their QAT versions.
+    
+    Args:
+        model: YOLOv8 model
+        qconfig_dict: Quantization configuration dictionary
+        
+    Returns:
+        Model with QAT modules
+    """
+    # Get default QConfig if not provided
+    default_qconfig = None
+    if qconfig_dict is not None and "" in qconfig_dict:
+        default_qconfig = qconfig_dict[""]
+    
+    # Process model to replace custom modules
+    for name, module in list(model.named_children()):
+        # Recursively process children
+        if len(list(module.children())) > 0:
+            model._modules[name] = convert_yolov8_modules_to_qat(module, qconfig_dict)
+        
+        # Convert detection head
+        elif _is_detection_head(module):
+            # Get specific QConfig for detection head if available
+            qconfig = _get_qconfig_for_module(name, qconfig_dict, default_qconfig)
+            model._modules[name] = QATDetectionHead.from_float(module, qconfig)
+            logger.info(f"Converted detection head: {name}")
+        
+        # Convert CSP layer
+        elif _is_csp_layer(module):
+            # Get specific QConfig for CSP layer if available
+            qconfig = _get_qconfig_for_module(name, qconfig_dict, default_qconfig)
+            model._modules[name] = QATCSPLayer.from_float(module, qconfig)
+            logger.info(f"Converted CSP layer: {name}")
+        
+        # Convert BottleneckCSP
+        elif _is_bottleneck_csp(module):
+            # Get specific QConfig for BottleneckCSP if available
+            qconfig = _get_qconfig_for_module(name, qconfig_dict, default_qconfig)
+            model._modules[name] = QATBottleneckCSP.from_float(module, qconfig)
+            logger.info(f"Converted BottleneckCSP: {name}")
+    
+    return model
+
+
+def remove_fake_quantize_nodes(model: nn.Module) -> nn.Module:
+    """
+    Remove fake quantization nodes from the model.
+    
+    Args:
+        model: YOLOv8 model
+        
+    Returns:
+        Model without fake quantization nodes
+    """
+    # Helper function to remove attributes related to quantization
+    def _remove_qat_attributes(module):
+        if hasattr(module, 'qconfig'):
+            delattr(module, 'qconfig')
+        if hasattr(module, 'weight_fake_quant'):
+            delattr(module, 'weight_fake_quant')
+        if hasattr(module, 'activation_post_process'):
+            delattr(module, 'activation_post_process')
+    
+    # Process all modules
+    for module in model.modules():
+        _remove_qat_attributes(module)
+    
+    return model
+
+
+def _get_default_fusion_patterns() -> List[Dict]:
+    """
+    Get default fusion patterns for YOLOv8.
+    
+    Returns:
+        List of fusion patterns
+    """
+    return [
+        {
+            "pattern": r"model\.\d+\.conv",
+            "modules": ["conv", "bn"],
+            "fuser_method": "fuse_conv_bn"
+        },
+        {
+            "pattern": r"model\.\d+\.cv\d+\.conv",
+            "modules": ["conv", "bn", "silu"],
+            "fuser_method": "fuse_conv_bn_silu"
+        },
+        {
+            "pattern": r"model\.\d+\.m\.\d+\.cv\d+\.conv",
+            "modules": ["conv", "bn", "silu"],
+            "fuser_method": "fuse_conv_bn_silu"
+        }
+    ]
+
+
+def _get_qconfig_for_module(
+    name: str,
+    qconfig_dict: Dict,
+    default_qconfig: Optional[Any] = None
+) -> Optional[Any]:
+    """
+    Get QConfig for a specific module based on name.
+    
+    Args:
+        name: Module name
+        qconfig_dict: Dictionary of QConfigs
+        default_qconfig: Default QConfig
+        
+    Returns:
+        QConfig for the module
+    """
+    if qconfig_dict is None:
+        return default_qconfig
+    
+    # Check if there's a direct match
+    if name in qconfig_dict:
+        return qconfig_dict[name]
+    
+    # Check for pattern matches
+    for pattern, qconfig in qconfig_dict.items():
+        if pattern != "" and re.match(pattern, name):
+            return qconfig
+    
+    # Return default
+    return default_qconfig
+
+
+def _is_detection_head(module: nn.Module) -> bool:
+    """
+    Check if a module is a YOLOv8 detection head.
+    
+    Args:
+        module: Module to check
+        
+    Returns:
+        True if module is a detection head, False otherwise
+    """
+    # Check class name
+    if 'Detect' in module.__class__.__name__:
+        return True
+    
+    # Check for typical detection head attributes
+    has_typical_attrs = hasattr(module, 'nc') and hasattr(module, 'no')
+    has_cv2 = hasattr(module, 'cv2') and isinstance(module.cv2, nn.ModuleList)
+    
+    return has_typical_attrs and has_cv2
+
+
+def _is_csp_layer(module: nn.Module) -> bool:
+    """
+    Check if a module is a YOLOv8 CSP layer.
+    
+    Args:
+        module: Module to check
+        
+    Returns:
+        True if module is a CSP layer, False otherwise
+    """
+    # Check class name
+    if 'CSP' in module.__class__.__name__ and 'Bottleneck' not in module.__class__.__name__:
+        return True
+    
+    # Check for typical CSP layer attributes
+    has_cv1_cv2 = hasattr(module, 'cv1') and hasattr(module, 'cv2')
+    has_m_or_cv3 = hasattr(module, 'm') or hasattr(module, 'cv3')
+    
+    return has_cv1_cv2 and has_m_or_cv3
+
+
+def _is_bottleneck_csp(module: nn.Module) -> bool:
+    """
+    Check if a module is a YOLOv8 BottleneckCSP.
+    
+    Args:
+        module: Module to check
+        
+    Returns:
+        True if module is a BottleneckCSP, False otherwise
+    """
+    # Check class name
+    if 'BottleneckCSP' in module.__class__.__name__:
+        return True
+    
+    # Check for typical BottleneckCSP attributes
+    has_cv1_cv2_cv3_cv4 = (
+        hasattr(module, 'cv1') and hasattr(module, 'cv2') and
+        hasattr(module, 'cv3') and hasattr(module, 'cv4')
+    )
+    
+    return has_cv1_cv2_cv3_cv4
+
+// yolov8_base.py
+"""
+Base YOLOv8 model implementation that serves as the foundation for QAT.
+
+This module provides wrapper classes and utilities for working with YOLOv8 models
+from the Ultralytics library, preparing them for quantization-aware training.
+"""
+
+import os
+import logging
+import torch
+import torch.nn as nn
+from typing import Dict, List, Optional, Union, Tuple, Any
+import yaml
+
+# Try to import ultralytics
+try:
+    from ultralytics.models.yolo.model import YOLO, YOLOWorld
+    from ultralytics.nn.tasks import DetectionModel
+    from ultralytics.models.yolo.detect import DetectionTrainer
+    from ultralytics.utils.torch_utils import intersect_dicts
+except ImportError:
+    logging.warning("Ultralytics not found. Please install with: pip install ultralytics")
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class YOLOv8BaseModel(nn.Module):
+    """
+    Base wrapper for YOLOv8 models from Ultralytics.
+    
+    This class provides a standardized interface for working with YOLOv8 models,
+    making them compatible with the quantization-aware training pipeline.
+    """
+    
+    def __init__(
+        self,
+        model_variant: str = "yolov8n",
+        num_classes: int = 80,
+        pretrained: bool = True,
+        pretrained_weights: Optional[str] = None
+    ):
+        """
+        Initialize YOLOv8 model.
+        
+        Args:
+            model_variant: YOLOv8 variant ('yolov8n', 'yolov8s', 'yolov8m', 'yolov8l', 'yolov8x')
+            num_classes: Number of classes for detection
+            pretrained: Whether to use pretrained weights
+            pretrained_weights: Path to pretrained weights file
+        """
+        super().__init__()
+        
+        self.model_variant = model_variant
+        self.num_classes = num_classes
+        self.pretrained = pretrained
+        
+        # Load model
+        self.model = self._load_model(model_variant, num_classes, pretrained, pretrained_weights)
+        
+        # Cache important layers for later use in quantization
+        self._cache_important_layers()
+    
+    def _load_model(
+        self,
+        model_variant: str,
+        num_classes: int,
+        pretrained: bool,
+        pretrained_weights: Optional[str]
+    ) -> nn.Module:
+        """
+        Load YOLOv8 model from Ultralytics.
+        
+        Args:
+            model_variant: YOLOv8 variant
+            num_classes: Number of classes
+            pretrained: Whether to use pretrained weights
+            pretrained_weights: Path to pretrained weights
+            
+        Returns:
+            YOLOv8 model
+        """
+        # Create model
+        if pretrained and pretrained_weights is None:
+            # Use Ultralytics' pretrained model
+            model = YOLO(f"{model_variant}.pt").model
+            
+            # If num_classes doesn't match pretrained, modify the detection head
+            if num_classes != 80:  # COCO has 80 classes
+                self._modify_detection_head(model, num_classes)
+        else:
+            # Create from scratch or custom weights
+            model = DetectionModel(cfg=f"{model_variant}.yaml", nc=num_classes)
+            
+            # Load custom weights if provided
+            if pretrained_weights is not None and os.path.exists(pretrained_weights):
+                ckpt = torch.load(pretrained_weights, map_location='cpu')
+                csd = ckpt['model'].float().state_dict()
+                csd = intersect_dicts(csd, model.state_dict())  # Intersect
+                model.load_state_dict(csd, strict=False)
+                logger.info(f"Loaded weights from {pretrained_weights}")
+        
+        return model
+    
+    def _modify_detection_head(self, model: nn.Module, num_classes: int) -> None:
+        """
+        Modify detection head for custom number of classes.
+        
+        Args:
+            model: YOLOv8 model
+            num_classes: New number of classes
+            
+        Returns:
+            None, modifies model in place
+        """
+        # Find detection head
+        detection_head = model.model[-1]
+        
+        # Check if it's a detection head
+        if hasattr(detection_head, 'nc'):
+            # Create new head with the right number of classes
+            old_nc = detection_head.nc
+            detection_head.nc = num_classes
+            
+            # Adjust output layers for new number of classes
+            for i, layer in enumerate(detection_head.cv2):
+                if isinstance(layer, nn.Conv2d):
+                    # Calculate new output channels
+                    old_out = layer.weight.shape[0]
+                    new_out = old_out - old_nc + num_classes
+                    
+                    # Create new conv layer with adjusted output size
+                    new_layer = nn.Conv2d(
+                        in_channels=layer.in_channels,
+                        out_channels=new_out,
+                        kernel_size=layer.kernel_size,
+                        stride=layer.stride,
+                        padding=layer.padding,
+                        bias=layer.bias is not None
+                    )
+                    
+                    # Copy weights for shared dimensions
+                    min_out = min(old_out, new_out)
+                    new_layer.weight.data[:min_out] = layer.weight.data[:min_out]
+                    if layer.bias is not None:
+                        new_layer.bias.data[:min_out] = layer.bias.data[:min_out]
+                    
+                    # Replace layer
+                    detection_head.cv2[i] = new_layer
+            
+            logger.info(f"Modified detection head from {old_nc} to {num_classes} classes")
+    
+    def _cache_important_layers(self) -> None:
+        """
+        Cache important layers for quantization-aware training.
+        
+        Identifies and stores references to layers that need special handling during QAT,
+        such as the first layer, detection head, and other critical components.
+        """
+        self.first_conv = None
+        self.detection_head = None
+        self.critical_blocks = []
+        
+        # Find first convolutional layer
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d):
+                self.first_conv = (name, module)
+                break
+        
+        # Find detection head
+        if hasattr(self.model, 'model'):
+            self.detection_head = ('model.' + str(len(self.model.model) - 1), self.model.model[-1])
+        
+        # Find critical blocks (e.g., CSP blocks)
+        for name, module in self.model.named_modules():
+            if name.startswith('model.') and any(x in name for x in ['C2f', 'SPPF', 'Detect']):
+                self.critical_blocks.append((name, module))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the model.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Model output
+        """
+        return self.model(x)
+    
+    def get_critical_layers(self) -> List[Tuple[str, nn.Module]]:
+        """
+        Get list of layers critical for model accuracy.
+        
+        Returns:
+            List of (name, module) tuples for critical layers
+        """
+        critical_layers = []
+        
+        # First conv is critical
+        if self.first_conv:
+            critical_layers.append(self.first_conv)
+        
+        # Detection head is critical
+        if self.detection_head:
+            critical_layers.append(self.detection_head)
+        
+        # Add all critical blocks
+        critical_layers.extend(self.critical_blocks)
+        
+        return critical_layers
+    
+    def save(self, path: str) -> None:
+        """
+        Save model to file.
+        
+        Args:
+            path: Path to save model
+            
+        Returns:
+            None
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({"model": self.model}, path)
+        logger.info(f"Model saved to {path}")
+    
+    def load(self, path: str) -> None:
+        """
+        Load model from file.
+        
+        Args:
+            path: Path to load model from
+            
+        Returns:
+            None
+        """
+        checkpoint = torch.load(path, map_location='cpu')
+        if "model" in checkpoint:
+            self.model = checkpoint["model"]
+        else:
+            self.model.load_state_dict(checkpoint)
+        
+        # Re-cache important layers
+        self._cache_important_layers()
+        
+        logger.info(f"Model loaded from {path}")
+
+
+def load_yolov8_from_ultralytics(
+    model_path: str,
+    num_classes: Optional[int] = None
+) -> YOLOv8BaseModel:
+    """
+    Load YOLOv8 model from Ultralytics checkpoint.
+    
+    Args:
+        model_path: Path to model file (.pt)
+        num_classes: Number of classes (override checkpoint value)
+        
+    Returns:
+        YOLOv8BaseModel instance
+    """
+    # Determine model variant from checkpoint
+    ckpt = torch.load(model_path, map_location='cpu')
+    
+    if "model" in ckpt:
+        if hasattr(ckpt["model"], "yaml"):
+            model_variant = os.path.splitext(os.path.basename(ckpt["model"].yaml["model"]))[0]
+        else:
+            # Try to infer from model structure
+            model_variant = "yolov8n"  # Default
+            model_size = sum(p.numel() for p in ckpt["model"].parameters())
+            
+            if model_size > 90_000_000:
+                model_variant = "yolov8x"
+            elif model_size > 40_000_000:
+                model_variant = "yolov8l"
+            elif model_size > 20_000_000:
+                model_variant = "yolov8m"
+            elif model_size > 10_000_000:
+                model_variant = "yolov8s"
+    else:
+        model_variant = "yolov8n"  # Default
+    
+    # Get number of classes from checkpoint if not provided
+    if num_classes is None:
+        if "model" in ckpt and hasattr(ckpt["model"], "nc"):
+            num_classes = ckpt["model"].nc
+        else:
+            num_classes = 80  # Default to COCO
+    
+    # Create model
+    model = YOLOv8BaseModel(
+        model_variant=model_variant,
+        num_classes=num_classes,
+        pretrained=False
+    )
+    
+    # Load checkpoint
+    model.load(model_path)
+    
+    return model
+
+
+def get_yolov8_model(
+    model_name: str = "yolov8n",
+    num_classes: int = 80,
+    pretrained: bool = True,
+    pretrained_path: Optional[str] = None
+) -> YOLOv8BaseModel:
+    """
+    Get YOLOv8 model with specified parameters.
+    
+    Args:
+        model_name: YOLOv8 model variant (yolov8n, yolov8s, yolov8m, etc.)
+        num_classes: Number of classes for classification head
+        pretrained: Whether to use pretrained weights
+        pretrained_path: Path to pretrained weights
+        
+    Returns:
+        YOLOv8BaseModel instance
+    """
+    # Check if using custom weights
+    if pretrained_path is not None:
+        return load_yolov8_from_ultralytics(pretrained_path, num_classes)
+    
+    # Create new model
+    return YOLOv8BaseModel(
+        model_variant=model_name,
+        num_classes=num_classes,
+        pretrained=pretrained,
+        pretrained_weights=None
+    )
+
+// yolov8_qat_modules.py
+"""
+Specialized QAT modules for YOLOv8.
+
+This module provides quantization-aware versions of YOLOv8-specific modules,
+such as detection heads and CSP blocks, which need special handling during QAT.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Optional, Union, Tuple, Any
+import logging
+import math
+
+from ..quantization.qat_modules import QATConv2d, QATBatchNorm2d, QATReLU
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class QATDetectionHead(nn.Module):
+    """
+    Quantization-aware detection head for YOLOv8.
+    
+    The detection head is a critical component that requires special handling
+    during quantization to maintain accuracy.
+    """
+    
+    def __init__(self, original_head, qconfig=None):
+        """
+        Initialize QAT detection head.
+        
+        Args:
+            original_head: Original YOLOv8 detection head
+            qconfig: Quantization configuration
+        """
+        super().__init__()
+        
+        self.nc = original_head.nc  # Number of classes
+        self.reg_max = getattr(original_head, 'reg_max', 16)  # Maximum box regression value
+        self.no = self.nc + self.reg_max * 4  # Number of outputs per detection
+        
+        # Copy and convert convolution layers
+        self.cv2 = nn.ModuleList()
+        for conv in original_head.cv2:
+            if isinstance(conv, nn.Conv2d):
+                qat_conv = QATConv2d.from_float(conv)
+                if qconfig is not None:
+                    qat_conv.qconfig = qconfig
+                self.cv2.append(qat_conv)
+        
+        # Copy other attributes from original head
+        if hasattr(original_head, 'stride'):
+            self.stride = original_head.stride
+        if hasattr(original_head, 'anchors'):
+            self.anchors = original_head.anchors
+        if hasattr(original_head, 'dfl'):
+            # Handle distribution focal loss (DFL) conv layer
+            if isinstance(original_head.dfl, nn.Conv2d):
+                self.dfl = QATConv2d.from_float(original_head.dfl)
+                if qconfig is not None:
+                    self.dfl.qconfig = qconfig
+            else:
+                self.dfl = original_head.dfl
+        
+        # Additional attributes for QAT
+        self.activation_post_process = None
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.activation_post_process = qconfig.activation()
+    
+    def forward(self, x):
+        """
+        Forward pass of detection head.
+        
+        Args:
+            x: Input features (list of tensors)
+            
+        Returns:
+            Detection outputs
+        """
+        for i in range(len(x)):
+            x[i] = self.cv2[i](x[i])  # Apply convolutions
+            
+            # Apply activation post-process if available
+            if self.activation_post_process is not None:
+                x[i] = self.activation_post_process(x[i])
+        
+        # Apply decode logic (to be compatible with original head)
+        if hasattr(self, 'dfl') and self.training:
+            # Apply DFL to regression outputs
+            b, _, h, w = x[0].shape
+            y = torch.cat([xi.view(b, self.reg_max * 4, -1) for xi in x], -1)
+            y = self.dfl(y.view(b, 4, self.reg_max, -1))
+            return y
+        
+        return x
+    
+    @classmethod
+    def from_float(cls, module, qconfig=None):
+        """
+        Create QAT detection head from float module.
+        
+        Args:
+            module: Float detection head
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT detection head
+        """
+        assert isinstance(module, type(module)), f"Expected {type(module)}, got {type(module)}"
+        qat_head = cls(module, qconfig)
+        return qat_head
+
+
+class QATCSPLayer(nn.Module):
+    """
+    Quantization-aware CSP (Cross Stage Partial) layer for YOLOv8.
+    
+    This is a QAT version of the CSP layer used in YOLOv8, which is a key
+    building block of the network.
+    """
+    
+    def __init__(self, original_csp, qconfig=None):
+        """
+        Initialize QAT CSP layer.
+        
+        Args:
+            original_csp: Original YOLOv8 CSP layer
+            qconfig: Quantization configuration
+        """
+        super().__init__()
+        
+        # Convert all convolutions to QAT versions
+        self.cv1 = self._convert_conv(original_csp.cv1, qconfig)
+        self.cv2 = self._convert_conv(original_csp.cv2, qconfig)
+        
+        # Handle additional convs if present
+        if hasattr(original_csp, 'cv3'):
+            self.cv3 = self._convert_conv(original_csp.cv3, qconfig)
+        
+        # Handle bottleneck modules
+        if hasattr(original_csp, 'm'):
+            if isinstance(original_csp.m, nn.ModuleList):
+                self.m = nn.ModuleList()
+                for module in original_csp.m:
+                    self.m.append(self._convert_bottleneck(module, qconfig))
+            else:
+                self.m = self._convert_bottleneck(original_csp.m, qconfig)
+        
+        # Additional attributes for QAT
+        self.activation_post_process = None
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.activation_post_process = qconfig.activation()
+    
+    def _convert_conv(self, conv, qconfig):
+        """
+        Convert convolution to QAT version.
+        
+        Args:
+            conv: Convolution module
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT convolution
+        """
+        if isinstance(conv, nn.Conv2d):
+            qat_conv = QATConv2d.from_float(conv)
+            if qconfig is not None:
+                qat_conv.qconfig = qconfig
+            return qat_conv
+        
+        # For compound modules (Conv+BN+Act), convert each part
+        if hasattr(conv, 'conv'):
+            conv.conv = self._convert_conv(conv.conv, qconfig)
+        
+        if hasattr(conv, 'bn'):
+            if isinstance(conv.bn, nn.BatchNorm2d):
+                qat_bn = QATBatchNorm2d.from_float(conv.bn)
+                if qconfig is not None:
+                    qat_bn.qconfig = qconfig
+                conv.bn = qat_bn
+        
+        return conv
+    
+    def _convert_bottleneck(self, bottleneck, qconfig):
+        """
+        Convert bottleneck module to QAT version.
+        
+        Args:
+            bottleneck: Bottleneck module
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT bottleneck
+        """
+        # Convert all convolutions in the bottleneck
+        if hasattr(bottleneck, 'cv1'):
+            bottleneck.cv1 = self._convert_conv(bottleneck.cv1, qconfig)
+        
+        if hasattr(bottleneck, 'cv2'):
+            bottleneck.cv2 = self._convert_conv(bottleneck.cv2, qconfig)
+        
+        # Apply QConfig to bottleneck
+        if qconfig is not None:
+            bottleneck.qconfig = qconfig
+        
+        return bottleneck
+    
+    def forward(self, x):
+        """
+        Forward pass of CSP layer.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        # First branch
+        y1 = self.cv1(x)
+        
+        # Second branch
+        if hasattr(self, 'm'):
+            if isinstance(self.m, nn.ModuleList):
+                y2 = self.cv2(x)
+                for module in self.m:
+                    y2 = module(y2)
+            else:
+                y2 = self.m(self.cv2(x))
+        else:
+            y2 = self.cv2(x)
+        
+        # Concatenate branches
+        out = torch.cat([y1, y2], dim=1)
+        
+        # Final convolution
+        if hasattr(self, 'cv3'):
+            out = self.cv3(out)
+        
+        # Apply activation post-process if available
+        if self.activation_post_process is not None:
+            out = self.activation_post_process(out)
+        
+        return out
+    
+    @classmethod
+    def from_float(cls, module, qconfig=None):
+        """
+        Create QAT CSP layer from float module.
+        
+        Args:
+            module: Float CSP layer
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT CSP layer
+        """
+        qat_csp = cls(module, qconfig)
+        return qat_csp
+
+
+class QATBottleneckCSP(nn.Module):
+    """
+    Quantization-aware Bottleneck CSP module for YOLOv8.
+    
+    This is a QAT version of the Bottleneck CSP module used in YOLOv8,
+    which is a specialized form of the CSP architecture.
+    """
+    
+    def __init__(self, original_bottleneck, qconfig=None):
+        """
+        Initialize QAT Bottleneck CSP module.
+        
+        Args:
+            original_bottleneck: Original YOLOv8 Bottleneck CSP module
+            qconfig: Quantization configuration
+        """
+        super().__init__()
+        
+        # Convert all convolutions to QAT versions
+        self.cv1 = self._convert_conv(original_bottleneck.cv1, qconfig)
+        self.cv2 = self._convert_conv(original_bottleneck.cv2, qconfig)
+        self.cv3 = self._convert_conv(original_bottleneck.cv3, qconfig)
+        self.cv4 = self._convert_conv(original_bottleneck.cv4, qconfig)
+        
+        # Handle bottleneck modules
+        if hasattr(original_bottleneck, 'm'):
+            if isinstance(original_bottleneck.m, nn.ModuleList):
+                self.m = nn.ModuleList()
+                for module in original_bottleneck.m:
+                    self.m.append(self._convert_bottleneck(module, qconfig))
+            else:
+                self.m = self._convert_bottleneck(original_bottleneck.m, qconfig)
+        
+        # Convert batch norm if present
+        if hasattr(original_bottleneck, 'bn'):
+            self.bn = QATBatchNorm2d.from_float(original_bottleneck.bn)
+            if qconfig is not None:
+                self.bn.qconfig = qconfig
+        
+        # Copy activation function
+        if hasattr(original_bottleneck, 'act'):
+            if isinstance(original_bottleneck.act, nn.ReLU):
+                self.act = QATReLU.from_float(original_bottleneck.act)
+                if qconfig is not None:
+                    self.act.qconfig = qconfig
+            else:
+                self.act = original_bottleneck.act
+        
+        # Additional attributes for QAT
+        self.activation_post_process = None
+        if qconfig is not None:
+            self.qconfig = qconfig
+            self.activation_post_process = qconfig.activation()
+    
+    def _convert_conv(self, conv, qconfig):
+        """
+        Convert convolution to QAT version.
+        
+        Args:
+            conv: Convolution module
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT convolution
+        """
+        if isinstance(conv, nn.Conv2d):
+            qat_conv = QATConv2d.from_float(conv)
+            if qconfig is not None:
+                qat_conv.qconfig = qconfig
+            return qat_conv
+        
+        # For compound modules (Conv+BN+Act), convert each part
+        if hasattr(conv, 'conv'):
+            conv.conv = self._convert_conv(conv.conv, qconfig)
+        
+        if hasattr(conv, 'bn'):
+            if isinstance(conv.bn, nn.BatchNorm2d):
+                qat_bn = QATBatchNorm2d.from_float(conv.bn)
+                if qconfig is not None:
+                    qat_bn.qconfig = qconfig
+                conv.bn = qat_bn
+        
+        return conv
+    
+    def _convert_bottleneck(self, bottleneck, qconfig):
+        """
+        Convert bottleneck module to QAT version.
+        
+        Args:
+            bottleneck: Bottleneck module
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT bottleneck
+        """
+        # Convert all convolutions in the bottleneck
+        if hasattr(bottleneck, 'cv1'):
+            bottleneck.cv1 = self._convert_conv(bottleneck.cv1, qconfig)
+        
+        if hasattr(bottleneck, 'cv2'):
+            bottleneck.cv2 = self._convert_conv(bottleneck.cv2, qconfig)
+        
+        # Apply QConfig to bottleneck
+        if qconfig is not None:
+            bottleneck.qconfig = qconfig
+        
+        return bottleneck
+    
+    def forward(self, x):
+        """
+        Forward pass of Bottleneck CSP module.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Output tensor
+        """
+        y1 = self.cv3(self.cv1(x))
+        
+        # Handle bottleneck modules
+        y2 = self.cv2(x)
+        if hasattr(self, 'm'):
+            if isinstance(self.m, nn.ModuleList):
+                for module in self.m:
+                    y2 = module(y2)
+            else:
+                y2 = self.m(y2)
+        
+        # Apply batch norm if present
+        if hasattr(self, 'bn'):
+            y = torch.cat([y1, y2], dim=1)
+            y = self.bn(y)
+        else:
+            y = torch.cat([y1, y2], dim=1)
+        
+        # Apply activation if present
+        if hasattr(self, 'act'):
+            y = self.act(y)
+        
+        # Final convolution
+        y = self.cv4(y)
+        
+        # Apply activation post-process if available
+        if self.activation_post_process is not None:
+            y = self.activation_post_process(y)
+        
+        return y
+    
+    @classmethod
+    def from_float(cls, module, qconfig=None):
+        """
+        Create QAT Bottleneck CSP module from float module.
+        
+        Args:
+            module: Float Bottleneck CSP module
+            qconfig: Quantization configuration
+            
+        Returns:
+            QAT Bottleneck CSP module
+        """
+        qat_bottleneck = cls(module, qconfig)
+        return qat_bottleneck
+
+// yolov8_qat.py
+"""
+YOLOv8 model with quantization-aware training support.
+
+This module extends the base YOLOv8 model with QAT capabilities,
+including specialized handling for detection heads and critical layers.
+"""
+
+import logging
+import torch
+import torch.nn as nn
+from typing import Dict, List, Optional, Union, Tuple, Any
+import yaml
+import os
+import re
+
+from .yolov8_base import YOLOv8BaseModel
+from ..quantization.utils import (
+    load_quantization_config,
+    prepare_model_for_qat,
+    convert_qat_model_to_quantized,
+    apply_layer_specific_quantization,
+    skip_layers_from_quantization
+)
+from ..quantization.qconfig import (
+    create_qconfig_mapping,
+    prepare_qat_config_from_yaml,
+    get_qconfig_by_name
+)
+from ..quantization.fusion import fuse_yolov8_modules
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class YOLOv8QATModel(nn.Module):
+    """
+    YOLOv8 model adapted for Quantization-Aware Training.
+    
+    This class extends the base YOLOv8 model with quantization-aware training
+    capabilities, including specialized handling for detection heads and critical layers.
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        qconfig_dict: Optional[Dict] = None,
+        skip_layers: Optional[List[Dict]] = None
+    ):
+        """
+        Initialize QAT-ready YOLOv8 model.
+        
+        Args:
+            model: Base YOLOv8 model
+            qconfig_dict: Quantization configuration dictionary
+            skip_layers: List of layer patterns to skip from quantization
+        """
+        super().__init__()
+        
+        self.model = model
+        self.qconfig_dict = qconfig_dict
+        self.skip_layers = skip_layers
+        
+        # Cache important layers for special handling
+        self._cache_important_layers()
+        
+        # Copy metadata from original model if available
+        if hasattr(model, 'model_variant'):
+            self.model_variant = model.model_variant
+        if hasattr(model, 'num_classes'):
+            self.num_classes = model.num_classes
+    
+    def _cache_important_layers(self) -> None:
+        """
+        Cache important layers for special handling during QAT.
+        
+        Identifies and stores references to layers that need special treatment,
+        such as the first layer, detection head, and other critical components.
+        """
+        self.first_conv = None
+        self.detection_head = None
+        self.critical_blocks = []
+        
+        # If model is a YOLOv8BaseModel, use its cached layers
+        if isinstance(self.model, YOLOv8BaseModel):
+            critical_layers = self.model.get_critical_layers()
+            
+            for name, module in critical_layers:
+                if name.endswith('.conv') and self.first_conv is None:
+                    self.first_conv = (name, module)
+                elif 'Detect' in name or name.endswith('.detect'):
+                    self.detection_head = (name, module)
+                else:
+                    self.critical_blocks.append((name, module))
+        else:
+            # Find first convolutional layer
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    self.first_conv = (name, module)
+                    break
+            
+            # Find detection head
+            for name, module in self.model.named_modules():
+                if 'Detect' in name or name.endswith('.detect'):
+                    self.detection_head = (name, module)
+                    break
+            
+            # Find critical blocks (e.g., CSP blocks)
+            for name, module in self.model.named_modules():
+                if any(x in name for x in ['C2f', 'SPPF']):
+                    self.critical_blocks.append((name, module))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the model.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Model output
+        """
+        return self.model(x)
+    
+    def get_critical_layers(self) -> List[Tuple[str, nn.Module]]:
+        """
+        Get list of layers critical for model accuracy.
+        
+        Returns:
+            List of (name, module) tuples for critical layers
+        """
+        critical_layers = []
+        
+        # First conv is critical
+        if self.first_conv:
+            critical_layers.append(self.first_conv)
+        
+        # Detection head is critical
+        if self.detection_head:
+            critical_layers.append(self.detection_head)
+        
+        # Add all critical blocks
+        critical_layers.extend(self.critical_blocks)
+        
+        return critical_layers
+    
+    def save(self, path: str, include_qconfig: bool = True) -> None:
+        """
+        Save model to file.
+        
+        Args:
+            path: Path to save model
+            include_qconfig: Whether to include quantization configuration
+            
+        Returns:
+            None
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        save_dict = {
+            "model": self.model,
+            "qat_config": self.qconfig_dict if include_qconfig else None,
+            "skip_layers": self.skip_layers if include_qconfig else None
+        }
+        
+        torch.save(save_dict, path)
+        logger.info(f"QAT model saved to {path}")
+    
+    def load(self, path: str) -> None:
+        """
+        Load model from file.
+        
+        Args:
+            path: Path to load model from
+            
+        Returns:
+            None
+        """
+        checkpoint = torch.load(path, map_location='cpu')
+        
+        if "model" in checkpoint:
+            self.model = checkpoint["model"]
+        else:
+            # Try to load as state dict
+            self.model.load_state_dict(checkpoint)
+        
+        # Load QAT configuration if available
+        if "qat_config" in checkpoint and checkpoint["qat_config"]:
+            self.qconfig_dict = checkpoint["qat_config"]
+        
+        # Load skip layers if available
+        if "skip_layers" in checkpoint and checkpoint["skip_layers"]:
+            self.skip_layers = checkpoint["skip_layers"]
+        
+        # Re-cache important layers
+        self._cache_important_layers()
+        
+        logger.info(f"QAT model loaded from {path}")
+    
+    def to_quantized(self) -> nn.Module:
+        """
+        Convert QAT model to fully quantized model.
+        
+        Returns:
+            Quantized model
+        """
+        from torch.quantization import convert
+        
+        # Ensure model is in eval mode
+        self.eval()
+        
+        # Convert model
+        quantized_model = convert(self.model)
+        
+        return quantized_model
+
+
+def prepare_yolov8_for_qat(
+    model: Union[YOLOv8BaseModel, nn.Module],
+    config_path: Optional[str] = None,
+    qconfig_dict: Optional[Dict] = None
+) -> YOLOv8QATModel:
+    """
+    Prepare YOLOv8 model for quantization-aware training.
+    
+    Args:
+        model: YOLOv8 model to prepare
+        config_path: Path to quantization configuration file
+        qconfig_dict: Quantization configuration dictionary
+        
+    Returns:
+        QAT-ready YOLOv8 model
+    """
+    # Extract model if wrapper
+    if isinstance(model, YOLOv8BaseModel):
+        yolo_model = model.model
+        skip_patterns = _get_default_skip_patterns()
+    else:
+        yolo_model = model
+        skip_patterns = _get_default_skip_patterns()
+    
+    # Load configuration if path provided
+    if config_path is not None:
+        config = load_quantization_config(config_path)
+        qconfig_dict = prepare_qat_config_from_yaml(config)
+        
+        # Extract skip patterns from config if available
+        if "quantization" in config and "skip_layers" in config["quantization"]:
+            skip_patterns = config["quantization"]["skip_layers"]
+    
+    # Use PyTorch's QAT preparation
+    prepared_model = prepare_model_for_qat(yolo_model, qconfig_dict=qconfig_dict)
+    
+    # Skip specific layers from quantization
+    if skip_patterns:
+        prepared_model = skip_layers_from_quantization(prepared_model, skip_patterns)
+    
+    # Create QAT model
+    qat_model = YOLOv8QATModel(
+        model=prepared_model,
+        qconfig_dict=qconfig_dict,
+        skip_layers=skip_patterns
+    )
+    
+    return qat_model
+
+
+def convert_yolov8_to_quantized(qat_model: YOLOv8QATModel) -> nn.Module:
+    """
+    Convert YOLOv8 QAT model to fully quantized model.
+    
+    Args:
+        qat_model: QAT model to convert
+        
+    Returns:
+        Quantized model
+    """
+    # Extract model if wrapper
+    if isinstance(qat_model, YOLOv8QATModel):
+        model = qat_model.model
+    else:
+        model = qat_model
+    
+    # Ensure model is in eval mode
+    model.eval()
+    
+    # Convert model
+    quantized_model = convert_qat_model_to_quantized(model)
+    
+    return quantized_model
+
+
+def apply_qat_config_to_yolov8(
+    model: Union[YOLOv8QATModel, nn.Module],
+    config_path: str
+) -> YOLOv8QATModel:
+    """
+    Apply quantization configuration to YOLOv8 model.
+    
+    Args:
+        model: YOLOv8 model
+        config_path: Path to configuration file
+        
+    Returns:
+        YOLOv8 model with quantization configuration applied
+    """
+    # Load configuration
+    config = load_quantization_config(config_path)
+    
+    # Extract model
+    if isinstance(model, YOLOv8QATModel):
+        yolo_model = model.model
+    else:
+        yolo_model = model
+    
+    # Apply layer-specific quantization based on config
+    if "quantization" in config and "layer_configs" in config["quantization"]:
+        layer_configs = config["quantization"]["layer_configs"]
+        default_qconfig = config["quantization"].get("default_qconfig", "default")
+        
+        yolo_model = apply_layer_specific_quantization(
+            yolo_model, layer_configs, default_qconfig
+        )
+    
+    # Create/update QAT model
+    if isinstance(model, YOLOv8QATModel):
+        model.model = yolo_model
+        model.qconfig_dict = prepare_qat_config_from_yaml(config)
+        
+        # Update skip layers if available
+        if "quantization" in config and "skip_layers" in config["quantization"]:
+            model.skip_layers = config["quantization"]["skip_layers"]
+        
+        return model
+    else:
+        return YOLOv8QATModel(
+            model=yolo_model,
+            qconfig_dict=prepare_qat_config_from_yaml(config),
+            skip_layers=config.get("quantization", {}).get("skip_layers", None)
+        )
+
+
+def _get_default_skip_patterns() -> List[Dict]:
+    """
+    Get default patterns for layers to skip from quantization.
+    
+    Returns:
+        List of skip patterns
+    """
+    return [
+        {
+            "pattern": r"model\.\d+\.forward",
+            "reason": "Skip forward method"
+        },
+        {
+            "pattern": r"model\.\d+\.detect",
+            "reason": "Special handling for detection layers"
+        }
+    ]
+
+

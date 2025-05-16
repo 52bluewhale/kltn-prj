@@ -1,0 +1,1829 @@
+// __init__.py
+from .trainer import Trainer, QATTrainer
+from .loss import QATPenaltyLoss, FocalLoss, DistillationLoss
+from .callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    ProgressiveQuantization,
+    TensorBoardLogger,
+    QuantizationErrorMonitor,
+    LearningRateScheduler
+)
+from .lr_scheduler import (
+    CosineAnnealingWarmRestarts,
+    StepLR,
+    ReduceLROnPlateau,
+    get_qat_scheduler
+)
+
+# Main API
+def create_trainer(model, config, qat_mode=False):
+    """
+    Create appropriate trainer based on mode.
+    
+    Args:
+        model: Model to train
+        config: Training configuration
+        qat_mode: Whether to use QAT trainer
+        
+    Returns:
+        Trainer instance
+    """
+    if qat_mode:
+        return QATTrainer(model, config)
+    else:
+        return Trainer(model, config)
+
+def build_loss_function(loss_type, config=None):
+    """
+    Build loss function based on type.
+    
+    Args:
+        loss_type: Type of loss function
+        config: Loss configuration
+        
+    Returns:
+        Loss function
+    """
+    if loss_type == "qat_penalty":
+        from .loss import FocalLoss  # Import a base criterion to use
+        penalty_factor = config.get("penalty_factor", 0.01) if config else 0.01
+        base_criterion = config.get("base_criterion", FocalLoss()) if config else FocalLoss()
+        return QATPenaltyLoss(base_criterion, penalty_factor)
+    elif loss_type == "focal":
+        gamma = config.get("gamma", 2.0) if config else 2.0
+        alpha = config.get("alpha", 0.25) if config else 0.25
+        return FocalLoss(gamma, alpha)
+    elif loss_type == "distillation":
+        teacher_model = config.get("teacher_model", None)
+        temp = config.get("temperature", 1.0) if config else 1.0
+        alpha = config.get("alpha", 0.5) if config else 0.5
+        return DistillationLoss(teacher_model, temp, alpha)
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
+def create_lr_scheduler(optimizer, scheduler_type, config=None):
+    """
+    Create learning rate scheduler.
+    
+    Args:
+        optimizer: Optimizer to schedule
+        scheduler_type: Type of scheduler
+        config: Scheduler configuration
+        
+    Returns:
+        Learning rate scheduler
+    """
+    if scheduler_type == "cosine":
+        T_0 = config.get("T_0", 10) if config else 10
+        T_mult = config.get("T_mult", 2) if config else 2
+        eta_min = config.get("eta_min", 1e-6) if config else 1e-6
+        return CosineAnnealingWarmRestarts(optimizer, T_0, T_mult, eta_min)
+    elif scheduler_type == "step":
+        step_size = config.get("step_size", 30) if config else 30
+        gamma = config.get("gamma", 0.1) if config else 0.1
+        return StepLR(optimizer, step_size, gamma)
+    elif scheduler_type == "plateau":
+        patience = config.get("patience", 10) if config else 10
+        factor = config.get("factor", 0.1) if config else 0.1
+        return ReduceLROnPlateau(optimizer, patience=patience, factor=factor)
+    elif scheduler_type == "qat":
+        return get_qat_scheduler(optimizer, config)
+    else:
+        raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+// callbacks.py
+import os
+import re
+import logging
+import torch
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class Callback:
+    """
+    Base callback class for model training hooks.
+    """
+    
+    def on_train_begin(self, trainer):
+        """Called at the beginning of training."""
+        pass
+    
+    def on_train_end(self, trainer):
+        """Called at the end of training."""
+        pass
+    
+    def on_epoch_begin(self, trainer):
+        """Called at the beginning of an epoch."""
+        pass
+    
+    def on_epoch_end(self, trainer, logs=None):
+        """Called at the end of an epoch."""
+        pass
+    
+    def on_batch_begin(self, trainer, batch_idx):
+        """Called at the beginning of a batch."""
+        pass
+    
+    def on_batch_end(self, trainer, batch_idx, logs=None):
+        """Called at the end of a batch."""
+        pass
+
+
+class ModelCheckpoint(Callback):
+    """
+    Callback to save model checkpoints during training.
+    """
+    
+    def __init__(self, filepath, monitor='val_loss', mode='min', save_best_only=True, verbose=True):
+        """
+        Initialize model checkpoint callback.
+        
+        Args:
+            filepath: Path to save checkpoints
+            monitor: Metric to monitor
+            mode: 'min' or 'max'
+            save_best_only: Whether to save only the best model
+            verbose: Whether to display messages
+        """
+        super().__init__()
+        self.filepath = filepath
+        self.monitor = monitor
+        self.mode = mode
+        self.save_best_only = save_best_only
+        self.verbose = verbose
+        
+        # Initialize best metric
+        self.best_metric = float('inf') if mode == 'min' else float('-inf')
+    
+    def on_epoch_end(self, trainer, logs=None):
+        """
+        Save model checkpoint at the end of an epoch.
+        
+        Args:
+            trainer: Trainer instance
+            logs: Dictionary of logs
+        """
+        if logs is None or self.monitor not in logs:
+            return
+        
+        current_metric = logs[self.monitor]
+        
+        # Check if model improved
+        if (self.mode == 'min' and current_metric < self.best_metric) or \
+           (self.mode == 'max' and current_metric > self.best_metric):
+            # Update best metric
+            self.best_metric = current_metric
+            
+            # Format filepath
+            formatted_filepath = self.filepath.format(
+                epoch=trainer.current_epoch + 1,
+                **{k: v for k, v in logs.items() if isinstance(v, (int, float))}
+            )
+            
+            # Save model
+            if self.verbose:
+                logger.info(f"Saving model to {formatted_filepath}")
+            
+            trainer.save_model(formatted_filepath)
+        elif not self.save_best_only:
+            # Save model even if not improved
+            formatted_filepath = self.filepath.format(
+                epoch=trainer.current_epoch + 1,
+                **{k: v for k, v in logs.items() if isinstance(v, (int, float))}
+            )
+            
+            # Save model
+            if self.verbose:
+                logger.info(f"Saving model to {formatted_filepath}")
+            
+            trainer.save_model(formatted_filepath)
+
+
+class EarlyStopping(Callback):
+    """
+    Callback to stop training early if monitored metric stops improving.
+    """
+    
+    def __init__(self, monitor='val_loss', patience=10, mode='min', min_delta=0, verbose=True):
+        """
+        Initialize early stopping callback.
+        
+        Args:
+            monitor: Metric to monitor
+            patience: Number of epochs with no improvement before stopping
+            mode: 'min' or 'max'
+            min_delta: Minimum change to qualify as improvement
+            verbose: Whether to display messages
+        """
+        super().__init__()
+        self.monitor = monitor
+        self.patience = patience
+        self.mode = mode
+        self.min_delta = min_delta
+        self.verbose = verbose
+        
+        # Initialize state
+        self.best_metric = float('inf') if mode == 'min' else float('-inf')
+        self.wait = 0
+    
+    def on_epoch_end(self, trainer, logs=None):
+        """
+        Check if training should be stopped.
+        
+        Args:
+            trainer: Trainer instance
+            logs: Dictionary of logs
+            
+        Returns:
+            Whether to continue training
+        """
+        if logs is None or self.monitor not in logs:
+            return True
+        
+        current_metric = logs[self.monitor]
+        
+        # Check if model improved
+        if (self.mode == 'min' and current_metric < self.best_metric - self.min_delta) or \
+           (self.mode == 'max' and current_metric > self.best_metric + self.min_delta):
+            # Update best metric
+            self.best_metric = current_metric
+            self.wait = 0
+        else:
+            # Increment wait counter
+            self.wait += 1
+            
+            # Check if patience is exhausted
+            if self.wait >= self.patience:
+                if self.verbose:
+                    logger.info(f"Early stopping triggered after {trainer.current_epoch + 1} epochs")
+                return False
+        
+        return True
+
+
+class TensorBoardLogger(Callback):
+    """
+    Callback to log metrics to TensorBoard.
+    """
+    
+    def __init__(self, log_dir='logs/tensorboard', histogram_freq=0):
+        """
+        Initialize TensorBoard logger.
+        
+        Args:
+            log_dir: Directory to save logs
+            histogram_freq: Frequency of weight histogram logging
+        """
+        super().__init__()
+        self.log_dir = log_dir
+        self.histogram_freq = histogram_freq
+        
+        if SummaryWriter is None:
+            logger.warning("TensorBoard not available. Install tensorflow or tensorboard.")
+            self.writer = None
+        else:
+            os.makedirs(log_dir, exist_ok=True)
+            self.writer = SummaryWriter(log_dir)
+    
+    def on_epoch_end(self, trainer, logs=None):
+        """
+        Log metrics to TensorBoard.
+        
+        Args:
+            trainer: Trainer instance
+            logs: Dictionary of logs
+        """
+        if self.writer is None or logs is None:
+            return
+        
+        # Log scalars
+        for key, value in logs.items():
+            if isinstance(value, (int, float)):
+                self.writer.add_scalar(key, value, trainer.current_epoch)
+        
+        # Log histograms
+        if self.histogram_freq > 0 and trainer.current_epoch % self.histogram_freq == 0:
+            for name, param in trainer.model.named_parameters():
+                self.writer.add_histogram(name, param.data.cpu().numpy(), trainer.current_epoch)
+    
+    def on_train_end(self, trainer):
+        """
+        Close TensorBoard writer.
+        
+        Args:
+            trainer: Trainer instance
+        """
+        if self.writer is not None:
+            self.writer.close()
+
+
+class LearningRateScheduler(Callback):
+    """
+    Callback to adjust learning rate during training.
+    """
+    
+    def __init__(self, scheduler, monitor='val_loss', verbose=True):
+        """
+        Initialize learning rate scheduler.
+        
+        Args:
+            scheduler: Learning rate scheduler
+            monitor: Metric to monitor for ReduceLROnPlateau
+            verbose: Whether to display messages
+        """
+        super().__init__()
+        self.scheduler = scheduler
+        self.monitor = monitor
+        self.verbose = verbose
+    
+    def on_epoch_end(self, trainer, logs=None):
+        """
+        Adjust learning rate at the end of an epoch.
+        
+        Args:
+            trainer: Trainer instance
+            logs: Dictionary of logs
+        """
+        if self.scheduler is None:
+            return
+        
+        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            if logs is not None and self.monitor in logs:
+                self.scheduler.step(logs[self.monitor])
+        else:
+            self.scheduler.step()
+        
+        if self.verbose:
+            lr = self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else trainer.optimizer.param_groups[0]['lr']
+            logger.info(f"Learning rate: {lr:.6f}")
+
+
+class ProgressiveQuantization(Callback):
+    """
+    Callback to progressively apply quantization to model layers.
+    """
+    
+    def __init__(self, progressive_stages, start_epoch=0, verbose=True):
+        """
+        Initialize progressive quantization callback.
+        
+        Args:
+            progressive_stages: List of dictionaries with stage configuration
+            start_epoch: Epoch to start quantization
+            verbose: Whether to display messages
+        """
+        super().__init__()
+        self.progressive_stages = progressive_stages
+        self.start_epoch = start_epoch
+        self.verbose = verbose
+        self.current_stage = -1
+    
+    def on_epoch_begin(self, trainer):
+        """
+        Apply quantization settings for the current epoch.
+        
+        Args:
+            trainer: Trainer instance
+        """
+        # Check if quantization should start
+        if trainer.current_epoch < self.start_epoch:
+            return
+        
+        # Find current stage
+        stage_idx = -1
+        for i, stage in enumerate(self.progressive_stages):
+            if trainer.current_epoch >= self.start_epoch + stage.get('epoch', 0):
+                stage_idx = i
+        
+        # Skip if stage hasn't changed
+        if stage_idx == self.current_stage:
+            return
+        
+        # Update current stage
+        self.current_stage = stage_idx
+        
+        if stage_idx >= 0:
+            # Apply quantization for current stage
+            stage = self.progressive_stages[stage_idx]
+            layer_patterns = stage.get('layers', [])
+            qconfig_name = stage.get('qconfig', 'default')
+            
+            if self.verbose:
+                logger.info(f"Applying {qconfig_name} quantization to {len(layer_patterns)} layer patterns in stage {stage_idx + 1}")
+            
+            # Apply quantization to matching layers
+            self._apply_quantization_to_layers(trainer.model, layer_patterns, qconfig_name)
+    
+    def _apply_quantization_to_layers(self, model, layer_patterns, qconfig_name):
+        """
+        Apply quantization to layers matching patterns.
+        
+        Args:
+            model: Model to apply quantization to
+            layer_patterns: List of regex patterns for layer names
+            qconfig_name: Name of QConfig to apply
+        """
+        try:
+            # More robust import approach
+            try:
+                from ..quantization.qconfig import get_qconfig_by_name
+            except ImportError:
+                import sys
+                if 'quantization.qconfig' in sys.modules:
+                    get_qconfig_by_name = sys.modules['quantization.qconfig'].get_qconfig_by_name
+                else:
+                    raise ImportError("Could not import quantization utilities")
+            
+            # Get QConfig
+            qconfig = get_qconfig_by_name(qconfig_name)
+            
+            # Apply to matching layers
+            for name, module in model.named_modules():
+                if any(re.match(pattern, name) for pattern in layer_patterns):
+                    if hasattr(module, 'qconfig'):
+                        module.qconfig = qconfig
+                        if self.verbose:
+                            logger.info(f"Applied {qconfig_name} to {name}")
+        except ImportError:
+            logger.error("Could not import quantization utilities")
+
+
+class QuantizationErrorMonitor(Callback):
+    """
+    Callback to monitor quantization error during training.
+    """
+    
+    def __init__(self, log_dir='logs/qat_error', save_maps=False, freq=5, verbose=True):
+        """
+        Initialize quantization error monitor.
+        
+        Args:
+            log_dir: Directory to save logs
+            save_maps: Whether to save error maps as images
+            freq: Frequency of error monitoring in epochs
+            verbose: Whether to display messages
+        """
+        super().__init__()
+        self.log_dir = log_dir
+        self.save_maps = save_maps
+        self.freq = freq
+        self.verbose = verbose
+        
+        # Create log directory
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Initialize TensorBoard writer
+        if SummaryWriter is not None:
+            self.writer = SummaryWriter(log_dir)
+        else:
+            self.writer = None
+    
+    def on_epoch_end(self, trainer, logs=None):
+        """
+        Monitor quantization error at the end of an epoch.
+        
+        Args:
+            trainer: Trainer instance
+            logs: Dictionary of logs
+        """
+        # Skip if not at monitoring frequency
+        if trainer.current_epoch % self.freq != 0:
+            return
+        
+        # Calculate quantization error for each layer
+        layer_errors = self._calculate_quantization_error(trainer.model)
+        
+        # Log errors
+        if self.writer is not None:
+            for layer_name, error_stats in layer_errors.items():
+                for stat_name, stat_value in error_stats.items():
+                    self.writer.add_scalar(f"quant_error/{layer_name}/{stat_name}", 
+                                           stat_value, trainer.current_epoch)
+        
+        # Save error maps
+        if self.save_maps:
+            self._save_error_maps(trainer.model, trainer.current_epoch)
+        
+        # Print summary
+        if self.verbose:
+            avg_error = np.mean([stats['mean'] for stats in layer_errors.values()])
+            max_error = np.max([stats['max'] for stats in layer_errors.values()])
+            logger.info(f"Quantization error - Avg: {avg_error:.6f}, Max: {max_error:.6f}")
+    
+    def _calculate_quantization_error(self, model):
+        """
+        Calculate quantization error for each layer with fake quantization.
+        
+        Args:
+            model: Model to analyze
+            
+        Returns:
+            Dictionary of layer errors
+        """
+        errors = {}
+        
+        for name, module in model.named_modules():
+            if hasattr(module, 'weight_fake_quant') and hasattr(module, 'weight'):
+                # Calculate error for weights
+                orig_weight = module.weight
+                quant_weight = module.weight_fake_quant(orig_weight)
+                
+                # Use CPU tensors to avoid memory issues
+                error = (orig_weight - quant_weight).abs().detach().cpu()
+                
+                # Calculate statistics using .item() to avoid tensor references
+                errors[name] = {
+                    'mean': float(error.mean().item()),
+                    'max': float(error.max().item()),
+                    'std': float(error.std().item()),
+                    'norm': float(torch.norm(error).item())
+                }
+                
+                # Explicitly delete tensors to free memory
+                del error
+                
+        return errors
+    
+    def _save_error_maps(self, model, epoch):
+        """
+        Save quantization error maps as images.
+        
+        Args:
+            model: Model to analyze
+            epoch: Current epoch
+        """
+        for name, module in model.named_modules():
+            if hasattr(module, 'weight_fake_quant') and hasattr(module, 'weight'):
+                # Calculate error for weights
+                orig_weight = module.weight
+                quant_weight = module.weight_fake_quant(orig_weight)
+                error = (orig_weight - quant_weight).abs().detach().cpu().numpy()
+                
+                # Create error map
+                if len(error.shape) == 4:  # Conv weights
+                    # Average over input channels and kernel dimensions
+                    error_map = np.mean(error, axis=(1, 2, 3))
+                elif len(error.shape) == 2:  # Linear weights
+                    # Average over input dimensions
+                    error_map = np.mean(error, axis=1)
+                else:
+                    continue
+                
+                # Create figure
+                plt.figure(figsize=(10, 5))
+                plt.bar(range(len(error_map)), error_map)
+                plt.title(f"Quantization Error - {name}")
+                plt.xlabel("Output Channel")
+                plt.ylabel("Average Error")
+                
+                # Get the figure before closing it
+                fig = plt.gcf()
+                
+                # Save figure
+                save_path = os.path.join(self.log_dir, f"error_map_{name.replace('.', '_')}_{epoch}.png")
+                plt.savefig(save_path)
+                
+                # Log to TensorBoard
+                if self.writer is not None:
+                    self.writer.add_figure(f"error_map/{name}", fig, epoch)
+                    
+                # Now close the figure
+                plt.close()
+    
+    def on_train_end(self, trainer):
+        """
+        Clean up at the end of training.
+        
+        Args:
+            trainer: Trainer instance
+        """
+        if self.writer is not None:
+            self.writer.close()
+
+// loss.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class QATPenaltyLoss(nn.Module):
+    """
+    Loss function with additional penalty term for quantization error.
+    Helps to guide the model towards better quantization-friendly weights.
+    """
+    
+    def __init__(self, base_criterion, penalty_factor=0.01):
+        """
+        Initialize QAT penalty loss.
+        
+        Args:
+            base_criterion: Base loss function
+            penalty_factor: Weight for quantization penalty term
+        """
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.penalty_factor = penalty_factor
+        self.model = None
+        
+        # Try to get model from criterion
+        if hasattr(base_criterion, 'model'):
+            self.model = base_criterion.model
+    
+    def forward(self, outputs, targets):
+        """
+        Forward pass to compute loss with quantization penalty.
+        
+        Args:
+            outputs: Model outputs
+            targets: Target values
+            
+        Returns:
+            Loss value
+        """
+        # Compute base loss
+        base_loss = self.base_criterion(outputs, targets)
+        
+        # Compute quantization penalty
+        quant_penalty = self._compute_quantization_penalty()
+        
+        # Combine losses
+        total_loss = base_loss + self.penalty_factor * quant_penalty
+        
+        return total_loss
+    
+    def _compute_quantization_penalty(self):
+        """
+        Compute penalty term based on quantization error.
+        
+        Returns:
+            Penalty term
+        """
+        penalty = torch.tensor(0.0, device=next(self.base_criterion.parameters()).device
+                              if hasattr(self.base_criterion, 'parameters') else 'cpu')
+        
+        # Collect all fake quantized parameters and their original values
+        for name, module in self._find_quantized_modules():
+            if hasattr(module, 'weight') and hasattr(module, 'weight_fake_quant'):
+                # Compute error between original and quantized weights
+                orig_weight = module.weight
+                quant_weight = module.weight_fake_quant(orig_weight)
+                error = torch.mean((orig_weight - quant_weight) ** 2)
+                penalty = penalty + error
+        
+        return penalty
+    
+    def _find_quantized_modules(self):
+        """
+        Find modules with fake quantization.
+        
+        Returns:
+            List of (name, module) pairs with fake quantization
+        """
+        if self.model is not None:
+            return [(name, module) for name, module in self.model.named_modules()
+                   if hasattr(module, 'weight_fake_quant')]
+        elif hasattr(self.base_criterion, 'model'):
+            # If base_criterion has access to model
+            model = self.base_criterion.model
+            return [(name, module) for name, module in model.named_modules()
+                   if hasattr(module, 'weight_fake_quant')]
+        else:
+            # If no model is directly accessible, penalty will be zero
+            return []
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for object detection.
+    Reduces loss contribution from easy examples and focuses on hard ones.
+    """
+    
+    def __init__(self, gamma=2.0, alpha=0.25, reduction='mean'):
+        """
+        Initialize focal loss.
+        
+        Args:
+            gamma: Focusing parameter for hard examples
+            alpha: Weighting factor for positive examples
+            reduction: Reduction method ('mean', 'sum', 'none')
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        """
+        Compute focal loss.
+        
+        Args:
+            inputs: Model predictions (logits)
+            targets: Ground truth labels
+            
+        Returns:
+            Loss value
+        """
+        # Convert inputs to probabilities with sigmoid
+        p = torch.sigmoid(inputs)
+        
+        # Prepare targets
+        targets = targets.float()
+        
+        # Calculate binary cross entropy
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        
+        # Apply focal weighting
+        p_t = p * targets + (1 - p) * (1 - targets)
+        alpha_factor = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        modulating_factor = (1.0 - p_t) ** self.gamma
+        
+        # Combine factors
+        focal_loss = alpha_factor * modulating_factor * ce_loss
+        
+        # Apply reduction
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:  # 'none'
+            return focal_loss
+
+
+class DistillationLoss(nn.Module):
+    """
+    Knowledge Distillation Loss for model compression.
+    Combines regular loss with KL divergence from teacher model.
+    """
+    
+    def __init__(self, teacher_model, temperature=1.0, alpha=0.5):
+        """
+        Initialize distillation loss.
+        
+        Args:
+            teacher_model: Teacher model for knowledge distillation
+            temperature: Temperature for softening probability distributions
+            alpha: Weight for distillation loss (1-alpha for regular loss)
+        """
+        super().__init__()
+        self.teacher_model = teacher_model
+        self.temperature = temperature
+        self.alpha = alpha
+        
+        # Ensure teacher model is in eval mode
+        self.teacher_model.eval()
+        
+        # Regular loss function for task-specific loss
+        self.criterion = nn.CrossEntropyLoss(reduction='none')
+    
+    def forward(self, student_outputs, targets):
+        """
+        Compute distillation loss.
+        
+        Args:
+            student_outputs: Student model predictions
+            targets: Ground truth labels
+            
+        Returns:
+            Combined loss value
+        """
+        # Get device
+        device = student_outputs.device
+        
+        # Convert targets if necessary
+        if len(targets.shape) == 1:
+            # Classification targets
+            hard_targets = targets
+        else:
+            # One-hot encoded targets
+            hard_targets = targets.argmax(dim=1)
+        
+        # Compute regular task loss
+        task_loss = self.criterion(student_outputs, hard_targets).mean()
+        
+        # Compute teacher outputs (no gradient needed)
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model(student_outputs.detach())
+        
+        # Compute distillation loss (KL divergence)
+        soft_targets = F.softmax(teacher_outputs / self.temperature, dim=1)
+        log_probs = F.log_softmax(student_outputs / self.temperature, dim=1)
+        distill_loss = F.kl_div(log_probs, soft_targets, reduction='batchmean') * (self.temperature ** 2)
+        
+        # Combine losses
+        combined_loss = (1 - self.alpha) * task_loss + self.alpha * distill_loss
+        
+        return combined_loss
+
+// lr_scheduler.py
+import torch
+import math
+import numpy as np
+from torch.optim.lr_scheduler import _LRScheduler
+
+class CosineAnnealingWarmRestarts(_LRScheduler):
+    """
+    Cosine annealing scheduler with warm restarts.
+    """
+    
+    def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+        """
+        Initialize cosine annealing scheduler.
+        
+        Args:
+            optimizer: Optimizer
+            T_0: Initial restart period
+            T_mult: Restart period multiplier
+            eta_min: Minimum learning rate
+            last_epoch: Last epoch
+        """
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.eta_min = eta_min
+        self.T_cur = last_epoch
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        """
+        Calculate learning rate.
+        
+        Returns:
+            List of learning rates
+        """
+        if self.T_cur == -1:
+            return self.base_lrs
+        
+        return [self.eta_min + (base_lr - self.eta_min) * 
+                (1 + math.cos(math.pi * self.T_cur / self.T_0)) / 2
+                for base_lr in self.base_lrs]
+    
+    def step(self, epoch=None):
+        """
+        Update learning rate.
+        
+        Args:
+            epoch: Current epoch (unused)
+        """
+        if epoch is None:
+            epoch = self.last_epoch + 1
+            self.T_cur = self.T_cur + 1
+            if self.T_cur >= self.T_0:
+                self.T_cur = self.T_cur - self.T_0
+                self.T_0 = self.T_0 * self.T_mult
+        else:
+            if epoch >= self.T_0:
+                if self.T_mult > 1:
+                    n = int(math.log((epoch / self.T_0 * (self.T_mult - 1) + 1), self.T_mult))
+                    self.T_cur = epoch - self.T_0 * (self.T_mult ** n - 1) / (self.T_mult - 1)
+                    self.T_0 = self.T_0 * self.T_mult ** n
+                else:
+                    self.T_cur = epoch % self.T_0
+            else:
+                self.T_cur = epoch
+                
+        self.last_epoch = math.floor(epoch)
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            param_group['lr'] = lr
+
+
+class StepLR(_LRScheduler):
+    """
+    Step learning rate scheduler.
+    """
+    
+    def __init__(self, optimizer, step_size, gamma=0.1, last_epoch=-1):
+        """
+        Initialize step scheduler.
+        
+        Args:
+            optimizer: Optimizer
+            step_size: Epoch interval for reduction
+            gamma: Learning rate reduction factor
+            last_epoch: Last epoch
+        """
+        self.step_size = step_size
+        self.gamma = gamma
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        """
+        Calculate learning rate.
+        
+        Returns:
+            List of learning rates
+        """
+        if self.last_epoch == 0 or self.last_epoch % self.step_size != 0:
+            return self.base_lrs
+        
+        return [base_lr * self.gamma ** (self.last_epoch // self.step_size)
+                for base_lr in self.base_lrs]
+
+
+class ReduceLROnPlateau:
+    """
+    Reduce learning rate when metric stops improving.
+    """
+    
+    def __init__(self, optimizer, mode='min', factor=0.1, patience=10, 
+                 threshold=1e-4, min_lr=0, verbose=False):
+        """
+        Initialize reduce on plateau scheduler.
+        
+        Args:
+            optimizer: Optimizer
+            mode: 'min' or 'max'
+            factor: Learning rate reduction factor
+            patience: Epochs to wait before reducing
+            threshold: Threshold for measuring improvement
+            min_lr: Minimum learning rate
+            verbose: Whether to print messages
+        """
+        self.optimizer = optimizer
+        self.mode = mode
+        self.factor = factor
+        self.patience = patience
+        self.threshold = threshold
+        self.min_lr = min_lr
+        self.verbose = verbose
+        
+        # State
+        self.best = float('inf') if mode == 'min' else float('-inf')
+        self.wait = 0
+        self.cooldown_counter = 0
+        self.reduced = False
+
+        # For compatibility with PyTorch LR schedulers
+        self.last_epoch = -1
+    
+    def step(self, metric):
+        """
+        Update learning rate based on metric.
+        
+        Args:
+            metric: Measured value
+        """
+        self.last_epoch += 1
+
+        if metric is None:
+            logger.warning("ReduceLROnPlateau requires a metric value, but none was provided")
+            return
+
+        if self.mode == 'min':
+            is_better = metric < self.best - self.threshold
+        else:
+            is_better = metric > self.best + self.threshold
+        
+        # Update best metric
+        if is_better:
+            self.best = metric
+            self.wait = 0
+        else:
+            self.wait += 1
+            
+            # Check if patience is exhausted
+            if self.wait >= self.patience:
+                self._reduce_lr()
+                self.wait = 0
+    
+    def _reduce_lr(self):
+        """
+        Reduce learning rate.
+        """
+        for param_group in self.optimizer.param_groups:
+            old_lr = param_group['lr']
+            new_lr = max(old_lr * self.factor, self.min_lr)
+            param_group['lr'] = new_lr
+            
+            if self.verbose:
+                print(f"Reducing learning rate from {old_lr} to {new_lr}")
+
+    # For compatibility with PyTorch LR schedulers
+    def get_last_lr(self):
+        """Return last computed learning rate by current scheduler."""
+        return [group['lr'] for group in self.optimizer.param_groups]
+
+
+
+class QATLearningRateScheduler(_LRScheduler):
+    """
+    Learning rate scheduler specifically for QAT.
+    Manages different phases of QAT training.
+    """
+    
+    def __init__(self, optimizer, warmup_epochs=5, initial_lr=1e-4, 
+                 peak_lr=1e-3, final_lr=1e-5, quant_start_epoch=10, 
+                 total_epochs=100, last_epoch=-1):
+        """
+        Initialize QAT scheduler.
+        
+        Args:
+            optimizer: Optimizer
+            warmup_epochs: Number of warmup epochs
+            initial_lr: Initial learning rate
+            peak_lr: Peak learning rate after warmup
+            final_lr: Final learning rate
+            quant_start_epoch: Epoch to start quantization
+            total_epochs: Total number of epochs
+            last_epoch: Last epoch
+        """
+        self.warmup_epochs = warmup_epochs
+        self.initial_lr = initial_lr
+        self.peak_lr = peak_lr
+        self.final_lr = final_lr
+        self.quant_start_epoch = quant_start_epoch
+        self.total_epochs = total_epochs
+        super().__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        """
+        Calculate learning rate based on training phase.
+        
+        Returns:
+            List of learning rates
+        """
+        epoch = self.last_epoch
+        
+        if epoch < self.warmup_epochs:
+            # Warmup phase: linearly increase LR
+            factor = epoch / self.warmup_epochs
+            lr = self.initial_lr + (self.peak_lr - self.initial_lr) * factor
+        elif epoch < self.quant_start_epoch:
+            # Pre-quantization phase: maintain peak LR
+            lr = self.peak_lr
+        else:
+            # Quantization phase: cosine decay to final LR
+            progress = (epoch - self.quant_start_epoch) / (self.total_epochs - self.quant_start_epoch)
+            factor = 0.5 * (1 + math.cos(math.pi * progress))
+            lr = self.final_lr + (self.peak_lr - self.final_lr) * factor
+        
+        return [lr for _ in self.base_lrs]
+
+
+def get_qat_scheduler(optimizer, config):
+    """
+    Create QAT-specific learning rate scheduler.
+    
+    Args:
+        optimizer: Optimizer
+        config: QAT configuration
+        
+    Returns:
+        Learning rate scheduler
+    """
+    scheduler_config = config.get('scheduler', {})
+    
+    warmup_epochs = scheduler_config.get('warmup_epochs', 5)
+    initial_lr = scheduler_config.get('initial_lr', 1e-4)
+    peak_lr = scheduler_config.get('peak_lr', 1e-3)
+    final_lr = scheduler_config.get('final_lr', 1e-5)
+    quant_start_epoch = config.get('start_epoch', 10)
+    total_epochs = scheduler_config.get('total_epochs', 100)
+    
+    return QATLearningRateScheduler(
+        optimizer,
+        warmup_epochs=warmup_epochs,
+        initial_lr=initial_lr,
+        peak_lr=peak_lr,
+        final_lr=final_lr,
+        quant_start_epoch=quant_start_epoch,
+        total_epochs=total_epochs
+    )
+
+// trainer.py
+# Main training loop with QAT support:
+#     - Progressive quantization
+#     - Specialized learning rate scheduling for QAT
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import os
+import logging
+import time
+from tqdm import tqdm
+import numpy as np
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class Trainer:
+    """
+    Base trainer class for model training.
+    """
+    
+    def __init__(self, model, config):
+        """
+        Initialize trainer.
+        
+        Args:
+            model: Model to train
+            config: Training configuration
+        """
+        self.model = model
+        self.config = config
+        self.device = self._get_device()
+        self.model = self.model.to(self.device)
+        
+        # Setup optimizer
+        self.optimizer = self._create_optimizer()
+        
+        # Setup loss function
+        self.criterion = self._create_criterion()
+        
+        # Setup learning rate scheduler
+        self.scheduler = self._create_scheduler()
+        
+        # Setup callbacks
+        self.callbacks = self._setup_callbacks()
+        
+        # Training state
+        self.current_epoch = 0
+        self.best_metric = float('inf')
+        self.training_history = {
+            'train_loss': [],
+            'val_loss': [],
+            'metrics': {}
+        }
+    
+    def _get_device(self):
+        """
+        Get appropriate device for training.
+        
+        Returns:
+            torch.device
+        """
+        device = self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        return torch.device(device)
+    
+    def _create_optimizer(self):
+        """
+        Create optimizer from configuration.
+        
+        Returns:
+            Optimizer
+        """
+        optimizer_config = self.config.get('optimizer', {})
+        optimizer_type = optimizer_config.get('type', 'adam')
+        lr = optimizer_config.get('lr', 1e-3)
+        weight_decay = optimizer_config.get('weight_decay', 0)
+        
+        if optimizer_type.lower() == 'adam':
+            return optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'sgd':
+            momentum = optimizer_config.get('momentum', 0.9)
+            return optim.SGD(self.model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'adamw':
+            return optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+    
+    def _create_criterion(self):
+        """
+        Create loss function from configuration.
+        
+        Returns:
+            Loss function
+        """
+        from .loss import FocalLoss
+        
+        loss_config = self.config.get('loss', {})
+        loss_type = loss_config.get('type', 'focal')
+        
+        if loss_type == 'focal':
+            gamma = loss_config.get('gamma', 2.0)
+            alpha = loss_config.get('alpha', 0.25)
+            return FocalLoss(gamma=gamma, alpha=alpha)
+        elif hasattr(nn, loss_type):
+            return getattr(nn, loss_type)()
+        else:
+            raise ValueError(f"Unsupported loss type: {loss_type}")
+    
+    def _create_scheduler(self):
+        """
+        Create learning rate scheduler from configuration.
+        
+        Returns:
+            Learning rate scheduler
+        """
+        scheduler_config = self.config.get('scheduler', {})
+        if not scheduler_config:
+            return None
+        
+        scheduler_type = scheduler_config.get('type', None)
+        if not scheduler_type:
+            return None
+        
+        from .lr_scheduler import (
+            CosineAnnealingWarmRestarts,
+            StepLR,
+            ReduceLROnPlateau
+        )
+        
+        if scheduler_type == 'cosine':
+            T_0 = scheduler_config.get('T_0', 10)
+            T_mult = scheduler_config.get('T_mult', 2)
+            eta_min = scheduler_config.get('eta_min', 1e-6)
+            return CosineAnnealingWarmRestarts(self.optimizer, T_0, T_mult, eta_min)
+        elif scheduler_type == 'step':
+            step_size = scheduler_config.get('step_size', 30)
+            gamma = scheduler_config.get('gamma', 0.1)
+            return StepLR(self.optimizer, step_size, gamma)
+        elif scheduler_type == 'plateau':
+            patience = scheduler_config.get('patience', 10)
+            factor = scheduler_config.get('factor', 0.1)
+            return ReduceLROnPlateau(self.optimizer, patience=patience, factor=factor)
+        else:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+    
+    def _setup_callbacks(self):
+        """
+        Setup callbacks from configuration.
+        
+        Returns:
+            List of callbacks
+        """
+        from .callbacks import (
+            ModelCheckpoint,
+            EarlyStopping,
+            TensorBoardLogger
+        )
+        
+        callbacks = []
+        callback_configs = self.config.get('callbacks', [])
+        
+        for callback_config in callback_configs:
+            callback_type = callback_config.get('type', '')
+            
+            if callback_type == 'checkpoint':
+                filepath = callback_config.get('filepath', 'checkpoints/model_{epoch:02d}_{val_loss:.4f}.pt')
+                monitor = callback_config.get('monitor', 'val_loss')
+                mode = callback_config.get('mode', 'min')
+                save_best_only = callback_config.get('save_best_only', True)
+                callbacks.append(ModelCheckpoint(filepath, monitor, mode, save_best_only))
+            
+            elif callback_type == 'early_stopping':
+                monitor = callback_config.get('monitor', 'val_loss')
+                patience = callback_config.get('patience', 10)
+                mode = callback_config.get('mode', 'min')
+                callbacks.append(EarlyStopping(monitor, patience, mode))
+            
+            elif callback_type == 'tensorboard':
+                log_dir = callback_config.get('log_dir', 'logs/tensorboard')
+                callbacks.append(TensorBoardLogger(log_dir))
+        
+        return callbacks
+    
+    def train(self, train_loader, val_loader=None, epochs=10):
+        """
+        Train the model.
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            epochs: Number of epochs to train
+            
+        Returns:
+            Training history
+        """
+        # Reset training state
+        self.current_epoch = 0
+        self.best_metric = float('inf')
+        self.training_history = {
+            'train_loss': [],
+            'val_loss': [],
+            'metrics': {}
+        }
+        
+        # Call on_train_begin for callbacks
+        for callback in self.callbacks:
+            if hasattr(callback, 'on_train_begin'):
+                callback.on_train_begin(self)
+        
+        # Training loop
+        for epoch in range(epochs):
+            self.current_epoch = epoch
+            
+            # Call on_epoch_begin for callbacks
+            for callback in self.callbacks:
+                if hasattr(callback, 'on_epoch_begin'):
+                    callback.on_epoch_begin(self)
+            
+            # Training phase
+            train_loss = self._train_epoch(train_loader)
+            self.training_history['train_loss'].append(train_loss)
+            
+            # Validation phase
+            val_loss = None
+            if val_loader is not None:
+                val_loss = self._validate_epoch(val_loader)
+                self.training_history['val_loss'].append(val_loss)
+            
+            # Call on_epoch_end for callbacks
+            stop_training = False
+            for callback in self.callbacks:
+                if hasattr(callback, 'on_epoch_end'):
+                    result = callback.on_epoch_end(self, logs={
+                        'train_loss': train_loss,
+                        'val_loss': val_loss
+                    })
+                    if result is False:
+                        stop_training = True
+            
+            # Update learning rate scheduler
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+            
+            # Print epoch summary
+            log_message = f"Epoch {epoch+1}/{epochs} - train_loss: {train_loss:.4f}"
+            if val_loss is not None:
+                log_message += f" - val_loss: {val_loss:.4f}"
+            logger.info(log_message)
+            
+            # Check if training should be stopped
+            if stop_training:
+                logger.info("Early stopping triggered")
+                break
+        
+        # Call on_train_end for callbacks
+        for callback in self.callbacks:
+            if hasattr(callback, 'on_train_end'):
+                callback.on_train_end(self)
+        
+        return self.training_history
+    
+    def _train_epoch(self, train_loader):
+        """
+        Train for one epoch.
+        
+        Args:
+            train_loader: Training data loader
+            
+        Returns:
+            Average training loss
+        """
+        self.model.train()
+        total_loss = 0
+        
+        # Progress bar
+        pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch+1} [Train]")
+        
+        for batch_idx, batch in enumerate(pbar):
+            # Call on_batch_begin for callbacks
+            for callback in self.callbacks:
+                if hasattr(callback, 'on_batch_begin'):
+                    callback.on_batch_begin(self, batch_idx)
+            
+            # Extract data and labels
+            data, targets = self._process_batch(batch)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            outputs = self.model(data)
+            
+            # Calculate loss
+            loss = self._compute_loss(outputs, targets)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update progress bar
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': loss.item()})
+            
+            # Call on_batch_end for callbacks
+            for callback in self.callbacks:
+                if hasattr(callback, 'on_batch_end'):
+                    callback.on_batch_end(self, batch_idx, logs={'loss': loss.item()})
+        
+        return total_loss / len(train_loader)
+    
+    def _validate_epoch(self, val_loader):
+        """
+        Validate for one epoch.
+        
+        Args:
+            val_loader: Validation data loader
+            
+        Returns:
+            Average validation loss
+        """
+        self.model.eval()
+        total_loss = 0
+        
+        # Progress bar
+        pbar = tqdm(val_loader, desc=f"Epoch {self.current_epoch+1} [Val]")
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(pbar):
+                # Extract data and labels
+                data, targets = self._process_batch(batch)
+                
+                # Forward pass
+                outputs = self.model(data)
+                
+                # Calculate loss
+                loss = self._compute_loss(outputs, targets)
+                
+                # Update progress bar
+                total_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
+        
+        return total_loss / len(val_loader)
+    
+    def _process_batch(self, batch):
+        """
+        Process batch data.
+        
+        Args:
+            batch: Batch data
+            
+        Returns:
+            data, targets
+        """
+        # Handle different data formats
+        if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+            data, targets = batch[0], batch[1]
+        elif isinstance(batch, dict) and 'input' in batch and 'target' in batch:
+            data, targets = batch['input'], batch['target']
+        else:
+            raise ValueError(f"Unsupported batch format: {type(batch)}")
+        
+        # Move to device
+        data = data.to(self.device)
+        if isinstance(targets, torch.Tensor):
+            targets = targets.to(self.device)
+        elif isinstance(targets, (tuple, list)):
+            targets = [t.to(self.device) if isinstance(t, torch.Tensor) else t for t in targets]
+        
+        return data, targets
+    
+    def _compute_loss(self, outputs, targets):
+        """
+        Compute loss with quantization penalty if needed.
+        
+        Args:
+            outputs: Model outputs
+            targets: Target values
+            
+        Returns:
+            Loss value
+        """
+        # Regular loss computation 
+        loss = super()._compute_loss(outputs, targets)
+        
+        # Check if additional QAT-specific penalty should be applied
+        if self.qat_config.get('use_penalty', False) and not isinstance(self.criterion, QATPenaltyLoss):
+            # Calculate quantization penalty
+            penalty = 0.0
+            penalty_factor = self.qat_config.get('penalty_factor', 0.01)
+            
+            # Find modules with fake quantization
+            for name, module in self.model.named_modules():
+                if hasattr(module, 'weight') and hasattr(module, 'weight_fake_quant'):
+                    # Compute error between original and quantized weights
+                    orig_weight = module.weight
+                    quant_weight = module.weight_fake_quant(orig_weight)
+                    error = torch.mean((orig_weight - quant_weight) ** 2)
+                    penalty = penalty + error
+            
+            # Add penalty to loss
+            loss = loss + penalty_factor * penalty
+        
+        return loss
+    
+    def save_model(self, filepath):
+        """
+        Save model to file.
+        
+        Args:
+            filepath: Path to save model
+            
+        Returns:
+            Success flag
+        """
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Save model
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'epoch': self.current_epoch,
+                'best_metric': self.best_metric,
+                'training_history': self.training_history
+            }, filepath)
+            
+            logger.info(f"Model saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+            return False
+    
+    def load_model(self, filepath):
+        """
+        Load model from file.
+        
+        Args:
+            filepath: Path to load model from
+            
+        Returns:
+            Success flag
+        """
+        try:
+            # Load checkpoint
+            checkpoint = torch.load(filepath, map_location=self.device)
+            
+            # Load model state
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Load optimizer state
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Load training state
+            self.current_epoch = checkpoint.get('epoch', 0)
+            self.best_metric = checkpoint.get('best_metric', float('inf'))
+            self.training_history = checkpoint.get('training_history', {
+                'train_loss': [],
+                'val_loss': [],
+                'metrics': {}
+            })
+            
+            logger.info(f"Model loaded from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            return False
+
+
+class QATTrainer(Trainer):
+    """
+    Trainer for Quantization-Aware Training.
+    Extends base Trainer with QAT-specific functionality.
+    """
+    
+    def __init__(self, model, config):
+        """
+        Initialize QAT trainer.
+        
+        Args:
+            model: Model to train (should be prepared for QAT)
+            config: Training configuration
+        """
+        super().__init__(model, config)
+        
+        # QAT-specific configuration
+        self.qat_config = config.get('qat', {})
+        self.quantization_start_epoch = self.qat_config.get('start_epoch', 0)
+        self.freeze_bn_epochs = self.qat_config.get('freeze_bn_epochs', 3)
+        self.progressive_stages = self.qat_config.get('progressive_stages', [])
+        
+        # QAT-specific callbacks
+        self._setup_qat_callbacks()
+    
+    def _create_criterion(self):
+        """
+        Create loss function with QAT penalty if needed.
+        
+        Returns:
+            Loss function
+        """
+        # Get base criterion
+        base_criterion = super()._create_criterion()
+        
+        # Check if QAT penalty should be added
+        use_qat_penalty = self.qat_config.get('use_penalty', False)
+        if use_qat_penalty:
+            from .loss import QATPenaltyLoss
+            penalty_factor = self.qat_config.get('penalty_factor', 0.01)
+            return QATPenaltyLoss(base_criterion, penalty_factor)
+        
+        return base_criterion
+    
+    def _create_scheduler(self):
+        """
+        Create QAT-specific learning rate scheduler.
+        
+        Returns:
+            Learning rate scheduler
+        """
+        # Check if QAT scheduler should be used
+        use_qat_scheduler = self.qat_config.get('use_qat_scheduler', False)
+        if use_qat_scheduler:
+            from .lr_scheduler import get_qat_scheduler
+            return get_qat_scheduler(self.optimizer, self.qat_config)
+        
+        return super()._create_scheduler()
+    
+    def _setup_qat_callbacks(self):
+        """
+        Setup QAT-specific callbacks.
+        """
+        from .callbacks import (
+            ProgressiveQuantization,
+            QuantizationErrorMonitor
+        )
+        
+        # Add progressive quantization callback if specified
+        if self.progressive_stages:
+            self.callbacks.append(ProgressiveQuantization(
+                self.progressive_stages,
+                start_epoch=self.quantization_start_epoch
+            ))
+        
+        # Add quantization error monitor if specified
+        monitor_error = self.qat_config.get('monitor_error', False)
+        if monitor_error:
+            log_dir = self.qat_config.get('error_log_dir', 'logs/qat_error')
+            save_maps = self.qat_config.get('save_error_maps', False)
+            self.callbacks.append(QuantizationErrorMonitor(
+                log_dir, save_maps=save_maps
+            ))
+    
+    def _train_epoch(self, train_loader):
+        """
+        Train for one epoch with QAT specifics.
+        
+        Args:
+            train_loader: Training data loader
+            
+        Returns:
+            Average training loss
+        """
+        # Check if BN layers should be frozen
+        if self.current_epoch >= self.quantization_start_epoch + self.freeze_bn_epochs:
+            # Freeze batch normalization layers to preserve statistics
+            self._freeze_bn_layers()
+        
+        return super()._train_epoch(train_loader)
+    
+    def _freeze_bn_layers(self):
+        """
+        Freeze batch normalization layers.
+        """
+        def _freeze_bn_stats(module):
+            if isinstance(module, nn.BatchNorm2d):
+                module.eval()
+        
+        self.model.apply(_freeze_bn_stats)
+    
+    def _compute_loss(self, outputs, targets):
+        """
+        Compute loss with quantization penalty if needed.
+        
+        Args:
+            outputs: Model outputs
+            targets: Target values
+            
+        Returns:
+            Loss value
+        """
+        # # Regular loss computation for QATPenaltyLoss
+        # return super()._compute_loss(outputs, targets)
+
+        # Regular loss computation 
+        loss = super()._compute_loss(outputs, targets)
+    
+        # Check if additional QAT-specific penalty should be applied
+        if self.qat_config.get('use_penalty', False) and not isinstance(self.criterion, QATPenaltyLoss):
+            # Calculate quantization penalty
+            penalty = 0.0
+            penalty_factor = self.qat_config.get('penalty_factor', 0.01)
+            
+            # Find modules with fake quantization
+            for name, module in self.model.named_modules():
+                if hasattr(module, 'weight') and hasattr(module, 'weight_fake_quant'):
+                    # Compute error between original and quantized weights
+                    orig_weight = module.weight
+                    quant_weight = module.weight_fake_quant(orig_weight)
+                    error = torch.mean((orig_weight - quant_weight) ** 2)
+                    penalty = penalty + error
+            
+            # Add penalty to loss
+            loss = loss + penalty_factor * penalty
+    
+    return loss
+    
+    def convert_model_to_quantized(self):
+        """
+        Convert QAT model to fully quantized model.
+        
+        Returns:
+            Quantized model
+        """
+        try:
+            from torch.quantization import convert
+            
+            # Try multiple import paths to be more robust
+            try:
+                from ..quantization.utils import convert_qat_model_to_quantized
+            except ImportError:
+                try:
+                    from src.quantization.utils import convert_qat_model_to_quantized
+                except ImportError:
+                    import sys
+                    if 'quantization.utils' in sys.modules:
+                        convert_qat_model_to_quantized = sys.modules['quantization.utils'].convert_qat_model_to_quantized
+                    else:
+                        # Fallback to PyTorch's convert
+                        logger.warning("Could not import custom conversion function, using PyTorch's convert")
+                        convert_qat_model_to_quantized = convert
+            
+            # Make sure model is in eval mode
+            self.model.eval()
+            
+            # Convert model to quantized version
+            quantized_model = convert_qat_model_to_quantized(self.model, inplace=False)
+            
+            return quantized_model
+        except Exception as e:
+            logger.error(f"Error converting model to quantized: {e}")
+            logger.error("Falling back to PyTorch's convert function")
+            
+            # Fallback to PyTorch's convert
+            from torch.quantization import convert
+            self.model.eval()
+            return convert(self.model)
+    
+    def evaluate_quantized_model(self, test_loader):
+        """
+        Evaluate the quantized version of the model.
+        
+        Args:
+            test_loader: Test data loader
+            
+        Returns:
+            Evaluation metrics
+        """
+        # Convert model to quantized version
+        quantized_model = self.convert_model_to_quantized()
+        quantized_model = quantized_model.to(self.device)
+        
+        # Evaluate
+        quantized_model.eval()
+        total_loss = 0
+        metrics = {}
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                # Process batch
+                data, targets = self._process_batch(batch)
+                
+                # Forward pass
+                outputs = quantized_model(data)
+                
+                # Calculate loss
+                loss = self._compute_loss(outputs, targets)
+                total_loss += loss.item()
+                
+                # Calculate additional metrics if needed
+                # ...
+        
+        # Compute average loss
+        avg_loss = total_loss / len(test_loader)
+        metrics['loss'] = avg_loss
+        
+        return metrics
+    
+    def save_model(self, filepath):
+        """
+        Save QAT model with additional information.
+        
+        Args:
+            filepath: Path to save model
+            
+        Returns:
+            Success flag
+        """
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Save model with QAT info
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'epoch': self.current_epoch,
+                'best_metric': self.best_metric,
+                'training_history': self.training_history,
+                'qat_config': self.qat_config
+            }, filepath)
+            
+            logger.info(f"QAT model saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving QAT model: {e}")
+            return False

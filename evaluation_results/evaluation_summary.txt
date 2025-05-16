@@ -1,0 +1,53 @@
+MODEL EVALUATION SUMMARY
+============================================================
+
+Models:
+  FP32: models/checkpoints/fp32/weights/best.pt
+  QAT:  models/checkpoints/qat/quantized_yolov8n.pt
+
+Model Size:
+----------------------------------------
+  FP32: 5.98 MB
+  QAT:  11.68 MB
+  Reduction: -95.49%
+
+Performance Metrics:
+----------------------------------------
+  mAP75:
+    FP32: 0.099698
+    QAT:  N/A
+    Better: FP32
+
+  mAP50:
+    FP32: 0.103276
+    QAT:  N/A
+    Better: FP32
+
+  mAP:
+    FP32: 0.083165
+    QAT:  N/A
+    Better: FP32
+
+Time Metrics:
+----------------------------------------
+  val_time:
+    FP32: 91657.71 ms
+    QAT:  N/A
+    Better: FP32
+
+  inference_time:
+    FP32: 79.27 ms
+    QAT:  inf ms
+    Speedup: 0.00x
+    Better: FP32
+
+SUMMARY:
+----------------------------------------
+  FP32 better in: 5 metrics
+  QAT better in: 0 metrics
+  Equal performance in: 0 metrics
+
+Recommendation:
+  QAT model is infx slower for inference
+
+  Final recommendation: Use FP32 model - No significant benefits observed from quantization.

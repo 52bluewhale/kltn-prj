@@ -1,0 +1,2559 @@
+// __init__.py
+"""
+Deployment utilities for YOLOv8 QAT models.
+
+This module provides functions for deploying, optimizing, and running inference
+with quantized YOLOv8 models in various deployment targets.
+"""
+
+from .inference import (
+    create_inference_engine,
+    run_inference,
+    run_batch_inference,
+    get_inference_profile,
+    load_model_for_inference
+)
+
+from .optimize import (
+    optimize_model_for_deployment,
+    prune_model,
+    fuse_model_for_deployment,
+    quantize_for_deployment,
+    convert_to_target_format
+)
+
+from .benchmark import (
+    benchmark_inference,
+    benchmark_memory_usage,
+    benchmark_precision,
+    run_deployment_benchmark,
+    compare_backends
+)
+
+# Main API functions
+def prepare_model_for_deployment(model, target_format="onnx", optimize=True, quantized=True, config_path=None):
+    """
+    Prepare model for deployment with specified optimization options.
+    
+    Args:
+        model: Model to prepare for deployment
+        target_format: Target deployment format (onnx, tensorrt, openvino, etc.)
+        optimize: Whether to apply optimizations
+        quantized: Whether the model is already quantized
+        config_path: Path to configuration file
+        
+    Returns:
+        Prepared model ready for deployment
+    """
+    from .optimize import optimize_model_for_deployment
+    return optimize_model_for_deployment(
+        model=model,
+        target_format=target_format,
+        optimize=optimize,
+        quantized=quantized,
+        config_path=config_path
+    )
+
+def deploy_model(model, output_path, target_format="onnx", config_path=None):
+    """
+    Export model to target deployment format.
+    
+    Args:
+        model: Model to deploy
+        output_path: Path to save deployed model
+        target_format: Target deployment format
+        config_path: Path to export configuration
+        
+    Returns:
+        Path to deployed model
+    """
+    from .optimize import convert_to_target_format
+    return convert_to_target_format(
+        model=model,
+        output_path=output_path,
+        target_format=target_format,
+        config_path=config_path
+    )
+
+def create_deployer(model, backend="onnx"):
+    """
+    Create a deployer for the specified backend.
+    
+    Args:
+        model: Model or path to model file
+        backend: Inference backend to use
+        
+    Returns:
+        Deployment engine for inference
+    """
+    from .inference import create_inference_engine
+    return create_inference_engine(model, backend=backend)
+
+// benchmark.py
+"""
+Benchmarking utilities for YOLOv8 QAT models.
+
+This module provides functions for benchmarking model performance
+across different backends and configurations.
+"""
+
+import torch
+import numpy as np
+import time
+import logging
+import os
+import json
+import cv2
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from typing import Dict, List, Optional, Union, Tuple, Any
+from pathlib import Path
+import pandas as pd
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def benchmark_inference(
+    model_path: str,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    backend: str = "pytorch",
+    device: str = "cuda",
+    num_runs: int = 100,
+    warmup_runs: int = 10,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Benchmark inference performance of a model.
+    
+    Args:
+        model_path: Path to model file
+        input_shape: Shape of input tensor
+        backend: Inference backend
+        device: Device to run inference on
+        num_runs: Number of inference runs
+        warmup_runs: Number of warmup runs
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with benchmark results
+    """
+    # Import locally to avoid circular imports
+    from .inference import create_inference_engine
+    
+    # Create inference engine
+    engine = create_inference_engine(model_path, backend, device, **kwargs)
+    
+    # Create dummy input
+    if backend == "pytorch":
+        input_tensor = torch.rand(*input_shape)
+        if device == "cuda":
+            input_tensor = input_tensor.cuda()
+        original_size = (input_shape[2], input_shape[3])
+        input_data = (input_tensor, original_size)
+    else:
+        # Create numpy array for other backends
+        input_tensor = np.random.rand(*input_shape).astype(np.float32)
+        original_size = (input_shape[2], input_shape[3])
+        input_data = engine.preprocess(input_tensor)
+    
+    # Warmup runs
+    logger.info(f"Performing {warmup_runs} warmup runs...")
+    for _ in range(warmup_runs):
+        _, _ = engine.run_inference(input_data)
+    
+    # Benchmark runs
+    logger.info(f"Measuring inference time over {num_runs} runs...")
+    inference_times = []
+    
+    for _ in range(num_runs):
+        start_time = time.time()
+        _, _ = engine.run_inference(input_data)
+        inference_time = time.time() - start_time
+        inference_times.append(inference_time)
+    
+    # Calculate statistics
+    np_times = np.array(inference_times)
+    mean_time = np.mean(np_times)
+    median_time = np.median(np_times)
+    std_time = np.std(np_times)
+    min_time = np.min(np_times)
+    max_time = np.max(np_times)
+    p95_time = np.percentile(np_times, 95)
+    
+    # Calculate FPS
+    fps = 1.0 / mean_time
+    
+    return {
+        "backend": backend,
+        "device": device,
+        "mean_time": mean_time,
+        "median_time": median_time,
+        "std_time": std_time,
+        "min_time": min_time,
+        "max_time": max_time,
+        "p95_time": p95_time,
+        "fps": fps,
+        "batch_size": input_shape[0],
+        "all_times": inference_times
+    }
+
+
+def benchmark_memory_usage(
+    model_path: str,
+    backend: str = "pytorch",
+    device: str = "cuda",
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Benchmark memory usage of a model.
+    
+    Args:
+        model_path: Path to model file
+        backend: Inference backend
+        device: Device to run inference on
+        input_shape: Shape of input tensor
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with memory usage results
+    """
+    # Import locally to avoid circular imports
+    from .inference import create_inference_engine
+    
+    # Create inference engine
+    engine = create_inference_engine(model_path, backend, device, **kwargs)
+    
+    # Create dummy input
+    if backend == "pytorch":
+        input_tensor = torch.rand(*input_shape)
+        if device == "cuda":
+            input_tensor = input_tensor.cuda()
+        original_size = (input_shape[2], input_shape[3])
+        input_data = (input_tensor, original_size)
+    else:
+        # Create numpy array for other backends
+        input_tensor = np.random.rand(*input_shape).astype(np.float32)
+        original_size = (input_shape[2], input_shape[3])
+        input_data = engine.preprocess(input_tensor)
+    
+    # Measure baseline memory usage
+    baseline_memory = None
+    peak_memory = None
+    
+    if device == "cuda" and torch.cuda.is_available():
+        # Reset peak stats
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Get baseline memory usage
+        baseline_memory = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+        
+        # Run inference
+        _, _ = engine.run_inference(input_data)
+        
+        # Get peak memory usage
+        peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)  # MB
+    
+    # Estimate model size
+    model_size = None
+    if backend == "pytorch" and hasattr(engine, 'model'):
+        model_size = 0
+        for param in engine.model.parameters():
+            model_size += param.nelement() * param.element_size()
+        for buffer in engine.model.buffers():
+            model_size += buffer.nelement() * buffer.element_size()
+        model_size = model_size / (1024 * 1024)  # MB
+    elif os.path.exists(model_path):
+        model_size = os.path.getsize(model_path) / (1024 * 1024)  # MB
+    
+    return {
+        "backend": backend,
+        "device": device,
+        "model_size_mb": model_size,
+        "baseline_memory_mb": baseline_memory,
+        "peak_memory_mb": peak_memory,
+        "memory_overhead_mb": peak_memory - baseline_memory if peak_memory is not None and baseline_memory is not None else None
+    }
+
+
+def benchmark_precision(
+    model_path: str,
+    reference_model_path: str,
+    test_dataset: Optional[Any] = None,
+    test_images: Optional[List[str]] = None,
+    conf_threshold: float = 0.25,
+    iou_threshold: float = 0.5,
+    backend: str = "pytorch",
+    device: str = "cuda",
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Benchmark precision of a model against a reference model.
+    
+    Args:
+        model_path: Path to model file
+        reference_model_path: Path to reference model file
+        test_dataset: Optional test dataset
+        test_images: Optional list of test image paths
+        conf_threshold: Confidence threshold
+        iou_threshold: IoU threshold
+        backend: Inference backend
+        device: Device to run inference on
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with precision results
+    """
+    from .inference import create_inference_engine
+    
+    # Create inference engines for both models
+    engine = create_inference_engine(model_path, backend, device, **kwargs)
+    ref_engine = create_inference_engine(reference_model_path, "pytorch", device, **kwargs)
+    
+    # Initialize metrics
+    class_correct = 0
+    class_total = 0
+    bbox_correct = 0
+    bbox_total = 0
+    
+    # Process test data
+    if test_dataset is not None:
+        # Use test dataset
+        results = []
+        for batch in test_dataset:
+            if isinstance(batch, dict):
+                images = batch.get("images", batch.get("image", None))
+                targets = batch.get("targets", batch.get("target", None))
+            elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                images, targets = batch[0], batch[1]
+            else:
+                logger.warning(f"Unsupported batch format: {type(batch)}")
+                continue
+            
+            # Process each image in batch
+            for i in range(len(images)):
+                image = images[i]
+                target = targets[i] if isinstance(targets, (list, tuple)) else targets
+                
+                # Preprocess image
+                input_data = engine.preprocess(image)
+                
+                # Run inference
+                detections, _ = engine.run_inference(input_data)
+                
+                # Run reference model
+                ref_input_data = ref_engine.preprocess(image)
+                ref_detections, _ = ref_engine.run_inference(ref_input_data)
+                
+                # Compare detections
+                compare_result = _compare_detections(
+                    detections, ref_detections, target, 
+                    conf_threshold, iou_threshold
+                )
+                
+                class_correct += compare_result["class_correct"]
+                class_total += compare_result["class_total"]
+                bbox_correct += compare_result["bbox_correct"]
+                bbox_total += compare_result["bbox_total"]
+                
+                results.append(compare_result)
+    
+    elif test_images is not None:
+        # Use test images
+        results = []
+        for image_path in test_images:
+            # Preprocess image
+            input_data = engine.preprocess(image_path)
+            
+            # Run inference
+            detections, _ = engine.run_inference(input_data)
+            
+            # Run reference model
+            ref_input_data = ref_engine.preprocess(image_path)
+            ref_detections, _ = ref_engine.run_inference(ref_input_data)
+            
+            # Compare detections (without ground truth)
+            compare_result = _compare_detections_no_gt(
+                detections, ref_detections, conf_threshold, iou_threshold
+            )
+            
+            results.append(compare_result)
+    
+    else:
+        logger.error("No test data provided for precision benchmark")
+        return {}
+    
+    # Calculate overall metrics
+    class_accuracy = class_correct / class_total if class_total > 0 else 0
+    bbox_accuracy = bbox_correct / bbox_total if bbox_total > 0 else 0
+    
+    return {
+        "class_accuracy": class_accuracy,
+        "bbox_accuracy": bbox_accuracy,
+        "class_correct": class_correct,
+        "class_total": class_total,
+        "bbox_correct": bbox_correct,
+        "bbox_total": bbox_total,
+        "detailed_results": results
+    }
+
+
+def _compare_detections(
+    detections: np.ndarray,
+    ref_detections: np.ndarray,
+    target: Union[np.ndarray, torch.Tensor],
+    conf_threshold: float,
+    iou_threshold: float
+) -> Dict[str, Any]:
+    """
+    Compare detections with reference detections and ground truth.
+    
+    Args:
+        detections: Model detections [N, 6] (x1, y1, x2, y2, conf, class)
+        ref_detections: Reference detections [M, 6]
+        target: Ground truth [K, 5] (class, x1, y1, x2, y2)
+        conf_threshold: Confidence threshold
+        iou_threshold: IoU threshold
+        
+    Returns:
+        Comparison results
+    """
+    # Convert target to numpy if needed
+    if isinstance(target, torch.Tensor):
+        target = target.cpu().numpy()
+    
+    # Filter by confidence
+    detections = detections[detections[:, 4] >= conf_threshold]
+    ref_detections = ref_detections[ref_detections[:, 4] >= conf_threshold]
+    
+    # Initialize metrics
+    class_correct = 0
+    class_total = 0
+    bbox_correct = 0
+    bbox_total = 0
+    
+    # Compare with ground truth
+    if len(target) > 0:
+        # For each ground truth box
+        for gt_box in target:
+            gt_class = int(gt_box[0]) if len(gt_box) >= 5 else -1
+            gt_bbox = gt_box[1:5] if len(gt_box) >= 5 else gt_box
+            
+            # Find best match in model detections
+            best_iou = 0
+            best_pred_class = -1
+            
+            for pred in detections:
+                pred_bbox = pred[:4]
+                pred_class = int(pred[5])
+                
+                # Calculate IoU
+                iou = _calculate_iou(gt_bbox, pred_bbox)
+                
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred_class = pred_class
+            
+            # Find best match in reference detections
+            best_ref_iou = 0
+            best_ref_class = -1
+            
+            for ref_pred in ref_detections:
+                ref_pred_bbox = ref_pred[:4]
+                ref_pred_class = int(ref_pred[5])
+                
+                # Calculate IoU
+                iou = _calculate_iou(gt_bbox, ref_pred_bbox)
+                
+                if iou > best_ref_iou:
+                    best_ref_iou = iou
+                    best_ref_class = ref_pred_class
+            
+            # Check if IoU is above threshold
+            if best_iou >= iou_threshold:
+                bbox_correct += 1
+                
+                # Check if class is correct
+                if best_pred_class == gt_class:
+                    class_correct += 1
+                
+                class_total += 1
+            
+            bbox_total += 1
+    
+    return {
+        "class_correct": class_correct,
+        "class_total": class_total,
+        "bbox_correct": bbox_correct,
+        "bbox_total": bbox_total
+    }
+
+
+def _compare_detections_no_gt(
+    detections: np.ndarray,
+    ref_detections: np.ndarray,
+    conf_threshold: float,
+    iou_threshold: float
+) -> Dict[str, Any]:
+    """
+    Compare detections with reference detections without ground truth.
+    
+    Args:
+        detections: Model detections [N, 6] (x1, y1, x2, y2, conf, class)
+        ref_detections: Reference detections [M, 6]
+        conf_threshold: Confidence threshold
+        iou_threshold: IoU threshold
+        
+    Returns:
+        Comparison results
+    """
+    # Filter by confidence
+    detections = detections[detections[:, 4] >= conf_threshold]
+    ref_detections = ref_detections[ref_detections[:, 4] >= conf_threshold]
+    
+    # Initialize metrics
+    matched_detections = 0
+    matched_classes = 0
+    
+    # Track matched reference detections
+    ref_matched = np.zeros(len(ref_detections), dtype=bool)
+    
+    # For each model detection
+    for pred in detections:
+        pred_bbox = pred[:4]
+        pred_class = int(pred[5])
+        
+        best_iou = 0
+        best_idx = -1
+        
+        # Find best match in reference detections
+        for i, ref_pred in enumerate(ref_detections):
+            if ref_matched[i]:
+                continue
+                
+            ref_pred_bbox = ref_pred[:4]
+            
+            # Calculate IoU
+            iou = _calculate_iou(pred_bbox, ref_pred_bbox)
+            
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = i
+        
+        # Check if IoU is above threshold
+        if best_iou >= iou_threshold and best_idx >= 0:
+            matched_detections += 1
+            ref_matched[best_idx] = True
+            
+            # Check if class matches
+            ref_class = int(ref_detections[best_idx][5])
+            if pred_class == ref_class:
+                matched_classes += 1
+    
+    # Calculate metrics
+    detection_recall = matched_detections / len(ref_detections) if len(ref_detections) > 0 else 0
+    class_accuracy = matched_classes / matched_detections if matched_detections > 0 else 0
+    
+    return {
+        "matched_detections": matched_detections,
+        "total_ref_detections": len(ref_detections),
+        "detection_recall": detection_recall,
+        "matched_classes": matched_classes,
+        "class_accuracy": class_accuracy
+    }
+
+
+def _calculate_iou(box1: np.ndarray, box2: np.ndarray) -> float:
+    """
+    Calculate Intersection over Union (IoU) between two bounding boxes.
+    
+    Args:
+        box1: First bounding box [x1, y1, x2, y2]
+        box2: Second bounding box [x1, y1, x2, y2]
+        
+    Returns:
+        IoU value
+    """
+    # Get coordinates of intersection
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    # Calculate area of intersection
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    # Calculate areas of both boxes
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    # Calculate union
+    union = box1_area + box2_area - intersection
+    
+    # Calculate IoU
+    iou = intersection / union if union > 0 else 0
+    
+    return iou
+
+
+def run_deployment_benchmark(
+    model_path: str,
+    output_dir: Optional[str] = None,
+    backends: List[str] = ["pytorch", "onnx"],
+    devices: List[str] = ["cpu", "cuda"],
+    batch_sizes: List[int] = [1, 4, 8],
+    num_runs: int = 100,
+    input_shape: Tuple[int, ...] = (1, 3, 640, 640),
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Run comprehensive deployment benchmark for a model.
+    
+    Args:
+        model_path: Path to model file
+        output_dir: Optional directory to save results
+        backends: List of backends to benchmark
+        devices: List of devices to benchmark
+        batch_sizes: List of batch sizes to benchmark
+        num_runs: Number of inference runs
+        input_shape: Base input shape (batch dimension will be replaced)
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with benchmark results
+    """
+    # Create output directory if provided
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize results
+    results = {
+        "model_path": model_path,
+        "performance": [],
+        "memory": []
+    }
+    
+    # Run benchmarks for each combination
+    for backend in backends:
+        for device in devices:
+            # Skip invalid combinations
+            if backend != "pytorch" and device == "cuda" and backend != "tensorrt":
+                logger.info(f"Skipping {backend} on {device} (not supported)")
+                continue
+            
+            # Benchmark memory usage
+            try:
+                memory_result = benchmark_memory_usage(
+                    model_path=model_path,
+                    backend=backend,
+                    device=device,
+                    input_shape=input_shape,
+                    **kwargs
+                )
+                results["memory"].append(memory_result)
+            except Exception as e:
+                logger.error(f"Memory benchmark failed for {backend} on {device}: {e}")
+            
+            # Benchmark performance for each batch size
+            for batch_size in batch_sizes:
+                # Adjust input shape for batch size
+                current_shape = (batch_size,) + input_shape[1:]
+                
+                try:
+                    perf_result = benchmark_inference(
+                        model_path=model_path,
+                        input_shape=current_shape,
+                        backend=backend,
+                        device=device,
+                        num_runs=num_runs,
+                        **kwargs
+                    )
+                    results["performance"].append(perf_result)
+                except Exception as e:
+                    logger.error(f"Performance benchmark failed for {backend} on {device} with batch size {batch_size}: {e}")
+    
+    # Save results if output directory is provided
+    if output_dir:
+        # Save JSON results
+        result_path = os.path.join(output_dir, "benchmark_results.json")
+        with open(result_path, 'w') as f:
+            # Convert numpy types to Python types for JSON serialization
+            clean_results = _clean_for_json(results)
+            json.dump(clean_results, f, indent=2)
+        
+        # Generate plots
+        _generate_benchmark_plots(results, output_dir)
+    
+    return results
+
+
+def compare_backends(
+    model_paths: Dict[str, str],
+    output_dir: Optional[str] = None,
+    batch_size: int = 1,
+    num_runs: int = 100,
+    input_shape: Optional[Tuple[int, ...]] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Compare performance of different backends for the same model.
+    
+    Args:
+        model_paths: Dictionary mapping backend names to model paths
+        output_dir: Optional directory to save results
+        batch_size: Batch size for benchmark
+        num_runs: Number of inference runs
+        input_shape: Optional input shape (default: (batch_size, 3, 640, 640))
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with comparison results
+    """
+    # Create output directory if provided
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # Set default input shape if not provided
+    if input_shape is None:
+        input_shape = (batch_size, 3, 640, 640)
+    elif input_shape[0] != batch_size:
+        input_shape = (batch_size,) + input_shape[1:]
+    
+    # Initialize results
+    results = {
+        "performance": [],
+        "memory": []
+    }
+    
+    # Run benchmarks for each backend
+    for backend, model_path in model_paths.items():
+        # Determine device based on backend
+        device = "cpu"
+        if backend == "pytorch" or backend == "tensorrt":
+            device = "cuda"
+        
+        # Benchmark performance
+        try:
+            perf_result = benchmark_inference(
+                model_path=model_path,
+                input_shape=input_shape,
+                backend=backend,
+                device=device,
+                num_runs=num_runs,
+                **kwargs
+            )
+            results["performance"].append(perf_result)
+        except Exception as e:
+            logger.error(f"Performance benchmark failed for {backend}: {e}")
+        
+        # Benchmark memory usage
+        try:
+            memory_result = benchmark_memory_usage(
+                model_path=model_path,
+                backend=backend,
+                device=device,
+                input_shape=input_shape,
+                **kwargs
+            )
+            results["memory"].append(memory_result)
+        except Exception as e:
+            logger.error(f"Memory benchmark failed for {backend}: {e}")
+    
+    # Save results if output directory is provided
+    if output_dir:
+        # Save JSON results
+        result_path = os.path.join(output_dir, "backend_comparison.json")
+        with open(result_path, 'w') as f:
+            # Convert numpy types to Python types for JSON serialization
+            clean_results = _clean_for_json(results)
+            json.dump(clean_results, f, indent=2)
+        
+        # Generate comparison plots
+        _generate_comparison_plots(results, output_dir)
+    
+    return results
+
+
+def _clean_for_json(obj):
+    """
+    Convert numpy types to Python types for JSON serialization.
+    
+    Args:
+        obj: Object to clean
+        
+    Returns:
+        Cleaned object
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: _clean_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_clean_for_json(v) for v in obj]
+    else:
+        return obj
+
+
+def _generate_benchmark_plots(results, output_dir):
+    """
+    Generate plots from benchmark results.
+    
+    Args:
+        results: Benchmark results
+        output_dir: Directory to save plots
+    """
+    # Create a DataFrame from performance results
+    performance_data = pd.DataFrame(results["performance"])
+    
+    # Plot inference time by backend and batch size
+    plt.figure(figsize=(10, 6))
+    backends = performance_data["backend"].unique()
+    devices = performance_data["device"].unique()
+    batch_sizes = performance_data["batch_size"].unique()
+    
+    for backend in backends:
+        for device in devices:
+            data = performance_data[(performance_data["backend"] == backend) & 
+                                    (performance_data["device"] == device)]
+            if not data.empty:
+                plt.plot(data["batch_size"], data["mean_time"] * 1000, 
+                         marker='o', linestyle='-', 
+                         label=f"{backend} ({device})")
+    
+    plt.xlabel("Batch Size")
+    plt.ylabel("Inference Time (ms)")
+    plt.title("Inference Time by Backend and Batch Size")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, "inference_time.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Plot FPS by backend and batch size
+    plt.figure(figsize=(10, 6))
+    
+    for backend in backends:
+        for device in devices:
+            data = performance_data[(performance_data["backend"] == backend) & 
+                                    (performance_data["device"] == device)]
+            if not data.empty:
+                plt.plot(data["batch_size"], data["fps"], 
+                         marker='o', linestyle='-', 
+                         label=f"{backend} ({device})")
+    
+    plt.xlabel("Batch Size")
+    plt.ylabel("Frames Per Second (FPS)")
+    plt.title("Throughput by Backend and Batch Size")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, "throughput.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Plot memory usage by backend
+    if results["memory"]:
+        memory_data = pd.DataFrame(results["memory"])
+        
+        plt.figure(figsize=(10, 6))
+        backends_with_memory = memory_data["backend"].unique()
+        
+        model_sizes = []
+        peak_memories = []
+        labels = []
+        
+        for backend in backends_with_memory:
+            for device in devices:
+                data = memory_data[(memory_data["backend"] == backend) & 
+                                   (memory_data["device"] == device)]
+                if not data.empty:
+                    model_size = data["model_size_mb"].values[0]
+                    peak_memory = data["peak_memory_mb"].values[0]
+                    
+                    if model_size is not None:
+                        model_sizes.append(model_size)
+                        labels.append(f"{backend} ({device})")
+                    
+                    if peak_memory is not None:
+                        peak_memories.append(peak_memory)
+        
+        # Create bar chart of model sizes
+        if model_sizes:
+            plt.figure(figsize=(10, 6))
+            plt.bar(labels, model_sizes)
+            plt.ylabel("Model Size (MB)")
+            plt.title("Model Size by Backend")
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, "model_size.png"), dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # Create bar chart of peak memory usage
+        if peak_memories and len(peak_memories) == len(labels):
+            plt.figure(figsize=(10, 6))
+            plt.bar(labels, peak_memories)
+            plt.ylabel("Peak Memory (MB)")
+            plt.title("Peak Memory Usage by Backend")
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, "peak_memory.png"), dpi=300, bbox_inches='tight')
+            plt.close()
+
+
+def _generate_comparison_plots(results, output_dir):
+    """
+    Generate comparison plots for different backends.
+    
+    Args:
+        results: Comparison results
+        output_dir: Directory to save plots
+    """
+    # Create DataFrames from results
+    performance_data = pd.DataFrame(results["performance"])
+    
+    if not performance_data.empty:
+        # Sort by inference time
+        performance_data = performance_data.sort_values("mean_time")
+        
+        # Create bar chart of inference time
+        plt.figure(figsize=(10, 6))
+        plt.bar(performance_data["backend"], performance_data["mean_time"] * 1000)
+        plt.ylabel("Inference Time (ms)")
+        plt.title("Inference Time by Backend")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "backend_inference_time.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Create bar chart of FPS
+        plt.figure(figsize=(10, 6))
+        plt.bar(performance_data["backend"], performance_data["fps"])
+        plt.ylabel("Frames Per Second (FPS)")
+        plt.title("Throughput by Backend")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "backend_throughput.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # Create bar chart of model size
+    if "memory" in results and results["memory"]:
+        memory_data = pd.DataFrame(results["memory"])
+        
+        if not memory_data.empty and "model_size_mb" in memory_data.columns:
+            # Filter out None values
+            memory_data = memory_data[memory_data["model_size_mb"].notna()]
+            
+            if not memory_data.empty:
+                # Sort by model size
+                memory_data = memory_data.sort_values("model_size_mb")
+                
+                plt.figure(figsize=(10, 6))
+                plt.bar(memory_data["backend"], memory_data["model_size_mb"])
+                plt.ylabel("Model Size (MB)")
+                plt.title("Model Size by Backend")
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, "backend_model_size.png"), dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                # Create bar chart of peak memory usage if available
+                if "peak_memory_mb" in memory_data.columns:
+                    memory_data_with_peak = memory_data[memory_data["peak_memory_mb"].notna()]
+                    
+                    if not memory_data_with_peak.empty:
+                        plt.figure(figsize=(10, 6))
+                        plt.bar(memory_data_with_peak["backend"], memory_data_with_peak["peak_memory_mb"])
+                        plt.ylabel("Peak Memory (MB)")
+                        plt.title("Peak Memory Usage by Backend")
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(output_dir, "backend_peak_memory.png"), dpi=300, bbox_inches='tight')
+                        plt.close()
+
+// inferece.py
+"""
+Inference utilities for YOLOv8 QAT models.
+
+This module provides functions for loading and running inference with 
+quantized YOLOv8 models using various inference engines.
+"""
+
+import torch
+import numpy as np
+import time
+import logging
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Union, Tuple, Any
+import cv2
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+class InferenceEngine:
+    """
+    Base class for inference engines.
+    """
+    
+    def __init__(self, model_path: str, device: str = "cuda"):
+        """
+        Initialize inference engine.
+        
+        Args:
+            model_path: Path to model file
+            device: Device to run inference on
+        """
+        self.model_path = model_path
+        self.device = device
+        self.model = None
+        self.input_shape = None
+        self.initialized = False
+    
+    def load_model(self):
+        """
+        Load model for inference.
+        
+        Returns:
+            Success flag
+        """
+        raise NotImplementedError("Subclasses must implement load_model")
+    
+    def preprocess(self, image: Union[np.ndarray, str]):
+        """
+        Preprocess image for inference.
+        
+        Args:
+            image: Input image or path to image
+            
+        Returns:
+            Preprocessed image
+        """
+        raise NotImplementedError("Subclasses must implement preprocess")
+    
+    def run_inference(self, input_data):
+        """
+        Run inference on input data.
+        
+        Args:
+            input_data: Input data
+            
+        Returns:
+            Inference results
+        """
+        raise NotImplementedError("Subclasses must implement run_inference")
+    
+    def postprocess(self, outputs, original_size: Tuple[int, int]):
+        """
+        Postprocess model outputs.
+        
+        Args:
+            outputs: Model outputs
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Processed results
+        """
+        raise NotImplementedError("Subclasses must implement postprocess")
+
+
+class PyTorchInferenceEngine(InferenceEngine):
+    """
+    Inference engine for PyTorch models.
+    """
+    
+    def __init__(self, model_path: str, device: str = "cuda", quantized: bool = True):
+        """
+        Initialize PyTorch inference engine.
+        
+        Args:
+            model_path: Path to model file
+            device: Device to run inference on
+            quantized: Whether the model is quantized
+        """
+        super().__init__(model_path, device)
+        self.quantized = quantized
+        if quantized and device == "cuda":
+            logger.warning("Quantized models may not be supported on CUDA. Falling back to CPU.")
+            self.device = "cpu"
+    
+    def load_model(self):
+        """
+        Load PyTorch model for inference.
+        
+        Returns:
+            Success flag
+        """
+        try:
+            # Load model checkpoint
+            checkpoint = torch.load(self.model_path, map_location="cpu")
+            
+            # Extract model from checkpoint
+            if "model" in checkpoint:
+                self.model = checkpoint["model"]
+            elif "state_dict" in checkpoint:
+                # Try to initialize model from state dict
+                # This requires the model class to be defined
+                try:
+                    from ultralytics.nn.tasks import DetectionModel
+                    self.model = DetectionModel()
+                    self.model.load_state_dict(checkpoint["state_dict"])
+                except ImportError:
+                    logger.error("Ultralytics not found. Cannot load model from state dict.")
+                    return False
+                except Exception as e:
+                    logger.error(f"Failed to load state dict: {e}")
+                    return False
+            else:
+                self.model = checkpoint
+            
+            # Move model to device
+            if self.device == "cpu" and self.quantized:
+                # Ensure model is in eval mode for quantized inference
+                self.model.eval()
+            else:
+                self.model = self.model.to(self.device)
+                self.model.eval()
+            
+            # Get input shape from model if available
+            if hasattr(self.model, "input_shape"):
+                self.input_shape = self.model.input_shape
+            else:
+                # Default YOLOv8 input shape
+                self.input_shape = (1, 3, 640, 640)
+            
+            self.initialized = True
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to load PyTorch model: {e}")
+            return False
+    
+    def preprocess(self, image: Union[np.ndarray, str]):
+        """
+        Preprocess image for PyTorch model.
+        
+        Args:
+            image: Input image or path to image
+            
+        Returns:
+            Preprocessed image tensor
+        """
+        # Load image if path is provided
+        if isinstance(image, str):
+            image = cv2.imread(image)
+            if image is None:
+                raise ValueError(f"Failed to load image from {image}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Store original size for postprocessing
+        original_size = image.shape[:2]
+        
+        # Resize image
+        height, width = self.input_shape[2:]
+        resized = cv2.resize(image, (width, height))
+        
+        # Normalize and convert to tensor
+        img = resized.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)  # HWC to CHW
+        img = np.expand_dims(img, axis=0)  # Add batch dimension
+        
+        # Convert to tensor
+        tensor = torch.from_numpy(img)
+        
+        if not self.quantized:
+            tensor = tensor.to(self.device)
+        
+        return tensor, original_size
+    
+    def run_inference(self, input_data):
+        """
+        Run inference with PyTorch model.
+        
+        Args:
+            input_data: Tuple of (input_tensor, original_size)
+            
+        Returns:
+            Model outputs
+        """
+        if not self.initialized:
+            raise RuntimeError("Model not initialized. Call load_model() first.")
+        
+        input_tensor, original_size = input_data
+        
+        # Run inference
+        with torch.no_grad():
+            start_time = time.time()
+            outputs = self.model(input_tensor)
+            inference_time = time.time() - start_time
+        
+        # Postprocess results
+        results = self.postprocess(outputs, original_size)
+        
+        return results, inference_time
+    
+    def postprocess(self, outputs, original_size: Tuple[int, int]):
+        """
+        Postprocess PyTorch model outputs.
+        
+        Args:
+            outputs: Model outputs
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Processed detection results: list of [x1, y1, x2, y2, conf, class_id]
+        """
+        # Handle different output formats
+        if isinstance(outputs, torch.Tensor):
+            # Standard output format: [batch_size, num_boxes, 6]
+            # where 6 is [x1, y1, x2, y2, confidence, class_id]
+            predictions = outputs.detach().cpu().numpy()
+        elif isinstance(outputs, (tuple, list)):
+            # Some YOLOv8 models output a tuple of tensors
+            if len(outputs) >= 1 and isinstance(outputs[0], torch.Tensor):
+                predictions = outputs[0].detach().cpu().numpy()
+            else:
+                predictions = np.array([])
+        else:
+            # Unsupported output format
+            logger.warning(f"Unsupported output format: {type(outputs)}")
+            predictions = np.array([])
+        
+        # Scale bounding boxes to original image size
+        if len(predictions) > 0 and predictions.shape[-1] >= 6:
+            orig_h, orig_w = original_size
+            input_h, input_w = self.input_shape[2:]
+            
+            # Scale factor
+            scale_x = orig_w / input_w
+            scale_y = orig_h / input_h
+            
+            # Scale bounding boxes
+            predictions[:, 0] *= scale_x  # x1
+            predictions[:, 1] *= scale_y  # y1
+            predictions[:, 2] *= scale_x  # x2
+            predictions[:, 3] *= scale_y  # y2
+        
+        return predictions
+
+
+class ONNXInferenceEngine(InferenceEngine):
+    """
+    Inference engine for ONNX models.
+    """
+    
+    def __init__(self, model_path: str, device: str = "cuda"):
+        """
+        Initialize ONNX inference engine.
+        
+        Args:
+            model_path: Path to ONNX model file
+            device: Device to run inference on
+        """
+        super().__init__(model_path, device)
+        self.providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if device == "cuda" else ["CPUExecutionProvider"]
+        self.session = None
+        self.input_name = None
+        self.output_names = None
+    
+    def load_model(self):
+        """
+        Load ONNX model for inference.
+        
+        Returns:
+            Success flag
+        """
+        try:
+            import onnxruntime as ort
+            
+            # Create inference session
+            self.session = ort.InferenceSession(self.model_path, providers=self.providers)
+            
+            # Get input and output names
+            model_inputs = self.session.get_inputs()
+            model_outputs = self.session.get_outputs()
+            
+            if len(model_inputs) > 0:
+                self.input_name = model_inputs[0].name
+                self.input_shape = model_inputs[0].shape
+                
+                # Handle dynamic batch size
+                if self.input_shape[0] == -1:
+                    self.input_shape = tuple([1] + list(self.input_shape[1:]))
+            
+            if len(model_outputs) > 0:
+                self.output_names = [output.name for output in model_outputs]
+            
+            self.initialized = True
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to load ONNX model: {e}")
+            return False
+    
+    def preprocess(self, image: Union[np.ndarray, str]):
+        """
+        Preprocess image for ONNX model.
+        
+        Args:
+            image: Input image or path to image
+            
+        Returns:
+            Preprocessed image
+        """
+        # Load image if path is provided
+        if isinstance(image, str):
+            image = cv2.imread(image)
+            if image is None:
+                raise ValueError(f"Failed to load image from {image}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Store original size for postprocessing
+        original_size = image.shape[:2]
+        
+        # Resize image
+        height, width = self.input_shape[2:]
+        resized = cv2.resize(image, (width, height))
+        
+        # Normalize image
+        img = resized.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)  # HWC to CHW
+        img = np.expand_dims(img, axis=0)  # Add batch dimension
+        
+        return {self.input_name: img}, original_size
+    
+    def run_inference(self, input_data):
+        """
+        Run inference with ONNX model.
+        
+        Args:
+            input_data: Tuple of (input_dict, original_size)
+            
+        Returns:
+            Model outputs
+        """
+        if not self.initialized:
+            raise RuntimeError("Model not initialized. Call load_model() first.")
+        
+        input_dict, original_size = input_data
+        
+        # Run inference
+        start_time = time.time()
+        outputs = self.session.run(self.output_names, input_dict)
+        inference_time = time.time() - start_time
+        
+        # Postprocess results
+        results = self.postprocess(outputs, original_size)
+        
+        return results, inference_time
+    
+    def postprocess(self, outputs, original_size: Tuple[int, int]):
+        """
+        Postprocess ONNX model outputs.
+        
+        Args:
+            outputs: Model outputs
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Processed detection results
+        """
+        # Get output tensor
+        if len(outputs) > 0:
+            predictions = outputs[0]
+        else:
+            return np.array([])
+        
+        # Scale bounding boxes to original image size
+        if len(predictions) > 0 and predictions.shape[-1] >= 6:
+            orig_h, orig_w = original_size
+            input_h, input_w = self.input_shape[2:]
+            
+            # Scale factor
+            scale_x = orig_w / input_w
+            scale_y = orig_h / input_h
+            
+            # Scale bounding boxes
+            predictions[:, 0] *= scale_x  # x1
+            predictions[:, 1] *= scale_y  # y1
+            predictions[:, 2] *= scale_x  # x2
+            predictions[:, 3] *= scale_y  # y2
+        
+        return predictions
+
+
+class TFLiteInferenceEngine(InferenceEngine):
+    """
+    Inference engine for TFLite models.
+    """
+    
+    def __init__(self, model_path: str, device: str = "cpu"):
+        """
+        Initialize TFLite inference engine.
+        
+        Args:
+            model_path: Path to TFLite model file
+            device: Device to run inference on (only CPU supported)
+        """
+        super().__init__(model_path, "cpu")  # TFLite only supports CPU
+        self.interpreter = None
+        self.input_details = None
+        self.output_details = None
+    
+    def load_model(self):
+        """
+        Load TFLite model for inference.
+        
+        Returns:
+            Success flag
+        """
+        try:
+            import tensorflow as tf
+            
+            # Load TFLite model
+            self.interpreter = tf.lite.Interpreter(model_path=self.model_path)
+            self.interpreter.allocate_tensors()
+            
+            # Get input and output details
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            
+            if len(self.input_details) > 0:
+                self.input_shape = tuple(self.input_details[0]["shape"])
+            
+            self.initialized = True
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to load TFLite model: {e}")
+            return False
+    
+    def preprocess(self, image: Union[np.ndarray, str]):
+        """
+        Preprocess image for TFLite model.
+        
+        Args:
+            image: Input image or path to image
+            
+        Returns:
+            Preprocessed image
+        """
+        # Load image if path is provided
+        if isinstance(image, str):
+            image = cv2.imread(image)
+            if image is None:
+                raise ValueError(f"Failed to load image from {image}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Store original size for postprocessing
+        original_size = image.shape[:2]
+        
+        # Resize image
+        height, width = self.input_shape[1:3]
+        resized = cv2.resize(image, (width, height))
+        
+        # Normalize image
+        img = resized.astype(np.float32) / 255.0
+        
+        # TFLite models expect NHWC format
+        img = np.expand_dims(img, axis=0)  # Add batch dimension
+        
+        return img, original_size
+    
+    def run_inference(self, input_data):
+        """
+        Run inference with TFLite model.
+        
+        Args:
+            input_data: Tuple of (input_tensor, original_size)
+            
+        Returns:
+            Model outputs
+        """
+        if not self.initialized:
+            raise RuntimeError("Model not initialized. Call load_model() first.")
+        
+        input_tensor, original_size = input_data
+        
+        # Set input tensor
+        self.interpreter.set_tensor(self.input_details[0]["index"], input_tensor)
+        
+        # Run inference
+        start_time = time.time()
+        self.interpreter.invoke()
+        inference_time = time.time() - start_time
+        
+        # Get output tensor
+        outputs = []
+        for output_detail in self.output_details:
+            output = self.interpreter.get_tensor(output_detail["index"])
+            outputs.append(output)
+        
+        # Postprocess results
+        results = self.postprocess(outputs, original_size)
+        
+        return results, inference_time
+    
+    def postprocess(self, outputs, original_size: Tuple[int, int]):
+        """
+        Postprocess TFLite model outputs.
+        
+        Args:
+            outputs: Model outputs
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Processed detection results
+        """
+        # Get detection boxes
+        if len(outputs) >= 4:
+            # TFLite YOLOv8 model returns separate tensors for boxes, scores, classes
+            boxes = outputs[0][0]  # [N, 4]
+            scores = outputs[2][0]  # [N]
+            classes = outputs[1][0]  # [N]
+            
+            # Filter by confidence
+            valid_indices = scores > 0.001
+            valid_boxes = boxes[valid_indices]
+            valid_scores = scores[valid_indices]
+            valid_classes = classes[valid_indices]
+            
+            # Format predictions as [x1, y1, x2, y2, confidence, class_id]
+            predictions = np.zeros((len(valid_boxes), 6))
+            predictions[:, :4] = valid_boxes
+            predictions[:, 4] = valid_scores
+            predictions[:, 5] = valid_classes
+        elif len(outputs) >= 1:
+            # Model returns single tensor with all detections
+            predictions = outputs[0]
+        else:
+            return np.array([])
+        
+        # Scale bounding boxes to original image size
+        if len(predictions) > 0 and predictions.shape[-1] >= 6:
+            orig_h, orig_w = original_size
+            input_h, input_w = self.input_shape[1:3]
+            
+            # Scale factor
+            scale_x = orig_w / input_w
+            scale_y = orig_h / input_h
+            
+            # Scale bounding boxes
+            predictions[:, 0] *= scale_x  # x1
+            predictions[:, 1] *= scale_y  # y1
+            predictions[:, 2] *= scale_x  # x2
+            predictions[:, 3] *= scale_y  # y2
+        
+        return predictions
+
+
+class OpenVINOInferenceEngine(InferenceEngine):
+    """
+    Inference engine for OpenVINO models.
+    """
+    
+    def __init__(self, model_path: str, device: str = "CPU"):
+        """
+        Initialize OpenVINO inference engine.
+        
+        Args:
+            model_path: Path to OpenVINO model file (.xml)
+            device: Device to run inference on (CPU, GPU, etc.)
+        """
+        super().__init__(model_path, device)
+        self.compiled_model = None
+        self.input_layer = None
+        self.output_layer = None
+    
+    def load_model(self):
+        """
+        Load OpenVINO model for inference.
+        
+        Returns:
+            Success flag
+        """
+        try:
+            import openvino as ov
+            
+            # Create OpenVINO Core
+            core = ov.Core()
+            
+            # Read model
+            model = core.read_model(self.model_path)
+            
+            # Check if model file is an IR file
+            if not self.model_path.endswith(".xml"):
+                logger.warning(f"Model file {self.model_path} is not an IR file.")
+                
+                # Check if corresponding .bin file exists
+                bin_path = os.path.splitext(self.model_path)[0] + ".bin"
+                if not os.path.exists(bin_path):
+                    logger.warning(f"Weights file {bin_path} not found.")
+            
+            # Compile model for device
+            self.compiled_model = core.compile_model(model, self.device)
+            
+            # Get input and output layers
+            inputs = model.inputs
+            outputs = model.outputs
+            
+            if len(inputs) > 0:
+                self.input_layer = inputs[0]
+                self.input_shape = inputs[0].shape
+            
+            if len(outputs) > 0:
+                self.output_layer = outputs[0]
+            
+            self.initialized = True
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to load OpenVINO model: {e}")
+            return False
+    
+    def preprocess(self, image: Union[np.ndarray, str]):
+        """
+        Preprocess image for OpenVINO model.
+        
+        Args:
+            image: Input image or path to image
+            
+        Returns:
+            Preprocessed image
+        """
+        # Load image if path is provided
+        if isinstance(image, str):
+            image = cv2.imread(image)
+            if image is None:
+                raise ValueError(f"Failed to load image from {image}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Store original size for postprocessing
+        original_size = image.shape[:2]
+        
+        # Resize image
+        height, width = self.input_shape[2:]
+        resized = cv2.resize(image, (width, height))
+        
+        # Normalize image
+        img = resized.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)  # HWC to CHW
+        img = np.expand_dims(img, axis=0)  # Add batch dimension
+        
+        return img, original_size
+    
+    def run_inference(self, input_data):
+        """
+        Run inference with OpenVINO model.
+        
+        Args:
+            input_data: Tuple of (input_tensor, original_size)
+            
+        Returns:
+            Model outputs
+        """
+        if not self.initialized:
+            raise RuntimeError("Model not initialized. Call load_model() first.")
+        
+        input_tensor, original_size = input_data
+        
+        # Create input dict
+        inputs = {self.input_layer.any_name: input_tensor}
+        
+        # Run inference
+        start_time = time.time()
+        results = self.compiled_model(inputs)
+        inference_time = time.time() - start_time
+        
+        # Get output tensor
+        output_key = self.output_layer.any_name
+        outputs = results[output_key]
+        
+        # Postprocess results
+        processed_results = self.postprocess(outputs, original_size)
+        
+        return processed_results, inference_time
+    
+    def postprocess(self, outputs, original_size: Tuple[int, int]):
+        """
+        Postprocess OpenVINO model outputs.
+        
+        Args:
+            outputs: Model outputs
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Processed detection results
+        """
+        # Get detection boxes
+        predictions = outputs
+        
+        # Scale bounding boxes to original image size
+        if len(predictions) > 0 and predictions.shape[-1] >= 6:
+            orig_h, orig_w = original_size
+            input_h, input_w = self.input_shape[2:]
+            
+            # Scale factor
+            scale_x = orig_w / input_w
+            scale_y = orig_h / input_h
+            
+            # Scale bounding boxes
+            predictions[:, 0] *= scale_x  # x1
+            predictions[:, 1] *= scale_y  # y1
+            predictions[:, 2] *= scale_x  # x2
+            predictions[:, 3] *= scale_y  # y2
+        
+        return predictions
+
+
+def create_inference_engine(model_path: str, backend: str = "pytorch", device: str = "cuda", **kwargs):
+    """
+    Create inference engine for the specified backend.
+    
+    Args:
+        model_path: Path to model file
+        backend: Inference backend ("pytorch", "onnx", "tflite", "openvino")
+        device: Device to run inference on
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Inference engine
+    """
+    # Create appropriate inference engine
+    if backend.lower() == "pytorch":
+        quantized = kwargs.get("quantized", True)
+        engine = PyTorchInferenceEngine(model_path, device, quantized)
+    elif backend.lower() == "onnx":
+        engine = ONNXInferenceEngine(model_path, device)
+    elif backend.lower() == "tflite":
+        engine = TFLiteInferenceEngine(model_path, device)
+    elif backend.lower() == "openvino":
+        engine = OpenVINOInferenceEngine(model_path, device)
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+    
+    # Load model
+    success = engine.load_model()
+    if not success:
+        raise RuntimeError(f"Failed to load model with {backend} backend")
+    
+    return engine
+
+
+def run_inference(model_path: str, image_path: str, backend: str = "pytorch", device: str = "cuda", 
+                 conf_threshold: float = 0.25, iou_threshold: float = 0.45, **kwargs):
+    """
+    Run inference on a single image.
+    
+    Args:
+        model_path: Path to model file
+        image_path: Path to image file
+        backend: Inference backend
+        device: Device to run inference on
+        conf_threshold: Confidence threshold
+        iou_threshold: IoU threshold for NMS
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with inference results
+    """
+    # Create inference engine
+    engine = create_inference_engine(model_path, backend, device, **kwargs)
+    
+    # Read and preprocess image
+    input_data = engine.preprocess(image_path)
+    
+    # Run inference
+    detections, inference_time = engine.run_inference(input_data)
+    
+    # Filter by confidence
+    if len(detections) > 0:
+        mask = detections[:, 4] >= conf_threshold
+        detections = detections[mask]
+    
+    # Apply NMS if needed
+    # NOTE: For simplicity, NMS is not implemented here as it's backend-specific
+    # and would require additional code for each backend
+    
+    return {
+        "detections": detections,
+        "inference_time": inference_time,
+        "fps": 1.0 / inference_time if inference_time > 0 else 0
+    }
+
+
+def run_batch_inference(model_path: str, image_paths: List[str], backend: str = "pytorch", 
+                     device: str = "cuda", batch_size: int = 4, **kwargs):
+    """
+    Run inference on a batch of images.
+    
+    Args:
+        model_path: Path to model file
+        image_paths: List of paths to image files
+        backend: Inference backend
+        device: Device to run inference on
+        batch_size: Batch size for inference
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        List of dictionaries with inference results
+    """
+    # Create inference engine
+    engine = create_inference_engine(model_path, backend, device, **kwargs)
+    
+    # Process images in batches
+    results = []
+    for i in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[i:i+batch_size]
+        batch_results = []
+        
+        # Process each image in batch
+        for img_path in batch_paths:
+            # Read and preprocess image
+            input_data = engine.preprocess(img_path)
+            
+            # Run inference
+            detections, inference_time = engine.run_inference(input_data)
+            
+            # Store results
+            batch_results.append({
+                "image_path": img_path,
+                "detections": detections,
+                "inference_time": inference_time
+            })
+        
+        results.extend(batch_results)
+    
+    return results
+
+
+def get_inference_profile(model_path: str, image: Union[str, np.ndarray], backend: str = "pytorch", 
+                         device: str = "cuda", num_runs: int = 100, **kwargs):
+    """
+    Get inference profile for a model.
+    
+    Args:
+        model_path: Path to model file
+        image: Path to image file or image array
+        backend: Inference backend
+        device: Device to run inference on
+        num_runs: Number of inference runs
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Dictionary with inference profile
+    """
+    # Create inference engine
+    engine = create_inference_engine(model_path, backend, device, **kwargs)
+    
+    # Read and preprocess image
+    input_data = engine.preprocess(image)
+    
+    # Run warmup inference
+    _, _ = engine.run_inference(input_data)
+    
+    # Run inference multiple times and measure performance
+    inference_times = []
+    
+    for _ in range(num_runs):
+        _, inference_time = engine.run_inference(input_data)
+        inference_times.append(inference_time)
+    
+    # Calculate statistics
+    mean_time = np.mean(inference_times)
+    median_time = np.median(inference_times)
+    std_time = np.std(inference_times)
+    min_time = np.min(inference_times)
+    max_time = np.max(inference_times)
+    
+    return {
+        "mean_inference_time": mean_time,
+        "median_inference_time": median_time,
+        "std_inference_time": std_time,
+        "min_inference_time": min_time,
+        "max_inference_time": max_time,
+        "fps": 1.0 / mean_time if mean_time > 0 else 0,
+        "backend": backend,
+        "device": device
+    }
+
+
+def load_model_for_inference(model_path: str, backend: str = "pytorch", device: str = "cuda", **kwargs):
+    """
+    Load model for inference without running inference.
+    
+    Args:
+        model_path: Path to model file
+        backend: Inference backend
+        device: Device to run inference on
+        **kwargs: Additional arguments for specific backends
+        
+    Returns:
+        Loaded inference engine
+    """
+    return create_inference_engine(model_path, backend, device, **kwargs)
+
+// optimize.py
+"""
+Optimization utilities for YOLOv8 QAT models deployment.
+
+This module provides functions for optimizing models for deployment,
+including pruning, fusion, and format conversion.
+"""
+
+import torch
+import numpy as np
+import logging
+import os
+import yaml
+from pathlib import Path
+from typing import Dict, List, Optional, Union, Tuple, Any
+import copy
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+def optimize_model_for_deployment(
+    model: torch.nn.Module,
+    target_format: str = "onnx",
+    optimize: bool = True,
+    quantized: bool = True,
+    config_path: Optional[str] = None
+) -> torch.nn.Module:
+    """
+    Optimize model for deployment with specified target format.
+    
+    Args:
+        model: Model to optimize
+        target_format: Target deployment format
+        optimize: Whether to apply optimizations
+        quantized: Whether the model is already quantized
+        config_path: Path to configuration file
+        
+    Returns:
+        Optimized model
+    """
+    # Make a copy of the model to avoid modifying the original
+    model_copy = copy.deepcopy(model)
+    
+    # Set model to evaluation mode
+    model_copy.eval()
+    
+    # Load configuration if provided
+    config = {}
+    if config_path:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            logger.warning(f"Configuration file {config_path} not found. Using default settings.")
+    
+    # Apply optimizations if requested
+    if optimize:
+        # Fuse model operations for better performance
+        model_copy = fuse_model_for_deployment(model_copy, config.get("optimization", {}))
+        
+        # Prune model if enabled in config
+        if config.get("optimization", {}).get("pruning", {}).get("enabled", False):
+            model_copy = prune_model(
+                model_copy, 
+                config.get("optimization", {}).get("pruning", {})
+            )
+    
+    return model_copy
+
+
+def prune_model(
+    model: torch.nn.Module,
+    pruning_config: Dict[str, Any]
+) -> torch.nn.Module:
+    """
+    Prune model to reduce size and improve performance.
+    
+    Args:
+        model: Model to prune
+        pruning_config: Pruning configuration
+        
+    Returns:
+        Pruned model
+    """
+    try:
+        import torch.nn.utils.prune as prune
+        
+        # Get pruning parameters
+        method = pruning_config.get("method", "l1_unstructured")
+        amount = pruning_config.get("amount", 0.3)
+        
+        # Get layers to prune (default: Conv2d and Linear)
+        layer_types = []
+        if pruning_config.get("prune_conv", True):
+            layer_types.append(torch.nn.Conv2d)
+        if pruning_config.get("prune_linear", True):
+            layer_types.append(torch.nn.Linear)
+        
+        # Skip certain layers specified in config
+        skip_layers = pruning_config.get("skip_layers", [])
+        
+        # Apply pruning to each layer
+        for name, module in model.named_modules():
+            # Skip if in exclusion list
+            if any(skip in name for skip in skip_layers):
+                continue
+            
+            # Apply pruning to supported layer types
+            if isinstance(module, tuple(layer_types)):
+                if method == "l1_unstructured":
+                    prune.l1_unstructured(module, name="weight", amount=amount)
+                elif method == "random_unstructured":
+                    prune.random_unstructured(module, name="weight", amount=amount)
+                elif method == "ln_structured":
+                    dim = pruning_config.get("dim", 0)
+                    n = pruning_config.get("n", 2)
+                    prune.ln_structured(module, name="weight", amount=amount, n=n, dim=dim)
+        
+        # Make pruning permanent
+        for name, module in model.named_modules():
+            if isinstance(module, tuple(layer_types)):
+                try:
+                    prune.remove(module, "weight")
+                except:
+                    # weight might not have been pruned
+                    pass
+        
+        logger.info(f"Model pruned with method {method} and amount {amount}")
+        return model
+    
+    except ImportError:
+        logger.warning("torch.nn.utils.prune not available. Skipping pruning.")
+        return model
+    except Exception as e:
+        logger.error(f"Error during pruning: {e}")
+        return model
+
+
+def fuse_model_for_deployment(
+    model: torch.nn.Module,
+    optimization_config: Dict[str, Any]
+) -> torch.nn.Module:
+    """
+    Fuse operations in the model for better performance.
+    
+    Args:
+        model: Model to fuse
+        optimization_config: Optimization configuration
+        
+    Returns:
+        Fused model
+    """
+    # Check if fusion is enabled
+    if not optimization_config.get("fuse", True):
+        return model
+    
+    try:
+        # Try to use model's own fusion method first
+        if hasattr(model, "fuse"):
+            logger.info("Using model's built-in fusion method")
+            model.fuse()
+            return model
+        
+        # For YOLOv8 models, try to use our custom fusion methods
+        try:
+            from ..models.model_transforms import fuse_yolov8_model_modules
+            logger.info("Using custom YOLOv8 fusion method")
+            return fuse_yolov8_model_modules(model)
+        except ImportError:
+            pass
+        
+        # Fall back to PyTorch's fusion utilities
+        from torch.quantization.fuse_modules import fuse_modules
+        
+        # Define fusion patterns
+        fusion_patterns = [
+            ['conv', 'bn'],
+            ['conv', 'bn', 'relu'],
+            ['conv', 'relu'],
+        ]
+        
+        # Find modules to fuse
+        modules_to_fuse = []
+        
+        # Find potential Conv+BN+ReLU/ReLU6 patterns
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Sequential):
+                # Check if the sequential module contains a fusion pattern
+                if len(module) >= 2:
+                    if isinstance(module[0], torch.nn.Conv2d):
+                        if isinstance(module[1], torch.nn.BatchNorm2d):
+                            if len(module) >= 3 and isinstance(module[2], torch.nn.ReLU):
+                                modules_to_fuse.append([f"{name}.0", f"{name}.1", f"{name}.2"])
+                            else:
+                                modules_to_fuse.append([f"{name}.0", f"{name}.1"])
+                        elif isinstance(module[1], torch.nn.ReLU):
+                            modules_to_fuse.append([f"{name}.0", f"{name}.1"])
+        
+        # Fuse modules
+        if modules_to_fuse:
+            logger.info(f"Fusing {len(modules_to_fuse)} module patterns")
+            model = fuse_modules(model, modules_to_fuse, inplace=True)
+        
+        return model
+    
+    except Exception as e:
+        logger.error(f"Error during fusion: {e}")
+        return model
+
+
+def quantize_for_deployment(
+    model: torch.nn.Module,
+    calibration_data: Optional[List[torch.Tensor]] = None,
+    quantization_config: Dict[str, Any] = None
+) -> torch.nn.Module:
+    """
+    Quantize model for deployment if needed.
+    
+    Args:
+        model: Model to quantize
+        calibration_data: Optional calibration data for PTQ
+        quantization_config: Quantization configuration
+        
+    Returns:
+        Quantized model
+    """
+    # Check if model is already quantized
+    # (This is a simplified check, might need enhancement for
+    # more robust detection of quantized models)
+    if hasattr(model, "_is_quantized") and model._is_quantized:
+        logger.info("Model is already quantized")
+        return model
+    
+    # Set default quantization config
+    if quantization_config is None:
+        quantization_config = {
+            "backend": "qnnpack",  # or "fbgemm" for x86, "qnnpack" for ARM
+            "dtype": "qint8",
+            "method": "static"
+        }
+    
+    try:
+        # Check if model is already prepared for QAT
+        is_qat_ready = any(hasattr(m, "weight_fake_quant") for m in model.modules())
+        
+        if is_qat_ready:
+            # Convert QAT model to fully quantized model
+            model.eval()
+            from torch.quantization import convert
+            quantized_model = convert(model)
+            logger.info("Converted QAT model to quantized model")
+            quantized_model._is_quantized = True
+            return quantized_model
+        else:
+            # For PTQ, use static quantization method
+            if calibration_data:
+                from torch.quantization import (
+                    get_default_qconfig, prepare, convert, quantize_static
+                )
+                
+                # Set backend
+                backend = quantization_config.get("backend", "qnnpack")
+                torch.backends.quantized.engine = backend
+                
+                # Create qconfig
+                qconfig = get_default_qconfig(backend)
+                model.qconfig = qconfig
+                
+                # Prepare model for quantization
+                prepared_model = prepare(model)
+                
+                # Calibrate with calibration data
+                with torch.no_grad():
+                    for x in calibration_data:
+                        prepared_model(x)
+                
+                # Convert to quantized model
+                quantized_model = convert(prepared_model)
+                quantized_model._is_quantized = True
+                
+                logger.info(f"Applied PTQ with {backend} backend using {len(calibration_data)} calibration samples")
+                return quantized_model
+            else:
+                logger.warning("No calibration data provided for PTQ. Skipping quantization.")
+                return model
+    
+    except Exception as e:
+        logger.error(f"Error during quantization: {e}")
+        return model
+
+
+def convert_to_target_format(
+    model: torch.nn.Module,
+    output_path: str,
+    target_format: str = "onnx",
+    config_path: Optional[str] = None,
+    input_shape: Optional[Tuple[int, ...]] = None
+) -> str:
+    """
+    Convert model to target deployment format.
+    
+    Args:
+        model: Model to convert
+        output_path: Path to save converted model
+        target_format: Target format (onnx, tensorrt, openvino, tflite, etc.)
+        config_path: Path to export configuration
+        input_shape: Optional input shape (default: (1, 3, 640, 640))
+        
+    Returns:
+        Path to converted model
+    """
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Load configuration if provided
+    config = {}
+    if config_path:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            logger.warning(f"Configuration file {config_path} not found. Using default settings.")
+    
+    # Set default input shape if not provided
+    if input_shape is None:
+        input_shape = (1, 3, 640, 640)
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Convert to target format
+    if target_format.lower() == "onnx":
+        return _convert_to_onnx(model, output_path, input_shape, config.get("onnx", {}))
+    elif target_format.lower() == "tensorrt":
+        return _convert_to_tensorrt(model, output_path, input_shape, config.get("tensorrt", {}))
+    elif target_format.lower() == "openvino":
+        return _convert_to_openvino(model, output_path, input_shape, config.get("openvino", {}))
+    elif target_format.lower() == "tflite":
+        return _convert_to_tflite(model, output_path, input_shape, config.get("tflite", {}))
+    elif target_format.lower() == "coreml":
+        return _convert_to_coreml(model, output_path, input_shape, config.get("coreml", {}))
+    else:
+        raise ValueError(f"Unsupported target format: {target_format}")
+
+
+def _convert_to_onnx(model, output_path, input_shape, config):
+    """Convert model to ONNX format."""
+    try:
+        import torch.onnx
+        
+        # Set ONNX export parameters
+        opset_version = config.get("opset", 13)
+        dynamic = config.get("dynamic", True)
+        simplify = config.get("simplify", True)
+        
+        # Create dummy input
+        x = torch.randn(input_shape, requires_grad=False)
+        
+        # Set output names
+        output_names = config.get("output_names", ["output0"])
+        
+        # Export model to ONNX
+        torch.onnx.export(
+            model,
+            x,
+            output_path,
+            verbose=False,
+            opset_version=opset_version,
+            input_names=["images"],
+            output_names=output_names,
+            dynamic_axes={"images": {0: "batch_size"}, "output0": {0: "batch_size"}} if dynamic else None
+        )
+        
+        # Simplify ONNX model if requested
+        if simplify:
+            try:
+                import onnx
+                import onnxsim
+                
+                # Load exported model
+                onnx_model = onnx.load(output_path)
+                
+                # Simplify model
+                simplified_model, check = onnxsim.simplify(onnx_model)
+                
+                if check:
+                    # Save simplified model
+                    onnx.save(simplified_model, output_path)
+                    logger.info("ONNX model simplified successfully")
+                else:
+                    logger.warning("ONNX model simplification failed")
+            except (ImportError, Exception) as e:
+                logger.warning(f"ONNX simplification failed: {e}")
+        
+        logger.info(f"Model exported to ONNX format at {output_path}")
+        return output_path
+    
+    except Exception as e:
+        logger.error(f"Error during ONNX export: {e}")
+        return None
+
+
+def _convert_to_tensorrt(model, output_path, input_shape, config):
+    """Convert model to TensorRT format."""
+    try:
+        # First export to ONNX
+        onnx_path = output_path.replace(".engine", ".onnx")
+        onnx_path = _convert_to_onnx(model, onnx_path, input_shape, config)
+        
+        if not onnx_path:
+            logger.error("Failed to export to ONNX, cannot proceed with TensorRT conversion")
+            return None
+        
+        # Convert ONNX to TensorRT
+        try:
+            import tensorrt as trt
+            import pycuda.driver as cuda
+            import pycuda.autoinit
+            
+            # Create TensorRT logger
+            TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+            
+            # Create builder and network
+            builder = trt.Builder(TRT_LOGGER)
+            network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+            
+            # Create ONNX parser
+            parser = trt.OnnxParser(network, TRT_LOGGER)
+            
+            # Parse ONNX file
+            with open(onnx_path, 'rb') as f:
+                parser.parse(f.read())
+            
+            # Create builder config
+            config = builder.create_builder_config()
+            
+            # Set TensorRT parameters
+            workspace_size = config.get("workspace", 4) * 1 << 30  # Convert to bytes
+            config.max_workspace_size = workspace_size
+            
+            # Set precision
+            if config.get("fp16", False):
+                config.set_flag(trt.BuilderFlag.FP16)
+            
+            if config.get("int8", False):
+                config.set_flag(trt.BuilderFlag.INT8)
+                
+                # For INT8, calibrator is needed but not implemented here
+                # This would require a calibration dataset and implementation
+                # of a Calibrator class
+            
+            # Build and save engine
+            engine = builder.build_engine(network, config)
+            
+            with open(output_path, 'wb') as f:
+                f.write(engine.serialize())
+            
+            logger.info(f"Model exported to TensorRT format at {output_path}")
+            return output_path
+        
+        except ImportError:
+            logger.error("TensorRT or PyCUDA not found. Cannot convert to TensorRT format.")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Error during TensorRT export: {e}")
+        return None
+
+
+def _convert_to_openvino(model, output_path, input_shape, config):
+    """Convert model to OpenVINO format."""
+    try:
+        # First export to ONNX
+        onnx_path = output_path.replace(".xml", ".onnx")
+        onnx_path = _convert_to_onnx(model, onnx_path, input_shape, config)
+        
+        if not onnx_path:
+            logger.error("Failed to export to ONNX, cannot proceed with OpenVINO conversion")
+            return None
+        
+        # Convert ONNX to OpenVINO IR
+        try:
+            import subprocess
+            
+            # Get OpenVINO installation directory
+            openvino_install_dir = os.environ.get("INTEL_OPENVINO_DIR", "")
+            if not openvino_install_dir:
+                logger.warning("INTEL_OPENVINO_DIR environment variable not set. Trying to use openvino package...")
+                
+                try:
+                    import openvino as ov
+                    from openvino.tools import mo
+                    
+                    # Use OpenVINO Python API for conversion
+                    model_xml_path = output_path
+                    ov_model = mo.convert_model(
+                        onnx_path, 
+                        compress_to_fp16=config.get("half_precision", False)
+                    )
+                    
+                    # Save the converted model
+                    ov.save_model(ov_model, model_xml_path)
+                    logger.info(f"Model exported to OpenVINO format at {model_xml_path}")
+                    return model_xml_path
+                
+                except ImportError:
+                    logger.error("OpenVINO Python API not found. Cannot convert to OpenVINO format.")
+                    return None
+            
+            # Use model optimizer script
+            mo_script = os.path.join(openvino_install_dir, "tools", "mo", "mo.py")
+            if not os.path.exists(mo_script):
+                logger.error(f"OpenVINO Model Optimizer not found at {mo_script}")
+                return None
+            
+            # Prepare command line arguments
+            cmd = [
+                "python", mo_script,
+                "--input_model", onnx_path,
+                "--output_dir", os.path.dirname(output_path),
+                "--model_name", os.path.splitext(os.path.basename(output_path))[0]
+            ]
+            
+            # Add additional parameters from config
+            if config.get("data_type", "FP32") == "FP16":
+                cmd.append("--compress_to_fp16")
+            
+            # Execute model optimizer
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                logger.error(f"OpenVINO conversion failed: {result.stderr}")
+                return None
+            
+            logger.info(f"Model exported to OpenVINO format at {output_path}")
+            return output_path
+        
+        except Exception as e:
+            logger.error(f"Error during OpenVINO conversion: {e}")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Error during OpenVINO export: {e}")
+        return None
+
+
+def _convert_to_tflite(model, output_path, input_shape, config):
+    """Convert model to TFLite format."""
+    try:
+        # First export to ONNX
+        onnx_path = output_path.replace(".tflite", ".onnx")
+        onnx_path = _convert_to_onnx(model, onnx_path, input_shape, config)
+        
+        if not onnx_path:
+            logger.error("Failed to export to ONNX, cannot proceed with TFLite conversion")
+            return None
+        
+        # Convert ONNX to TFLite
+        try:
+            import tf2onnx
+            import tensorflow as tf
+            
+            # Convert ONNX to TensorFlow SavedModel
+            saved_model_dir = os.path.join(os.path.dirname(output_path), "saved_model")
+            cmd = ["python", "-m", "tf2onnx.convert", 
+                   "--onnx", onnx_path, 
+                   "--output", saved_model_dir, 
+                   "--target", "tf"]
+            
+            import subprocess
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                logger.error(f"TensorFlow conversion failed: {result.stderr}")
+                return None
+            
+            # Convert SavedModel to TFLite
+            converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+            
+            # Set optimization options
+            if config.get("optimize", True):
+                converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            
+            # Set quantization options
+            if config.get("quantize", False):
+                converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+                converter.inference_input_type = tf.int8
+                converter.inference_output_type = tf.int8
+                
+                # For quantization, a representative dataset would be needed
+                # This is a simplified example and doesn't include it
+            
+            # Convert model
+            tflite_model = converter.convert()
+            
+            # Save model
+            with open(output_path, 'wb') as f:
+                f.write(tflite_model)
+            
+            logger.info(f"Model exported to TFLite format at {output_path}")
+            return output_path
+        
+        except ImportError:
+            logger.error("TensorFlow or tf2onnx not found. Cannot convert to TFLite format.")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Error during TFLite export: {e}")
+        return None
+
+
+def _convert_to_coreml(model, output_path, input_shape, config):
+    """Convert model to Core ML format."""
+    try:
+        # First export to ONNX
+        onnx_path = output_path.replace(".mlmodel", ".onnx")
+        onnx_path = _convert_to_onnx(model, onnx_path, input_shape, config)
+        
+        if not onnx_path:
+            logger.error("Failed to export to ONNX, cannot proceed with Core ML conversion")
+            return None
+        
+        # Convert ONNX to Core ML
+        try:
+            import onnx
+            import coremltools as ct
+            
+            # Load ONNX model
+            onnx_model = onnx.load(onnx_path)
+            
+            # Specify input shape
+            input_shape_dict = {"images": input_shape}
+            
+            # Convert to Core ML
+            mlmodel = ct.converters.onnx.convert(
+                model=onnx_model,
+                minimum_ios_deployment_target=config.get("minimum_ios_version", "13"),
+                source='onnx',
+                inputs=input_shape_dict if config.get("specify_input_shape", True) else None
+            )
+            
+            # Set model metadata
+            mlmodel.author = config.get("author", "YOLOv8 QAT")
+            mlmodel.license = config.get("license", "Unknown")
+            mlmodel.short_description = config.get("description", "YOLOv8 object detection model")
+            
+            # Set user-defined metadata
+            user_metadata = config.get("metadata", {})
+            for key, value in user_metadata.items():
+                mlmodel.user_defined_metadata[key] = str(value)
+            
+            # Save the model
+            mlmodel.save(output_path)
+            
+            logger.info(f"Model exported to Core ML format at {output_path}")
+            return output_path
+        
+        except ImportError:
+            logger.error("CoreMLTools or ONNX not found. Cannot convert to Core ML format.")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Error during Core ML export: {e}")
+        return None
