@@ -18,6 +18,9 @@ import copy
 # Import PyTorch quantization modules
 from torch.quantization import prepare_qat, convert, get_default_qconfig
 
+# Import PyTorch quantization modules
+from torch.quantization import prepare_qat, convert, get_default_qconfig
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -340,44 +343,40 @@ class QuantizedYOLOv8:
         self._set_activation_quantizers_enabled(enabled)
 
     def _train_phase(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, log_dir, use_distillation, phase_name):
-        """Train for a specific phase using YOLO's built-in export/import."""
+        """Train for a specific phase - simplified approach to avoid pickling issues."""
         # Create directories
         os.makedirs(save_dir, exist_ok=True)
         
         logger.info(f"Training {phase_name} for {epochs} epochs with lr={lr}")
         
-        # For the first phase, use a clean copy of the model
+        # For the first phase, start with original model
         if phase_name == "phase1_weight_only":
-            # Start with a clean model
-            clean_model = YOLO(self.model_path)
-            temp_model_path = os.path.join(save_dir, f"{phase_name}_temp.pt")
-            clean_model.save(temp_model_path)
+            logger.info("Phase 1: Starting with original model")
+            trainer = YOLO(self.model_path)
             
-            # Create trainer from this saved file
-            trainer = YOLO(temp_model_path)
         else:
-            # For subsequent phases, use the previous phase's best model
-            prev_phase_dir = None
-            if phase_name == "phase2_activations":
-                prev_phase_dir = os.path.join(os.path.dirname(save_dir), "phase1_weight_only")
-            elif phase_name == "phase3_full_quant":
-                prev_phase_dir = os.path.join(os.path.dirname(save_dir), "phase2_activations")
-            elif phase_name == "phase4_fine_tuning":
-                prev_phase_dir = os.path.join(os.path.dirname(save_dir), "phase3_full_quant")
+            # For subsequent phases, try to use the best model from previous phase
+            prev_best_model = self._get_previous_phase_best_model(save_dir, phase_name)
             
-            # Use the best model from previous phase
-            prev_best_model = os.path.join(prev_phase_dir, "weights", "best.pt")
-            if os.path.exists(prev_best_model):
-                temp_model_path = prev_best_model
-                logger.info(f"Using best model from previous phase: {temp_model_path}")
-                trainer = YOLO(temp_model_path)
+            if prev_best_model and os.path.exists(prev_best_model):
+                logger.info(f"Loading best model from previous phase: {prev_best_model}")
+                trainer = YOLO(prev_best_model)
             else:
-                # Fallback - use original model
                 logger.warning(f"Previous phase best model not found, using original model")
                 trainer = YOLO(self.model_path)
         
-        # Apply phase-specific configuration to the new trainer model
-        self._apply_phase_config_to_trainer_model(trainer.model, phase_name)
+        # Apply quantization configuration to the trainer model
+        # This is where we'll apply our phase-specific quantization settings
+        logger.info(f"Applying quantization configuration for {phase_name}")
+        
+        # Set trainer model to training mode
+        trainer.model.train()
+        
+        # Apply qconfig to the trainer model
+        self._apply_qconfig_and_prepare_model(trainer, phase_name)
+        
+        # Verify quantization setup
+        self._verify_quantization_setup(trainer.model, phase_name)
         
         # Training arguments
         train_args = {
@@ -395,25 +394,76 @@ class QuantizedYOLOv8:
         }
         
         # Train for this phase
+        logger.info(f"Starting training for {phase_name}")
         results = trainer.train(**train_args)
         
-        # After training, update our model by creating a fresh instance from the trained weights
-        best_weights_path = os.path.join(save_dir, 'weights', 'best.pt')
-        if os.path.exists(best_weights_path):
-            logger.info(f"Loading best weights from {best_weights_path}")
-            # Replace our model with the trained model
-            self.model = YOLO(best_weights_path)
-            # Re-apply our phase configuration
-            self._configure_phase(phase_name)
-        else:
-            logger.warning(f"Best weights not found, using last weights")
-            last_weights_path = os.path.join(save_dir, 'weights', 'last.pt')
-            if os.path.exists(last_weights_path):
-                self.model = YOLO(last_weights_path)
-                # Re-apply our phase configuration
-                self._configure_phase(phase_name)
+        # After training, update our main model with the best results
+        self._update_main_model_after_phase(save_dir, phase_name)
         
         return results
+
+    def _apply_qconfig_and_prepare_model(self, trainer, phase_name):
+        """Apply qconfig and prepare model for QAT in one step."""
+        try:
+            logger.info(f"Applying QConfig and preparing model for {phase_name}")
+            
+            # Apply qconfig to appropriate modules
+            count = 0
+            for name, module in trainer.model.named_modules():
+                if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                    if "model.0.conv" in name:
+                        from src.quantization.qconfig import get_first_layer_qconfig
+                        module.qconfig = get_first_layer_qconfig()
+                    else:
+                        from src.quantization.qconfig import get_default_qat_qconfig
+                        module.qconfig = get_default_qat_qconfig()
+                    count += 1
+            
+            # Skip detection head if requested
+            if self.skip_detection_head:
+                detection_count = 0
+                for name, module in trainer.model.named_modules():
+                    if 'detect' in name or 'model.22' in name:
+                        module.qconfig = None
+                        detection_count += 1
+                logger.info(f"Disabled quantization for {detection_count} detection modules")
+            
+            logger.info(f"Applied qconfig to {count} modules")
+            
+            # Prepare model for QAT
+            trainer.model = torch.quantization.prepare_qat(trainer.model, inplace=False)
+            
+            # Configure phase-specific settings
+            self._configure_model_for_specific_phase(trainer.model, phase_name)
+            
+            logger.info(f"Successfully prepared model for QAT in {phase_name}")
+            
+        except Exception as e:
+            logger.error(f"Error preparing model for QAT: {e}")
+            logger.warning("Continuing without QAT preparation - model will train without quantization")
+
+    def _update_main_model_after_phase(self, save_dir, phase_name):
+        """Update main model with best results from this phase."""
+        best_weights_path = os.path.join(save_dir, 'weights', 'best.pt')
+        
+        if os.path.exists(best_weights_path):
+            logger.info(f"Updating main model with best weights from {best_weights_path}")
+            
+            try:
+                # Load the trained model
+                self.model = YOLO(best_weights_path)
+                
+                # Re-prepare the model for QAT for the next phase
+                self.model.model.train()
+                self._apply_qconfig_and_prepare_model(self.model, phase_name)
+                
+                logger.info(f"Successfully updated main model with {phase_name} results")
+                
+            except Exception as e:
+                logger.error(f"Error updating main model: {e}")
+                logger.warning("Main model update failed - continuing with previous model state")
+        else:
+            logger.warning(f"Best weights not found at {best_weights_path}")
 
     def _apply_phase_config_to_trainer_model(self, trainer_model, phase_name):
         """
@@ -1031,26 +1081,28 @@ class QuantizedYOLOv8:
 
     def _configure_phase(self, phase):
         """Configure model for specific QAT phase."""
-        if phase == "weight_only":
+        # Use consistent phase names
+        if phase == "weight_only" or phase == "phase1_weight_only":
             # Enable only weight quantization, disable activation quantization
             logger.info("Configuring for weight-only quantization phase")
             self._set_activation_quantizers_enabled(False)
             self._set_weight_quantizers_enabled(True)
-        elif phase == "activation_phase":
+        elif phase == "activation_phase" or phase == "phase2_activations":
             # Enable both weight and activation quantization
             logger.info("Configuring for activation quantization phase")
             self._set_activation_quantizers_enabled(True)
             self._set_weight_quantizers_enabled(True)
-        elif phase == "full_quantization":
+        elif phase == "full_quantization" or phase == "phase3_full_quant":
             # Enable all quantizers
             logger.info("Configuring for full network quantization phase")
             self._set_all_quantizers_enabled(True)
-        elif phase == "fine_tuning":
+        elif phase == "fine_tuning" or phase == "phase4_fine_tuning":
             # All quantizers remain enabled
             logger.info("Configuring for fine-tuning phase")
             self._set_all_quantizers_enabled(True)
         else:
-            logger.warning(f"Unknown phase: {phase}")
+            logger.warning(f"Unknown phase: {phase}, enabling all quantizers as fallback")
+            self._set_all_quantizers_enabled(True)
         
         # VERIFICATION - Count active quantizers
         weight_count = 0
@@ -1083,3 +1135,231 @@ class QuantizedYOLOv8:
         logger.info(f"Applied qconfig to {count} additional submodules in C2f blocks")
         
         return model
+
+    def _reapply_qconfig_to_model(self, model):
+        """Re-apply qconfig to all modules after loading."""
+        logger.info("Re-applying qconfig to model modules...")
+        
+        count = 0
+        for name, module in model.named_modules():
+            # Apply to appropriate module types
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                # Special config for first layer
+                if "model.0.conv" in name:
+                    from src.quantization.qconfig import get_first_layer_qconfig
+                    module.qconfig = get_first_layer_qconfig()
+                    logger.info(f"Applied first layer qconfig to {name}")
+                else:
+                    # Default config for other layers
+                    from src.quantization.qconfig import get_default_qat_qconfig
+                    module.qconfig = get_default_qat_qconfig()
+                count += 1
+        
+        # Skip detection head if requested
+        if self.skip_detection_head:
+            detection_count = 0
+            for name, module in model.named_modules():
+                if 'detect' in name or 'model.22' in name:
+                    # Remove qconfig to skip quantization
+                    module.qconfig = None
+                    detection_count += 1
+            
+            logger.info(f"Disabled quantization for {detection_count} detection modules")
+        
+        logger.info(f"Re-applied qconfig to {count} modules")
+        return model
+
+    def _configure_model_for_specific_phase(self, model, phase_name):
+        """Configure model specifically for the current phase."""
+        logger.info(f"Configuring model for {phase_name}")
+        
+        if phase_name == "phase1_weight_only":
+            # Enable weight quantizers, disable activation quantizers
+            self._set_quantizers_for_model(model, weights_enabled=True, activations_enabled=False)
+        elif phase_name == "phase2_activations":
+            # Enable both weight and activation quantizers
+            self._set_quantizers_for_model(model, weights_enabled=True, activations_enabled=True)
+        elif phase_name == "phase3_full_quant":
+            # Enable all quantizers (same as phase 2 for now)
+            self._set_quantizers_for_model(model, weights_enabled=True, activations_enabled=True)
+        elif phase_name == "phase4_fine_tuning":
+            # All quantizers remain enabled
+            self._set_quantizers_for_model(model, weights_enabled=True, activations_enabled=True)
+        else:
+            logger.warning(f"Unknown phase: {phase_name}, enabling all quantizers")
+            self._set_quantizers_for_model(model, weights_enabled=True, activations_enabled=True)
+
+    def _set_quantizers_for_model(self, model, weights_enabled=True, activations_enabled=True):
+        """Enable or disable quantizers for a specific model."""
+        weight_count = 0
+        activation_count = 0
+        
+        for name, module in model.named_modules():
+            # Handle weight quantizers
+            if hasattr(module, 'weight_fake_quant'):
+                if not weights_enabled:
+                    if not hasattr(module, '_original_weight_fake_quant'):
+                        module._original_weight_fake_quant = module.weight_fake_quant
+                    module.weight_fake_quant = torch.nn.Identity()
+                else:
+                    if hasattr(module, '_original_weight_fake_quant'):
+                        module.weight_fake_quant = module._original_weight_fake_quant
+                    if not isinstance(module.weight_fake_quant, torch.nn.Identity):
+                        weight_count += 1
+            
+            # Handle activation quantizers
+            if hasattr(module, 'activation_post_process'):
+                if not activations_enabled:
+                    if not hasattr(module, '_original_activation_post_process'):
+                        module._original_activation_post_process = module.activation_post_process
+                    module.activation_post_process = torch.nn.Identity()
+                else:
+                    if hasattr(module, '_original_activation_post_process'):
+                        module.activation_post_process = module._original_activation_post_process
+                    if not isinstance(module.activation_post_process, torch.nn.Identity):
+                        activation_count += 1
+        
+        logger.info(f"Configured model with {weight_count} weight quantizers and {activation_count} activation quantizers")
+
+    def _verify_quantization_setup(self, model, phase_name):
+        """Verify that quantization is properly set up for the current phase."""
+        weight_count = 0
+        activation_count = 0
+        fake_quant_count = 0
+        
+        for name, module in model.named_modules():
+            # Count weight quantizers
+            if hasattr(module, 'weight_fake_quant') and not isinstance(module.weight_fake_quant, torch.nn.Identity):
+                weight_count += 1
+            
+            # Count activation quantizers
+            if hasattr(module, 'activation_post_process') and not isinstance(module.activation_post_process, torch.nn.Identity):
+                activation_count += 1
+            
+            # Count FakeQuantize modules
+            if 'FakeQuantize' in module.__class__.__name__:
+                fake_quant_count += 1
+        
+        logger.info(f"✓ Quantization verification for {phase_name}:")
+        logger.info(f"  - Weight quantizers: {weight_count}")
+        logger.info(f"  - Activation quantizers: {activation_count}")
+        logger.info(f"  - FakeQuantize modules: {fake_quant_count}")
+        
+        # Validate expected counts based on phase
+        if phase_name == "phase1_weight_only":
+            if weight_count == 0:
+                logger.error("❌ ERROR: No weight quantizers found in weight-only phase!")
+                return False
+            if activation_count > 0:
+                logger.warning(f"⚠️ WARNING: Found {activation_count} activation quantizers in weight-only phase")
+        elif phase_name in ["phase2_activations", "phase3_full_quant", "phase4_fine_tuning"]:
+            if weight_count == 0 or activation_count == 0:
+                logger.error(f"❌ ERROR: Missing quantizers in {phase_name} - Weight: {weight_count}, Activation: {activation_count}")
+                return False
+        
+        return True
+
+    def _save_model_with_quantization_info(self, model, path):
+        """Save model while avoiding quantization pickling issues."""
+        try:
+            # Method 1: Try to save state dict only (avoids observer pickling issues)
+            logger.info(f"Saving model state dict to avoid pickling issues: {path}")
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # Save just the state dict
+            torch.save({
+                'model': model.state_dict(),
+                'metadata': {
+                    'quantized': True,
+                    'prepared_for_qat': True,
+                    'architecture': 'yolov8',
+                    'framework': 'pytorch'
+                }
+            }, path)
+            
+            logger.info(f"Successfully saved model state dict to {path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save model state dict: {e}")
+            
+            # Method 2: Fallback - create a clean YOLO model and copy weights
+            try:
+                logger.info("Trying fallback method: creating clean YOLO model")
+                
+                # Create a clean YOLO model
+                clean_yolo = YOLO(self.model_path)  # Start with original model
+                
+                # Copy the state dict from our quantized model to the clean model
+                # This will copy weights but lose quantization info (which is expected for intermediate saves)
+                try:
+                    clean_yolo.model.load_state_dict(model.state_dict(), strict=False)
+                    logger.info("Successfully copied weights to clean model")
+                except Exception as copy_error:
+                    logger.warning(f"Could not copy all weights: {copy_error}")
+                    # If copying fails, just use the original model structure
+                
+                # Save the clean model
+                clean_yolo.save(path)
+                logger.info(f"Successfully saved clean model to {path}")
+                
+            except Exception as fallback_error:
+                logger.error(f"Fallback save method also failed: {fallback_error}")
+                
+                # Method 3: Last resort - save original model
+                logger.info("Using original model as last resort")
+                original_yolo = YOLO(self.model_path)
+                original_yolo.save(path)
+                logger.warning(f"Saved original model to {path} (quantization info lost)")
+
+    def _get_previous_phase_best_model(self, save_dir, phase_name):
+        """Get the best model from the previous phase."""
+        phase_mapping = {
+            "phase2_activations": "phase1_weight_only",
+            "phase3_full_quant": "phase2_activations", 
+            "phase4_fine_tuning": "phase3_full_quant"
+        }
+        
+        prev_phase = phase_mapping.get(phase_name)
+        if prev_phase:
+            prev_phase_dir = os.path.join(os.path.dirname(save_dir), prev_phase)
+            prev_best_model = os.path.join(prev_phase_dir, "weights", "best.pt")
+            
+            if os.path.exists(prev_best_model):
+                logger.info(f"Found previous phase model: {prev_best_model}")
+                return prev_best_model
+            else:
+                logger.warning(f"Previous phase model not found: {prev_best_model}")
+        
+        return None
+
+    def test_quantization_setup(self):
+        """Test method to verify quantization is working correctly."""
+        logger.info("Testing quantization setup...")
+        
+        # Test each phase configuration
+        phases_to_test = [
+            "phase1_weight_only",
+            "phase2_activations", 
+            "phase3_full_quant",
+            "phase4_fine_tuning"
+        ]
+        
+        for phase in phases_to_test:
+            logger.info(f"\n--- Testing {phase} ---")
+            
+            # Configure for this phase
+            test_model = copy.deepcopy(self.model.model)
+            self._configure_model_for_specific_phase(test_model, phase)
+            
+            # Verify setup
+            success = self._verify_quantization_setup(test_model, phase)
+            
+            if success:
+                logger.info(f"✓ {phase} configuration test PASSED")
+            else:
+                logger.error(f"❌ {phase} configuration test FAILED")
+        
+        logger.info("Quantization setup test completed")
+        

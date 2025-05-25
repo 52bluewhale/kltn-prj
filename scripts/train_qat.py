@@ -459,6 +459,20 @@ def main():
     # Set random seed
     set_seed(args.seed)
     
+    # Safety check: Test basic quantization first
+    logger.info("Running safety check for quantization compatibility...")
+    try:
+        # Quick test to see if quantization works
+        test_model = torch.nn.Conv2d(3, 16, 3)
+        test_model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+        test_prepared = torch.quantization.prepare_qat(test_model)
+        logger.info("✓ Basic quantization compatibility check passed")
+    except Exception as e:
+        logger.error(f"❌ Basic quantization compatibility check failed: {e}")
+        logger.error("Your PyTorch environment may not support quantization properly")
+        logger.error("Consider updating PyTorch or using a different environment")
+        return None
+
     # Load QAT configuration
     qat_config = load_config(args.config)
     
@@ -601,37 +615,80 @@ def main():
     lr = args.lr if args.lr else train_params.get('lr', QAT_LEARNING_RATE)
     
     # Train with QAT - either phased or standard approach
-    if phased_training:
-        logger.info("Using phased QAT training approach")
-        results = qat_model.train_model(
-            data_yaml=data_path,
-            epochs=epochs,
-            batch_size=batch_size,
-            img_size=img_size,
-            lr=lr,
-            device=args.device,
-            save_dir=args.save_dir,
-            log_dir=args.log_dir,
-            use_distillation=use_distillation
-        )
-    else:
-        logger.info("Using standard QAT training approach (non-phased)")
-        # Original non-phased training method would be called here
-        results = qat_model.train_standard(
-            data_yaml=data_path,
-            epochs=epochs,
-            batch_size=batch_size,
-            img_size=img_size,
-            lr=lr,
-            device=args.device,
-            save_dir=args.save_dir,
-            log_dir=args.log_dir,
-            use_distillation=use_distillation
-        )
+    try:
+        if phased_training:
+            logger.info("Using phased QAT training approach")
+            results = qat_model.train_model(
+                data_yaml=data_path,
+                epochs=epochs,
+                batch_size=batch_size,
+                img_size=img_size,
+                lr=lr,
+                device=args.device,
+                save_dir=args.save_dir,
+                log_dir=args.log_dir,
+                use_distillation=use_distillation
+            )
+        else:
+            logger.info("Using standard QAT training approach (non-phased)")
+            results = qat_model.train_standard(
+                data_yaml=data_path,
+                epochs=epochs,
+                batch_size=batch_size,
+                img_size=img_size,
+                lr=lr,
+                device=args.device,
+                save_dir=args.save_dir,
+                log_dir=args.log_dir,
+                use_distillation=use_distillation
+            )
+        
+        logger.info("✓ QAT training completed successfully")
+        
+    except Exception as training_error:
+        logger.error(f"❌ QAT training failed: {training_error}")
+        logger.error("Full error traceback:")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Try to provide helpful error guidance
+        if "pickle" in str(training_error).lower():
+            logger.error("This appears to be a serialization/pickling error.")
+            logger.error("Try reducing the complexity of quantization or using simpler QConfig.")
+        elif "cuda" in str(training_error).lower():
+            logger.error("This appears to be a CUDA/device error.")
+            logger.error("Try using --device cpu or check your GPU setup.")
+        elif "memory" in str(training_error).lower():
+            logger.error("This appears to be a memory error.")
+            logger.error("Try reducing --batch-size or using a smaller model.")
+        
+        logger.error("QAT training failed. Exiting.")
+        return None
     
     # Convert and save quantized model
     save_path = os.path.join(args.save_dir, args.output)
-    quantized_model = qat_model.convert_to_quantized(save_path)
+
+    try:
+        logger.info("Converting QAT model to quantized INT8 model...")
+        quantized_model = qat_model.convert_to_quantized(save_path)
+        logger.info("✓ Model conversion completed successfully")
+        
+    except Exception as conversion_error:
+        logger.error(f"❌ Model conversion failed: {conversion_error}")
+        logger.error("Full conversion error traceback:")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Try to save the QAT model instead
+        try:
+            logger.info("Attempting to save QAT model instead of converted model...")
+            qat_save_path = save_path.replace('.pt', '_qat.pt')
+            qat_model.save(qat_save_path)
+            logger.info(f"✓ QAT model saved to {qat_save_path}")
+            quantized_model = qat_model.model  # Use QAT model for further operations
+        except Exception as save_error:
+            logger.error(f"❌ Could not save QAT model either: {save_error}")
+            quantized_model = None
     
     # Analyze quantization effects if requested
     if args.analyze or qat_params.get('analyze_quantization_effects', False):

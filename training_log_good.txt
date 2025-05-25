@@ -1,0 +1,847 @@
+(venv) PS F:\kltn-prj> python scripts/train_qat.py --model yolov8n.pt --data datasets/vietnam-traffic-sign-detection/dataset.yaml --config configs/qat_config.yaml --epochs 5 --batch-size 16 --img-size 640 --lr 0.0005 --save-dir models/checkpoints/qat --log-dir logs/qat --device cpu --phased-training --quant-penalty --eval --export
+F:\kltn-prj\venv\lib\site-packages\albumentations\__init__.py:13: UserWarning: A new version of Albumentations is available: 2.0.7 (you have 1.4.18). Upgrade using: pip install -U albumentations. To disable automatic update checks, set the environment variable NO_ALBUMENTATIONS_UPDATE to 1.
+  check_for_updates()
+2025-05-25 14:33:53,448 - train_qat - INFO - Running safety check for quantization compatibility...
+F:\kltn-prj\venv\lib\site-packages\torch\ao\quantization\observer.py:221: UserWarning: Please use quant_min and quant_max to specify the range for observers.                     reduce_range will be deprecated in a future release of PyTorch.
+  warnings.warn(
+2025-05-25 14:33:53,452 - train_qat - INFO - ✓ Basic quantization compatibility check passed
+2025-05-25 14:33:53,461 - train_qat - INFO - Starting YOLOv8 QAT training
+2025-05-25 14:33:53,461 - train_qat - INFO - Model: yolov8n.pt
+2025-05-25 14:33:53,461 - train_qat - INFO - Dataset: datasets/vietnam-traffic-sign-detection/dataset.yaml
+2025-05-25 14:33:53,461 - train_qat - INFO - QConfig: default
+2025-05-25 14:33:53,462 - yolov8_qat - INFO - Loading YOLOv8 model from yolov8n.pt
+2025-05-25 14:33:53,607 - yolov8_qat - INFO - Quantization penalty monitoring setup with alpha=0.01
+2025-05-25 14:33:53,607 - yolov8_qat - INFO - Note: For YOLOv8, we'll track the penalty but apply it manually in training
+2025-05-25 14:33:53,607 - yolov8_qat - INFO - Preparing model for QAT...
+2025-05-25 14:33:53,608 - yolov8_qat - INFO - Setting model to training mode...
+2025-05-25 14:33:53,608 - yolov8_qat - INFO - Fusing modules for better quantization...
+2025-05-25 14:33:53,610 - yolov8_qat - INFO - Manually applying qconfig to individual modules...
+2025-05-25 14:33:53,610 - yolov8_qat - INFO - Applied first layer qconfig to model.0.conv
+2025-05-25 14:33:53,611 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 14:33:53,611 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 14:33:53,611 - yolov8_qat - INFO - Applying YOLOv8-specific module handling...
+2025-05-25 14:33:53,612 - yolov8_qat - INFO - Found 8 C2f blocks to process
+2025-05-25 14:33:53,612 - yolov8_qat - INFO - Applied qconfig to 0 additional submodules in C2f blocks
+2025-05-25 14:33:53,612 - yolov8_qat - INFO - QConfig application state:
+2025-05-25 14:33:53,612 - yolov8_qat - INFO - Module model.0.conv has qconfig applied
+2025-05-25 14:33:53,612 - yolov8_qat - INFO - Module model.1.conv has qconfig applied
+2025-05-25 14:33:53,613 - yolov8_qat - INFO - Module model.2.cv1.conv has qconfig applied
+2025-05-25 14:33:53,613 - yolov8_qat - INFO - Module model.2.cv2.conv has qconfig applied
+2025-05-25 14:33:53,613 - yolov8_qat - INFO - Module model.2.m.0.cv1.conv has qconfig applied
+2025-05-25 14:33:53,613 - yolov8_qat - INFO - Total modules: 225, modules with qconfig: 45
+2025-05-25 14:33:53,613 - yolov8_qat - INFO - Calling prepare_qat with PyTorch 2.4.1 compatible arguments...
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - QAT preparation verified: 135 modules have qconfig applied
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - Found 90 FakeQuantize modules after prepare_qat
+2025-05-25 14:33:53,714 - train_qat - INFO - Using phased QAT training approach
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - Phase 1: Weight-only quantization - 1 epochs
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - Phase 2: Adding activation quantization - 2 epochs
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - Phase 3: Full network quantization - 1 epochs
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - Phase 4: Fine-tuning - 1 epochs
+2025-05-25 14:33:53,714 - yolov8_qat - INFO - Starting Phase 1: Weight-only quantization
+2025-05-25 14:33:53,715 - yolov8_qat - INFO - Configuring for weight-only quantization phase
+2025-05-25 14:33:53,718 - yolov8_qat - INFO - Disabled activation quantizers for 135 modules
+2025-05-25 14:33:53,720 - yolov8_qat - INFO - Enabled weight quantizers for 45 modules
+2025-05-25 14:33:53,723 - yolov8_qat - INFO - Phase 'weight_only' configured with 45 active weight quantizers and 0 active activation quantizers
+2025-05-25 14:33:53,724 - yolov8_qat - INFO - Training phase1_weight_only for 1 epochs with lr=0.0005
+2025-05-25 14:33:53,724 - yolov8_qat - INFO - Phase 1: Starting with original model
+2025-05-25 14:33:53,760 - yolov8_qat - INFO - Applying quantization configuration for phase1_weight_only
+2025-05-25 14:33:53,761 - yolov8_qat - INFO - Applying QConfig and preparing model for phase1_weight_only
+2025-05-25 14:33:53,763 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 14:33:53,763 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 14:33:53,984 - yolov8_qat - INFO - Configuring model for phase1_weight_only
+2025-05-25 14:33:53,989 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 0 activation quantizers
+2025-05-25 14:33:53,989 - yolov8_qat - INFO - Successfully prepared model for QAT in phase1_weight_only
+2025-05-25 14:33:53,991 - yolov8_qat - INFO - ✓ Quantization verification for phase1_weight_only:
+2025-05-25 14:33:53,991 - yolov8_qat - INFO -   - Weight quantizers: 45
+2025-05-25 14:33:53,992 - yolov8_qat - INFO -   - Activation quantizers: 0
+2025-05-25 14:33:53,992 - yolov8_qat - INFO -   - FakeQuantize modules: 90
+2025-05-25 14:33:53,992 - yolov8_qat - INFO - Starting training for phase1_weight_only
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+engine\trainer: agnostic_nms=False, amp=True, augment=False, auto_augment=randaugment, batch=16, bgr=0.0, box=7.5, cache=False, cfg=None, classes=None, close_mosaic=10, cls=0.5, conf=None, copy_paste=0.0, copy_paste_mode=flip, cos_lr=False, cutmix=0.0, data=datasets/vietnam-traffic-sign-detection/dataset.yaml, degrees=0.0, deterministic=True, device=cpu, dfl=1.5, dnn=False, dropout=0.0, dynamic=False, embed=None, epochs=1, erasing=0.4, exist_ok=True, fliplr=0.5, flipud=0.0, format=torchscript, fraction=1.0, freeze=None, half=False, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, imgsz=640, int8=False, iou=0.7, keras=False, kobj=1.0, line_width=None, lr0=0.0005, lrf=0.01, mask_ratio=4, max_det=300, mixup=0.0, mode=train, model=yolov8n.pt, momentum=0.937, mosaic=1.0, multi_scale=False, name=phase1_weight_only, nbs=64, nms=False, opset=None, optimize=False, optimizer=auto, overlap_mask=True, patience=100, perspective=0.0, plots=True, pose=12.0, pretrained=False, profile=False, project=models/checkpoints/qat, rect=False, resume=False, retina_masks=False, save=True, save_conf=False, save_crop=False, save_dir=models\checkpoints\qat\phase1_weight_only, save_frames=False, save_json=False, save_period=-1, save_txt=False, scale=0.5, seed=0, shear=0.0, show=False, show_boxes=True, show_conf=True, show_labels=True, simplify=True, single_cls=False, source=None, split=val, stream_buffer=False, task=detect, time=None, tracker=botsort.yaml, translate=0.1, val=True, verbose=True, vid_stride=1, visualize=False, warmup_bias_lr=0.1, warmup_epochs=3.0, warmup_momentum=0.8, weight_decay=0.0005, workers=8, workspace=None
+Overriding model.yaml nc=80 with nc=58
+
+                   from  n    params  module                                       arguments
+  0                  -1  1       464  ultralytics.nn.modules.conv.Conv             [3, 16, 3, 2]
+  1                  -1  1      4672  ultralytics.nn.modules.conv.Conv             [16, 32, 3, 2]
+  2                  -1  1      7360  ultralytics.nn.modules.block.C2f             [32, 32, 1, True]
+  3                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]
+  4                  -1  2     49664  ultralytics.nn.modules.block.C2f             [64, 64, 2, True]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+Model summary: 129 layers, 3,022,158 parameters, 3,022,142 gradients, 8.3 GFLOPs
+
+Model summary: 129 layers, 3,022,158 parameters, 3,022,142 gradients, 8.3 GFLOPs
+
+Transferred 319/355 items from pretrained weights
+Freezing layer 'model.22.dfl.conv.weight'
+train: Fast image access  (ping: 0.40.0 ms, read: 9.63.2 MB/s, size: 74.0 KB)
+train: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\train\labels.cache... 9536 images, 465 backgrounds, 0 corrupt: 100%|██████████| 9536/9536 [00:00<?, ?it/s]
+albumentations: Blur(p=0.01, blur_limit=(3, 7)), MedianBlur(p=0.01, blur_limit=(3, 7)), ToGray(p=0.01, num_output_channels=3, method='weighted_average'), CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8))
+val: Fast image access  (ping: 0.40.1 ms, read: 11.15.4 MB/s, size: 82.7 KB)
+val: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\valid\labels.cache... 784 images, 169 backgrounds, 0 corrupt: 100%|██████████| 784/784 [00:00<?, ?it/s]
+Plotting labels to models\checkpoints\qat\phase1_weight_only\labels.jpg...
+optimizer: 'optimizer=auto' found, ignoring 'lr0=0.0005' and 'momentum=0.937' and determining best 'optimizer', 'lr0' and 'momentum' automatically...
+optimizer: AdamW(lr=0.000161, momentum=0.9) with parameter groups 57 weight(decay=0.0), 64 weight(decay=0.0005), 63 bias(decay=0.0)
+Image sizes 640 train, 640 val
+Using 0 dataloader workers
+Logging results to models\checkpoints\qat\phase1_weight_only
+Starting training for 1 epochs...
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+        1/1         0G     0.9053      4.053     0.9715         43        640: 100%|██████████| 596/596 [59:16<00:00,  5.97s/it]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:56<00:00,  4.64s/it]
+                   all        784       1249      0.514      0.133      0.103     0.0832
+
+1 epochs completed in 1.021 hours.
+Optimizer stripped from models\checkpoints\qat\phase1_weight_only\weights\last.pt, 6.3MB
+Optimizer stripped from models\checkpoints\qat\phase1_weight_only\weights\best.pt, 6.3MB
+
+Validating models\checkpoints\qat\phase1_weight_only\weights\best.pt...
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+Model summary (fused): 72 layers, 3,016,958 parameters, 0 gradients, 8.1 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:22<00:00,  3.32s/it]
+                   all        784       1249      0.515      0.134      0.103     0.0832
+                DP.135          4          4          1          0    0.00876    0.00789
+                 P.102         48         50      0.324       0.18      0.137     0.0994
+                P.103a         10         10          0          0     0.0754     0.0628
+                P.103b          1          1          1          0          0          0
+                P.103c         15         18      0.111      0.444      0.281      0.251
+                 P.104          9          9          0          0    0.00252    0.00157
+                P.106a         19         19          0          0     0.0321     0.0274
+                P.106b         15         23       0.15      0.609      0.236      0.207
+                 P.112          4          4          0          0     0.0787     0.0649
+                 P.115          3          3          0          0     0.0102     0.0093
+                 P.117         21         27          0          0     0.0332     0.0247
+                P.123a          4          4          1          0    0.00798    0.00612
+                P.123b         15         18      0.159      0.111     0.0795     0.0698
+                P.124a         16         16     0.0893       0.25     0.0796     0.0668
+                P.124c          5          5          1          0    0.00375    0.00297
+                 P.125          1          1          1          0          0          0
+                 P.127        125        249      0.394      0.839      0.748      0.568
+                 P.130        143        171       0.42      0.836      0.801      0.651
+                P.131a        150        155      0.519      0.935      0.877      0.719
+                 P.137          3          3          1          0    0.00156    0.00115
+                R.301c          3          3          1          0          0          0
+                R.301d          3          3          1          0    0.00192    0.00173
+                R.301e          5          5          1          0          0          0
+                R.302a         49         49      0.205     0.0897     0.0703     0.0558
+                R.302b          6          6          1          0     0.0298     0.0245
+                 R.303         10         11     0.0448      0.182     0.0448     0.0424
+                R.407a         11         11      0.191     0.0909       0.06     0.0529
+                 R.409         10         10      0.583      0.283      0.346       0.28
+                 R.425          1          1          1          0          0          0
+                 R.434         17         17          1          0    0.00194    0.00136
+                S.509a         19         19          1          0      0.115     0.0949
+                W.201a         28         30       0.14      0.367      0.198      0.135
+                W.201b         13         16     0.0534     0.0625      0.031      0.025
+                W.202a          7          7          1          0     0.0172     0.0127
+                W.202b          7          7          1          0     0.0243      0.022
+                W.203b          3          3          1          0          0          0
+                W.203c          7          7          0          0     0.0424     0.0354
+                W.205a         12         12     0.0683      0.129     0.0715     0.0579
+                W.205b          1          1          1          0      0.016      0.016
+                W.205d         15         15          1          0    0.00256    0.00179
+                W.207a         13         13     0.0593     0.0769     0.0458     0.0335
+                W.207b         45         46      0.166      0.522      0.212      0.154
+                W.207c         17         17      0.141      0.235      0.134      0.117
+                 W.208          9          9          1          0    0.00907    0.00693
+                 W.209          3          3          0          0     0.0311     0.0255
+                 W.210          5          6          0          0    0.00699    0.00548
+                 W.219          2          2          1          0          0          0
+                W.221b          1          1          1          0    0.00578    0.00521
+                 W.224         66         66      0.229      0.727      0.304      0.243
+                 W.225         15         15     0.0226     0.0667     0.0363     0.0274
+                 W.227          5          5          1          0    0.00929    0.00715
+                 W.233          6          6          1          0    0.00653    0.00531
+                W.245a         37         37      0.213     0.0541      0.105     0.0769
+Speed: 2.4ms preprocess, 95.2ms inference, 0.0ms loss, 0.9ms postprocess per image
+Results saved to models\checkpoints\qat\phase1_weight_only
+2025-05-25 15:36:44,252 - yolov8_qat - INFO - Updating main model with best weights from models/checkpoints/qat\phase1_weight_only\weights\best.pt
+2025-05-25 15:36:44,287 - yolov8_qat - INFO - Applying QConfig and preparing model for phase1_weight_only
+2025-05-25 15:36:44,289 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 15:36:44,290 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 15:36:44,428 - yolov8_qat - INFO - Configuring model for phase1_weight_only
+2025-05-25 15:36:44,432 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 0 activation quantizers
+2025-05-25 15:36:44,433 - yolov8_qat - INFO - Successfully prepared model for QAT in phase1_weight_only
+2025-05-25 15:36:44,433 - yolov8_qat - INFO - Successfully updated main model with phase1_weight_only results
+2025-05-25 15:36:44,434 - yolov8_qat - INFO - Starting Phase 2: Adding activation quantization
+2025-05-25 15:36:44,434 - yolov8_qat - INFO - Configuring for activation quantization phase
+2025-05-25 15:36:44,437 - yolov8_qat - INFO - Enabled activation quantizers for 135 modules
+2025-05-25 15:36:44,438 - yolov8_qat - INFO - Enabled weight quantizers for 45 modules
+2025-05-25 15:36:44,440 - yolov8_qat - INFO - Phase 'activation_phase' configured with 45 active weight quantizers and 135 active activation quantizers
+2025-05-25 15:36:44,442 - yolov8_qat - INFO - Training phase2_activations for 2 epochs with lr=0.0005
+2025-05-25 15:36:44,442 - yolov8_qat - INFO - Found previous phase model: models/checkpoints/qat\phase1_weight_only\weights\best.pt
+2025-05-25 15:36:44,442 - yolov8_qat - INFO - Loading best model from previous phase: models/checkpoints/qat\phase1_weight_only\weights\best.pt
+2025-05-25 15:36:44,498 - yolov8_qat - INFO - Applying quantization configuration for phase2_activations
+2025-05-25 15:36:44,499 - yolov8_qat - INFO - Applying QConfig and preparing model for phase2_activations
+2025-05-25 15:36:44,501 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 15:36:44,501 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 15:36:44,633 - yolov8_qat - INFO - Configuring model for phase2_activations
+2025-05-25 15:36:44,636 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 135 activation quantizers
+2025-05-25 15:36:44,636 - yolov8_qat - INFO - Successfully prepared model for QAT in phase2_activations
+2025-05-25 15:36:44,638 - yolov8_qat - INFO - ✓ Quantization verification for phase2_activations:
+2025-05-25 15:36:44,639 - yolov8_qat - INFO -   - Weight quantizers: 45
+2025-05-25 15:36:44,639 - yolov8_qat - INFO -   - Activation quantizers: 135
+2025-05-25 15:36:44,639 - yolov8_qat - INFO -   - FakeQuantize modules: 90
+2025-05-25 15:36:44,639 - yolov8_qat - INFO - Starting training for phase2_activations
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+engine\trainer: agnostic_nms=False, amp=True, augment=False, auto_augment=randaugment, batch=16, bgr=0.0, box=7.5, cache=False, cfg=None, classes=None, close_mosaic=10, cls=0.5, conf=None, copy_paste=0.0, copy_paste_mode=flip, cos_lr=False, cutmix=0.0, data=datasets/vietnam-traffic-sign-detection/dataset.yaml, degrees=0.0, deterministic=True, device=cpu, dfl=1.5, dnn=False, dropout=0.0, dynamic=False, embed=None, epochs=2, erasing=0.4, exist_ok=True, fliplr=0.5, flipud=0.0, format=torchscript, fraction=1.0, freeze=None, half=False, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, imgsz=640, int8=False, iou=0.7, keras=False, kobj=1.0, line_width=None, lr0=0.0005, lrf=0.01, mask_ratio=4, max_det=300, mixup=0.0, mode=train, model=models/checkpoints/qat\phase1_weight_only\weights\best.pt, momentum=0.937, mosaic=1.0, multi_scale=False, name=phase2_activations, nbs=64, nms=False, opset=None, optimize=False, optimizer=auto, overlap_mask=True, patience=100, perspective=0.0, plots=True, pose=12.0, pretrained=False, profile=False, project=models/checkpoints/qat, rect=False, resume=False, retina_masks=False, save=True, save_conf=False, save_crop=False, save_dir=models\checkpoints\qat\phase2_activations, save_frames=False, save_json=False, save_period=-1, save_txt=False, scale=0.5, seed=0, shear=0.0, show=False, show_boxes=True, show_conf=True, show_labels=True, simplify=True, single_cls=False, source=None, split=val, stream_buffer=False, task=detect, time=None, tracker=botsort.yaml, translate=0.1, val=True, verbose=True, vid_stride=1, visualize=False, warmup_bias_lr=0.1, warmup_epochs=3.0, warmup_momentum=0.8, weight_decay=0.0005, workers=8, workspace=None
+
+                   from  n    params  module                                       arguments
+  0                  -1  1       464  ultralytics.nn.modules.conv.Conv             [3, 16, 3, 2]
+  1                  -1  1      4672  ultralytics.nn.modules.conv.Conv             [16, 32, 3, 2]
+  2                  -1  1      7360  ultralytics.nn.modules.block.C2f             [32, 32, 1, True]
+  3                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]
+  4                  -1  2     49664  ultralytics.nn.modules.block.C2f             [64, 64, 2, True]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+Model summary: 129 layers, 3,022,158 parameters, 3,022,142 gradients, 8.3 GFLOPs
+
+Transferred 355/355 items from pretrained weights
+Freezing layer 'model.22.dfl.conv.weight'
+train: Fast image access  (ping: 0.10.1 ms, read: 598.6211.1 MB/s, size: 74.0 KB)
+train: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\train\labels.cache... 9536 images, 465 backgrounds, 0 corrupt: 100%|██████████| 9536/9536 [00:00<?, ?it/s]
+albumentations: Blur(p=0.01, blur_limit=(3, 7)), MedianBlur(p=0.01, blur_limit=(3, 7)), ToGray(p=0.01, num_output_channels=3, method='weighted_average'), CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8))
+val: Fast image access  (ping: 0.00.0 ms, read: 654.6296.2 MB/s, size: 82.7 KB)
+val: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\valid\labels.cache... 784 images, 169 backgrounds, 0 corrupt: 100%|██████████| 784/784 [00:00<?, ?it/s]
+Plotting labels to models\checkpoints\qat\phase2_activations\labels.jpg... 
+optimizer: 'optimizer=auto' found, ignoring 'lr0=0.0005' and 'momentum=0.937' and determining best 'optimizer', 'lr0' and 'momentum' automatically... 
+optimizer: AdamW(lr=0.000161, momentum=0.9) with parameter groups 57 weight(decay=0.0), 64 weight(decay=0.0005), 63 bias(decay=0.0)
+Image sizes 640 train, 640 val
+Using 0 dataloader workers
+Logging results to models\checkpoints\qat\phase2_activations
+Starting training for 2 epochs...
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+        1/2         0G     0.7554      2.515     0.9148         43        640: 100%|██████████| 596/596 [51:38<00:00,  5.20s/it]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:52<00:00,  4.48s/it]
+                   all        784       1249      0.599      0.211      0.217       0.18
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+        2/2         0G      0.736       2.11     0.9074         47        640: 100%|██████████| 596/596 [47:16<00:00,  4.76s/it]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:32<00:00,  3.70s/it]
+                   all        784       1249      0.657      0.268      0.319      0.262
+
+2 epochs completed in 1.706 hours.
+Optimizer stripped from models\checkpoints\qat\phase2_activations\weights\last.pt, 6.3MB
+Optimizer stripped from models\checkpoints\qat\phase2_activations\weights\best.pt, 6.3MB
+
+Validating models\checkpoints\qat\phase2_activations\weights\best.pt...
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+Model summary (fused): 72 layers, 3,016,958 parameters, 0 gradients, 8.1 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:10<00:00,  2.83s/it]
+                   all        784       1249      0.657      0.269      0.319      0.262
+                DP.135          4          4          1          0      0.307      0.262
+                 P.102         48         50      0.914       0.62      0.691      0.571
+                P.103a         10         10      0.256        0.4      0.358      0.296
+                P.103b          1          1          1          0    0.00478    0.00335
+                P.103c         15         18      0.305      0.444      0.408      0.377
+                 P.104          9          9          1          0     0.0208     0.0167
+                P.106a         19         19      0.944      0.474      0.714      0.623
+                P.106b         15         23      0.472      0.826       0.77      0.658
+                 P.112          4          4          1          0      0.312      0.273
+                 P.115          3          3          1          0     0.0165      0.015
+                 P.117         21         27      0.656      0.283      0.472      0.346
+                P.123a          4          4     0.0078     0.0039      0.131      0.116
+                P.123b         15         18      0.449      0.333      0.359      0.312
+                P.124a         16         16      0.861      0.387      0.617      0.515
+                P.124c          5          5          1          0     0.0101    0.00754
+                 P.125          1          1          1          0          0          0
+                 P.127        125        249      0.859      0.799      0.852      0.658
+                 P.130        143        171      0.859      0.853      0.888      0.727
+                P.131a        150        155      0.861       0.91      0.917      0.747
+                 P.137          3          3          1          0    0.00403    0.00295
+                R.301c          3          3          1          0          0          0
+                R.301d          3          3      0.738      0.667      0.715      0.643
+                R.301e          5          5          1          0      0.204      0.181
+                R.302a         49         49      0.699      0.429       0.51      0.371
+                R.302b          6          6      0.732        0.5      0.627      0.541
+                 R.303         10         11      0.914      0.818      0.816      0.716
+                R.407a         11         11      0.446      0.545       0.53      0.455
+                 R.409         10         10      0.946        0.7      0.697      0.553
+                 R.425          1          1          1          0    0.00995    0.00895
+                 R.434         17         17      0.259      0.235      0.121     0.0822
+                S.509a         19         19      0.193      0.211      0.202      0.161
+                W.201a         28         30      0.295      0.667      0.353      0.261
+                W.201b         13         16      0.735      0.176      0.256      0.189
+                W.202a          7          7          0          0     0.0371     0.0277
+                W.202b          7          7          0          0     0.0696     0.0623
+                W.203b          3          3          1          0          0          0
+                W.203c          7          7          1          0     0.0614      0.054
+                W.205a         12         12      0.456      0.167      0.298      0.229
+                W.205b          1          1          1          0     0.0765     0.0765
+                W.205d         15         15          0          0     0.0542     0.0362
+                W.207a         13         13      0.193     0.0297      0.102     0.0822
+                W.207b         45         46      0.329      0.587       0.47       0.35
+                W.207c         17         17      0.318      0.647       0.52      0.414
+                 W.208          9          9      0.742      0.222      0.623       0.49
+                 W.209          3          3          0          0      0.107     0.0761
+                 W.210          5          6          0          0     0.0143     0.0105
+                 W.219          2          2          1          0          0          0
+                W.221b          1          1          1          0          0          0
+                 W.224         66         66       0.57      0.643      0.699      0.553
+                 W.225         15         15      0.325      0.133      0.249      0.215
+                 W.227          5          5          1          0     0.0206     0.0149
+                 W.233          6          6          1          0     0.0621     0.0473
+                W.245a         37         37      0.496      0.532      0.568      0.473
+Speed: 2.1ms preprocess, 80.8ms inference, 0.0ms loss, 0.7ms postprocess per image
+Results saved to models\checkpoints\qat\phase2_activations
+2025-05-25 17:20:25,693 - yolov8_qat - INFO - Updating main model with best weights from models/checkpoints/qat\phase2_activations\weights\best.pt
+2025-05-25 17:20:25,732 - yolov8_qat - INFO - Applying QConfig and preparing model for phase2_activations
+2025-05-25 17:20:25,734 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 17:20:25,734 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 17:20:25,870 - yolov8_qat - INFO - Configuring model for phase2_activations
+2025-05-25 17:20:25,873 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 135 activation quantizers
+2025-05-25 17:20:25,874 - yolov8_qat - INFO - Successfully prepared model for QAT in phase2_activations
+2025-05-25 17:20:25,874 - yolov8_qat - INFO - Successfully updated main model with phase2_activations results
+2025-05-25 17:20:25,875 - yolov8_qat - INFO - Starting Phase 3: Full network quantization
+2025-05-25 17:20:25,875 - yolov8_qat - INFO - Configuring for full network quantization phase
+2025-05-25 17:20:25,876 - yolov8_qat - INFO - Enabled weight quantizers for 45 modules
+2025-05-25 17:20:25,878 - yolov8_qat - INFO - Enabled activation quantizers for 135 modules
+2025-05-25 17:20:25,880 - yolov8_qat - INFO - Phase 'full_quantization' configured with 45 active weight quantizers and 135 active activation quantizers
+2025-05-25 17:20:25,881 - yolov8_qat - INFO - Training phase3_full_quant for 1 epochs with lr=0.0005
+2025-05-25 17:20:25,881 - yolov8_qat - INFO - Found previous phase model: models/checkpoints/qat\phase2_activations\weights\best.pt
+2025-05-25 17:20:25,882 - yolov8_qat - INFO - Loading best model from previous phase: models/checkpoints/qat\phase2_activations\weights\best.pt
+2025-05-25 17:20:25,927 - yolov8_qat - INFO - Applying quantization configuration for phase3_full_quant
+2025-05-25 17:20:25,928 - yolov8_qat - INFO - Applying QConfig and preparing model for phase3_full_quant
+2025-05-25 17:20:25,930 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 17:20:25,930 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 17:20:26,081 - yolov8_qat - INFO - Configuring model for phase3_full_quant
+2025-05-25 17:20:26,083 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 135 activation quantizers
+2025-05-25 17:20:26,083 - yolov8_qat - INFO - Successfully prepared model for QAT in phase3_full_quant
+2025-05-25 17:20:26,085 - yolov8_qat - INFO - ✓ Quantization verification for phase3_full_quant:
+2025-05-25 17:20:26,086 - yolov8_qat - INFO -   - Weight quantizers: 45
+2025-05-25 17:20:26,086 - yolov8_qat - INFO -   - Activation quantizers: 135
+2025-05-25 17:20:26,086 - yolov8_qat - INFO -   - FakeQuantize modules: 90
+2025-05-25 17:20:26,086 - yolov8_qat - INFO - Starting training for phase3_full_quant
+New https://pypi.org/project/ultralytics/8.3.144 available  Update with 'pip install -U ultralytics'
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+engine\trainer: agnostic_nms=False, amp=True, augment=False, auto_augment=randaugment, batch=16, bgr=0.0, box=7.5, cache=False, cfg=None, classes=None, close_mosaic=10, cls=0.5, conf=None, copy_paste=0.0, copy_paste_mode=flip, cos_lr=False, cutmix=0.0, data=datasets/vietnam-traffic-sign-detection/dataset.yaml, degrees=0.0, deterministic=True, device=cpu, dfl=1.5, dnn=False, dropout=0.0, dynamic=False, embed=None, epochs=1, erasing=0.4, exist_ok=True, fliplr=0.5, flipud=0.0, format=torchscript, fraction=1.0, freeze=None, half=False, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, imgsz=640, int8=False, iou=0.7, keras=False, kobj=1.0, line_width=None, lr0=0.0005, lrf=0.01, mask_ratio=4, max_det=300, mixup=0.0, mode=train, model=models/checkpoints/qat\phase2_activations\weights\best.pt, momentum=0.937, mosaic=1.0, multi_scale=False, name=phase3_full_quant, nbs=64, nms=False, opset=None, optimize=False, optimizer=auto, overlap_mask=True, patience=100, perspective=0.0, plots=True, pose=12.0, pretrained=False, profile=False, project=models/checkpoints/qat, rect=False, resume=False, retina_masks=False, save=True, save_conf=False, save_crop=False, save_dir=models\checkpoints\qat\phase3_full_quant, save_frames=False, save_json=False, save_period=-1, save_txt=False, scale=0.5, seed=0, shear=0.0, show=False, show_boxes=True, show_conf=True, show_labels=True, simplify=True, single_cls=False, source=None, split=val, stream_buffer=False, task=detect, time=None, tracker=botsort.yaml, translate=0.1, val=True, verbose=True, vid_stride=1, visualize=False, warmup_bias_lr=0.1, warmup_epochs=3.0, warmup_momentum=0.8, weight_decay=0.0005, workers=8, workspace=None
+
+                   from  n    params  module                                       arguments
+  0                  -1  1       464  ultralytics.nn.modules.conv.Conv             [3, 16, 3, 2]
+  1                  -1  1      4672  ultralytics.nn.modules.conv.Conv             [16, 32, 3, 2]
+  2                  -1  1      7360  ultralytics.nn.modules.block.C2f             [32, 32, 1, True]
+  3                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]
+  4                  -1  2     49664  ultralytics.nn.modules.block.C2f             [64, 64, 2, True]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+
+                   from  n    params  module                                       arguments
+  0                  -1  1       464  ultralytics.nn.modules.conv.Conv             [3, 16, 3, 2]
+  1                  -1  1      4672  ultralytics.nn.modules.conv.Conv             [16, 32, 3, 2]
+  2                  -1  1      7360  ultralytics.nn.modules.block.C2f             [32, 32, 1, True]
+  3                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]
+  4                  -1  2     49664  ultralytics.nn.modules.block.C2f             [64, 64, 2, True]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+  3                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]
+  4                  -1  2     49664  ultralytics.nn.modules.block.C2f             [64, 64, 2, True]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+Model summary: 129 layers, 3,022,158 parameters, 3,022,142 gradients, 8.3 GFLOPs
+
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+Model summary: 129 layers, 3,022,158 parameters, 3,022,142 gradients, 8.3 GFLOPs
+
+Transferred 355/355 items from pretrained weights
+
+Transferred 355/355 items from pretrained weights
+Transferred 355/355 items from pretrained weights
+Freezing layer 'model.22.dfl.conv.weight'
+train: Fast image access  (ping: 0.10.1 ms, read: 591.6234.9 MB/s, size: 74.0 KB)
+Freezing layer 'model.22.dfl.conv.weight'
+train: Fast image access  (ping: 0.10.1 ms, read: 591.6234.9 MB/s, size: 74.0 KB)
+train: Fast image access  (ping: 0.10.1 ms, read: 591.6234.9 MB/s, size: 74.0 KB)
+train: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\train\labels.cache... 9536 images, 465 backgrounds, 0 corrupt: 100%|██████████| 9536/9536 [00:00<?, ?it/s]
+albumentations: Blur(p=0.01, blur_limit=(3, 7)), MedianBlur(p=0.01, blur_limit=(3, 7)), ToGray(p=0.01, num_output_channels=3, method='weighted_average'), CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8))
+val: Fast image access  (ping: 0.00.0 ms, read: 753.0219.8 MB/s, size: 82.7 KB)
+val: Fast image access  (ping: 0.00.0 ms, read: 753.0219.8 MB/s, size: 82.7 KB)
+val: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\valid\labels.cache... 784 images, 169 backgrounds, 0 corrupt: 100%|██████████| 784/784 [00:00<?, ?it/s]
+Plotting labels to models\checkpoints\qat\phase3_full_quant\labels.jpg...
+optimizer: 'optimizer=auto' found, ignoring 'lr0=0.0005' and 'momentum=0.937' and determining best 'optimizer', 'lr0' and 'momentum' automatically...
+optimizer: AdamW(lr=0.000161, momentum=0.9) with parameter groups 57 weight(decay=0.0), 64 weight(decay=0.0005), 63 bias(decay=0.0)
+Image sizes 640 train, 640 val
+Using 0 dataloader workers
+Logging results to models\checkpoints\qat\phase3_full_quant
+Starting training for 1 epochs...
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+        1/1         0G     0.6757      1.808     0.8897         43        640: 100%|██████████| 596/596 [45:11<00:00,  4.55s/it]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:38<00:00,  3.93s/it]
+                   all        784       1249      0.637       0.33      0.376      0.309
+
+1 epochs completed in 0.782 hours.
+Optimizer stripped from models\checkpoints\qat\phase3_full_quant\weights\last.pt, 6.3MB
+Optimizer stripped from models\checkpoints\qat\phase3_full_quant\weights\best.pt, 6.3MB
+
+Validating models\checkpoints\qat\phase3_full_quant\weights\best.pt...
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+Model summary (fused): 72 layers, 3,016,958 parameters, 0 gradients, 8.1 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:15<00:00,  3.03s/it]
+                   all        784       1249      0.635      0.333      0.376      0.309
+                DP.135          4          4      0.865       0.75      0.769      0.623
+                 P.102         48         50      0.901      0.544      0.699      0.554
+                P.103a         10         10      0.499      0.399      0.324      0.305
+                P.103b          1          1          1          0    0.00348    0.00244
+                P.103c         15         18      0.535      0.444      0.466      0.417
+                 P.104          9          9      0.822      0.111      0.135      0.118
+                P.106a         19         19      0.592      0.686       0.74      0.665
+                P.106b         15         23      0.828      0.835      0.892      0.743
+                 P.112          4          4       0.56        0.5      0.528       0.45
+                 P.115          3          3          1          0     0.0264     0.0243
+                 P.117         21         27      0.808      0.312      0.551      0.383
+                P.123a          4          4      0.255      0.128      0.129      0.116
+                P.123b         15         18      0.533      0.222      0.443      0.392
+                P.124a         16         16      0.579      0.688      0.705      0.598
+                P.124c          5          5          1          0     0.0133     0.0124
+                 P.125          1          1          0          0          0          0
+                 P.127        125        249      0.861      0.819      0.867      0.669
+                 P.130        143        171      0.912      0.865      0.902      0.725
+                P.131a        150        155      0.889       0.93      0.924       0.76
+                 P.137          3          3          0          0     0.0245     0.0178
+                R.301c          3          3          1          0    0.00878    0.00614
+                R.301d          3          3      0.727          1      0.913      0.855
+                R.301e          5          5          1          0      0.201       0.18
+                R.302a         49         49      0.789      0.458      0.614      0.445
+                R.302b          6          6      0.564        0.5       0.53       0.48
+                 R.303         10         11      0.912      0.818      0.816      0.712
+                R.407a         11         11       0.83      0.727       0.79      0.684
+                 R.409         10         10          1      0.626      0.698      0.563
+                 R.425          1          1          1          0     0.0829     0.0829
+                 R.434         17         17      0.248      0.294      0.129     0.0891
+                S.509a         19         19      0.351      0.158      0.223      0.173
+                W.201a         28         30      0.602      0.555      0.528      0.363
+                W.201b         13         16      0.214      0.375       0.29      0.189
+                W.202a          7          7          0          0     0.0726     0.0581
+                W.202b          7          7      0.194      0.143      0.141      0.127
+                W.203b          3          3          1          0    0.00185    0.00111
+                W.203c          7          7          1          0     0.0865     0.0784
+                W.205a         12         12      0.455      0.417      0.571      0.467
+                W.205b          1          1          1          0      0.332      0.298
+                W.205d         15         15          0          0     0.0946     0.0615
+                W.207a         13         13      0.207      0.231      0.211      0.176
+                W.207b         45         46      0.549      0.413      0.539      0.406
+                W.207c         17         17      0.404      0.235      0.354      0.284
+                 W.208          9          9      0.934      0.667      0.732      0.558
+                 W.209          3          3          1          0      0.107     0.0757
+                 W.210          5          6          0          0     0.0154     0.0113
+                 W.219          2          2          1          0          0          0
+                W.221b          1          1          0          0          0          0
+                 W.224         66         66      0.607      0.866      0.803      0.645
+                 W.225         15         15      0.198      0.333      0.248      0.219
+                 W.227          5          5          1          0      0.101     0.0707
+                 W.233          6          6          1          0     0.0286     0.0218
+                W.245a         37         37      0.455      0.595      0.534      0.411
+Speed: 2.3ms preprocess, 86.6ms inference, 0.0ms loss, 0.7ms postprocess per image
+Results saved to models\checkpoints\qat\phase3_full_quant
+2025-05-25 18:08:44,557 - yolov8_qat - INFO - Updating main model with best weights from models/checkpoints/qat\phase3_full_quant\weights\best.pt
+2025-05-25 18:08:44,595 - yolov8_qat - INFO - Applying QConfig and preparing model for phase3_full_quant
+2025-05-25 18:08:44,597 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 18:08:44,597 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 18:08:44,729 - yolov8_qat - INFO - Configuring model for phase3_full_quant
+2025-05-25 18:08:44,731 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 135 activation quantizers
+2025-05-25 18:08:44,731 - yolov8_qat - INFO - Successfully prepared model for QAT in phase3_full_quant
+2025-05-25 18:08:44,732 - yolov8_qat - INFO - Successfully updated main model with phase3_full_quant results
+2025-05-25 18:08:44,733 - yolov8_qat - INFO - Starting Phase 4: Fine-tuning
+2025-05-25 18:08:44,733 - yolov8_qat - INFO - Configuring for fine-tuning phase
+2025-05-25 18:08:44,735 - yolov8_qat - INFO - Enabled weight quantizers for 45 modules
+2025-05-25 18:08:44,737 - yolov8_qat - INFO - Enabled activation quantizers for 135 modules
+2025-05-25 18:08:44,739 - yolov8_qat - INFO - Phase 'fine_tuning' configured with 45 active weight quantizers and 135 active activation quantizers
+2025-05-25 18:08:44,740 - yolov8_qat - INFO - Training phase4_fine_tuning for 1 epochs with lr=5e-05
+2025-05-25 18:08:44,740 - yolov8_qat - INFO - Found previous phase model: models/checkpoints/qat\phase3_full_quant\weights\best.pt
+2025-05-25 18:08:44,741 - yolov8_qat - INFO - Loading best model from previous phase: models/checkpoints/qat\phase3_full_quant\weights\best.pt
+2025-05-25 18:08:44,780 - yolov8_qat - INFO - Applying quantization configuration for phase4_fine_tuning
+2025-05-25 18:08:44,781 - yolov8_qat - INFO - Applying QConfig and preparing model for phase4_fine_tuning
+2025-05-25 18:08:44,783 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 18:08:44,784 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 18:08:44,917 - yolov8_qat - INFO - Configuring model for phase4_fine_tuning
+2025-05-25 18:08:44,920 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 135 activation quantizers
+2025-05-25 18:08:44,920 - yolov8_qat - INFO - Successfully prepared model for QAT in phase4_fine_tuning
+2025-05-25 18:08:44,923 - yolov8_qat - INFO - ✓ Quantization verification for phase4_fine_tuning:
+2025-05-25 18:08:44,923 - yolov8_qat - INFO -   - Weight quantizers: 45
+2025-05-25 18:08:44,924 - yolov8_qat - INFO -   - Activation quantizers: 135
+2025-05-25 18:08:44,924 - yolov8_qat - INFO -   - FakeQuantize modules: 90
+2025-05-25 18:08:44,924 - yolov8_qat - INFO - Starting training for phase4_fine_tuning
+New https://pypi.org/project/ultralytics/8.3.144 available  Update with 'pip install -U ultralytics'
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+engine\trainer: agnostic_nms=False, amp=True, augment=False, auto_augment=randaugment, batch=16, bgr=0.0, box=7.5, cache=False, cfg=None, classes=None, close_mosaic=10, cls=0.5, conf=None, copy_paste=0.0, copy_paste_mode=flip, cos_lr=False, cutmix=0.0, data=datasets/vietnam-traffic-sign-detection/dataset.yaml, degrees=0.0, deterministic=True, device=cpu, dfl=1.5, dnn=False, dropout=0.0, dynamic=False, embed=None, epochs=1, erasing=0.4, exist_ok=True, fliplr=0.5, flipud=0.0, format=torchscript, fraction=1.0, freeze=None, half=False, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, imgsz=640, int8=False, iou=0.7, keras=False, kobj=1.0, line_width=None, lr0=5e-05, lrf=0.01, mask_ratio=4, max_det=300, mixup=0.0, mode=train, model=models/checkpoints/qat\phase3_full_quant\weights\best.pt, momentum=0.937, mosaic=1.0, multi_scale=False, name=phase4_fine_tuning, nbs=64, nms=False, opset=None, optimize=False, optimizer=auto, overlap_mask=True, patience=100, perspective=0.0, plots=True, pose=12.0, pretrained=False, profile=False, project=models/checkpoints/qat, rect=False, resume=False, retina_masks=False, save=True, save_conf=False, save_crop=False, save_dir=models\checkpoints\qat\phase4_fine_tuning, save_frames=False, save_json=False, save_period=-1, save_txt=False, scale=0.5, seed=0, shear=0.0, show=False, show_boxes=True, show_conf=True, show_labels=True, simplify=True, single_cls=False, source=None, split=val, stream_buffer=False, task=detect, time=None, tracker=botsort.yaml, translate=0.1, val=True, verbose=True, vid_stride=1, visualize=False, warmup_bias_lr=0.1, warmup_epochs=3.0, warmup_momentum=0.8, weight_decay=0.0005, workers=8, workspace=None
+
+                   from  n    params  module                                       arguments
+  0                  -1  1       464  ultralytics.nn.modules.conv.Conv             [3, 16, 3, 2]
+  1                  -1  1      4672  ultralytics.nn.modules.conv.Conv             [16, 32, 3, 2]
+  2                  -1  1      7360  ultralytics.nn.modules.block.C2f             [32, 32, 1, True]
+  3                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]
+  4                  -1  2     49664  ultralytics.nn.modules.block.C2f             [64, 64, 2, True]
+  5                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]
+  6                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]
+  7                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]
+  8                  -1  1    460288  ultralytics.nn.modules.block.C2f             [256, 256, 1, True]
+  9                  -1  1    164608  ultralytics.nn.modules.block.SPPF            [256, 256, 5]
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 12                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 15                  -1  1     37248  ultralytics.nn.modules.block.C2f             [192, 64, 1]
+ 16                  -1  1     36992  ultralytics.nn.modules.conv.Conv             [64, 64, 3, 2]
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 18                  -1  1    123648  ultralytics.nn.modules.block.C2f             [192, 128, 1]
+ 19                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]
+ 21                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]
+ 22        [15, 18, 21]  1    762622  ultralytics.nn.modules.head.Detect           [58, [64, 128, 256]]
+Model summary: 129 layers, 3,022,158 parameters, 3,022,142 gradients, 8.3 GFLOPs
+
+Transferred 355/355 items from pretrained weights
+Freezing layer 'model.22.dfl.conv.weight'
+train: Fast image access  (ping: 0.10.1 ms, read: 457.8275.3 MB/s, size: 74.0 KB)
+train: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\train\labels.cache... 9536 images, 465 backgrounds, 0 corrupt: 100%|██████████| 9536/9536 [00:00<?, ?it/s]
+albumentations: Blur(p=0.01, blur_limit=(3, 7)), MedianBlur(p=0.01, blur_limit=(3, 7)), ToGray(p=0.01, num_output_channels=3, method='weighted_average'), CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8))
+val: Fast image access  (ping: 0.00.0 ms, read: 773.7370.1 MB/s, size: 82.7 KB)
+val: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\valid\labels.cache... 784 images, 169 backgrounds, 0 corrupt: 100%|██████████| 784/784 [00:00<?, ?it/s]
+Plotting labels to models\checkpoints\qat\phase4_fine_tuning\labels.jpg... 
+optimizer: 'optimizer=auto' found, ignoring 'lr0=5e-05' and 'momentum=0.937' and determining best 'optimizer', 'lr0' and 'momentum' automatically... 
+optimizer: AdamW(lr=0.000161, momentum=0.9) with parameter groups 57 weight(decay=0.0), 64 weight(decay=0.0005), 63 bias(decay=0.0)
+Image sizes 640 train, 640 val
+Using 0 dataloader workers
+Logging results to models\checkpoints\qat\phase4_fine_tuning
+Starting training for 1 epochs...
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+        1/1         0G     0.6291      1.552     0.8755         43        640: 100%|██████████| 596/596 [44:18<00:00,  4.46s/it]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:28<00:00,  3.56s/it]
+                   all        784       1249      0.515      0.428      0.446      0.367
+
+1 epochs completed in 0.764 hours.
+Optimizer stripped from models\checkpoints\qat\phase4_fine_tuning\weights\last.pt, 6.3MB
+Optimizer stripped from models\checkpoints\qat\phase4_fine_tuning\weights\best.pt, 6.3MB
+
+Validating models\checkpoints\qat\phase4_fine_tuning\weights\best.pt...
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+Model summary (fused): 72 layers, 3,016,958 parameters, 0 gradients, 8.1 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 25/25 [01:07<00:00,  2.72s/it]
+                   all        784       1249      0.516      0.427      0.446      0.367
+                DP.135          4          4      0.756       0.75       0.87      0.779
+                 P.102         48         50      0.662       0.72      0.721      0.558
+                P.103a         10         10      0.265        0.5      0.458      0.392
+                P.103b          1          1          1          0          0          0
+                P.103c         15         18      0.481        0.5      0.526      0.471
+                 P.104          9          9      0.584      0.111      0.146      0.125
+                P.106a         19         19      0.527      0.789      0.781      0.685
+                P.106b         15         23      0.714       0.87      0.904      0.754
+                 P.112          4          4      0.214        0.5      0.546      0.429
+                 P.115          3          3          1          0     0.0328     0.0301
+                 P.117         21         27      0.748      0.519      0.642      0.453
+                P.123a          4          4      0.373       0.25      0.132      0.119
+                P.123b         15         18      0.478      0.358      0.543      0.477
+                P.124a         16         16      0.605      0.812      0.838        0.7
+                P.124c          5          5          1          0     0.0176     0.0162
+                 P.125          1          1          0          0          0          0
+                 P.127        125        249      0.824      0.839      0.867      0.666
+                 P.130        143        171      0.827      0.877      0.908      0.729
+                P.131a        150        155      0.739      0.974      0.942      0.771
+                 P.137          3          3          0          0     0.0958      0.067
+                R.301c          3          3          1          0     0.0857     0.0514
+                R.301d          3          3      0.491          1      0.995      0.929
+                R.301e          5          5      0.721        0.2      0.208      0.184
+                R.302a         49         49      0.692      0.531      0.678      0.499
+                R.302b          6          6      0.512        0.5      0.556      0.495
+                 R.303         10         11      0.725      0.818      0.817      0.718
+                R.407a         11         11      0.775      0.818      0.857      0.734
+                 R.409         10         10       0.98        0.7      0.698      0.571
+                 R.425          1          1          0          0      0.199      0.199
+                 R.434         17         17      0.258      0.294      0.152      0.109
+                S.509a         19         19      0.226      0.368      0.346       0.27
+                W.201a         28         30      0.548        0.7      0.567       0.41
+                W.201b         13         16      0.105      0.472      0.312      0.217
+                W.202a          7          7          0          0        0.1     0.0803
+                W.202b          7          7      0.244      0.286      0.231      0.203
+                W.203b          3          3          1          0    0.00976    0.00339
+                W.203c          7          7          0          0     0.0649     0.0552
+                W.205a         12         12      0.897      0.728      0.803      0.651
+                W.205b          1          1      0.484          1      0.995      0.995
+                W.205d         15         15      0.146      0.133      0.145     0.0912
+                W.207a         13         13      0.176      0.462      0.218      0.185
+                W.207b         45         46      0.537      0.543      0.583      0.434
+                W.207c         17         17      0.328      0.518      0.354      0.289
+                 W.208          9          9      0.751      0.667      0.775      0.592
+                 W.209          3          3          1      0.392      0.863      0.641
+                 W.210          5          6          0          0     0.0235     0.0165
+                 W.219          2          2          1          0          0          0
+                W.221b          1          1          0          0          0          0
+                 W.224         66         66      0.489      0.894      0.833      0.668
+                 W.225         15         15      0.144      0.467      0.354      0.323
+                 W.227          5          5          1          0      0.199       0.14
+                 W.233          6          6          0          0      0.042     0.0304
+                W.245a         37         37       0.33      0.757      0.589      0.449
+Speed: 2.0ms preprocess, 77.7ms inference, 0.0ms loss, 0.7ms postprocess per image
+Results saved to models\checkpoints\qat\phase4_fine_tuning
+2025-05-25 18:55:51,363 - yolov8_qat - INFO - Updating main model with best weights from models/checkpoints/qat\phase4_fine_tuning\weights\best.pt
+2025-05-25 18:55:51,398 - yolov8_qat - INFO - Applying QConfig and preparing model for phase4_fine_tuning
+2025-05-25 18:55:51,400 - yolov8_qat - INFO - Disabled quantization for 53 detection modules
+2025-05-25 18:55:51,400 - yolov8_qat - INFO - Applied qconfig to 64 modules
+2025-05-25 18:55:51,521 - yolov8_qat - INFO - Configuring model for phase4_fine_tuning
+2025-05-25 18:55:51,523 - yolov8_qat - INFO - Configured model with 45 weight quantizers and 135 activation quantizers
+2025-05-25 18:55:51,523 - yolov8_qat - INFO - Successfully prepared model for QAT in phase4_fine_tuning
+2025-05-25 18:55:51,523 - yolov8_qat - INFO - Successfully updated main model with phase4_fine_tuning results
+2025-05-25 18:55:51,525 - train_qat - INFO - ✓ QAT training completed successfully
+2025-05-25 18:55:51,525 - train_qat - INFO - Converting QAT model to quantized INT8 model...
+2025-05-25 18:55:51,525 - yolov8_qat - INFO - Converting QAT model to quantized INT8 model...
+2025-05-25 18:55:51,525 - utils - INFO - Creating a copy of the model...
+2025-05-25 18:55:51,597 - utils - INFO - Converting QAT model to quantized model...
+F:\kltn-prj\venv\lib\site-packages\torch\ao\quantization\observer.py:1289: UserWarning: must run observer before calling calculate_qparams.                                    Returning default scale and zero point 
+  warnings.warn(
+F:\kltn-prj\venv\lib\site-packages\torch\ao\quantization\utils.py:376: UserWarning: must run observer before calling calculate_qparams. Returning default values.
+  warnings.warn(
+2025-05-25 18:55:51,762 - utils - INFO - Model successfully converted to INT8
+2025-05-25 18:55:51,765 - yolov8_qat - INFO - Model size comparison:
+2025-05-25 18:55:51,765 - yolov8_qat - INFO -   Original FP32 model: 12.08 MB
+2025-05-25 18:55:51,765 - yolov8_qat - INFO -   Quantized INT8 model: 2.98 MB
+2025-05-25 18:55:51,765 - yolov8_qat - INFO -   Compression ratio: 4.05x
+2025-05-25 18:55:51,765 - yolov8_qat - INFO -   Size reduction: 75.31%
+2025-05-25 18:55:51,766 - yolov8_qat - INFO - Quantization analysis:
+2025-05-25 18:55:51,766 - yolov8_qat - INFO -   Quantized modules: 0 / 225
+2025-05-25 18:55:51,766 - yolov8_qat - INFO -   Quantization ratio: 0.00
+2025-05-25 18:55:51,813 - src.quantization.utils - INFO - Quantized model saved to models/checkpoints/qat\quantized_model.pt
+2025-05-25 18:55:51,813 - yolov8_qat - INFO - Quantized model saved to models/checkpoints/qat\quantized_model.pt
+2025-05-25 18:55:51,814 - train_qat - INFO - ✓ Model conversion completed successfully
+2025-05-25 18:55:51,814 - train_qat - INFO - Analyzing quantization effects...
+2025-05-25 18:55:51,815 - train_qat - INFO - Quantization ratio: 0.00
+2025-05-25 18:55:51,815 - train_qat - INFO - Quantized modules: 0 / 225
+2025-05-25 18:55:51,818 - train_qat - INFO - FP32 model size: 12.08 MB
+2025-05-25 18:55:51,818 - train_qat - INFO - INT8 model size: 2.98 MB
+2025-05-25 18:55:51,818 - train_qat - INFO - Compression ratio: 4.05x
+2025-05-25 18:55:51,818 - train_qat - INFO - Size reduction: 75.31%
+2025-05-25 18:55:51,820 - train_qat - INFO - Analysis results saved to models/checkpoints/qat\quantization_analysis.yaml
+2025-05-25 18:55:51,820 - yolov8_qat - INFO - Evaluating model on datasets/vietnam-traffic-sign-detection/dataset.yaml...
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+Model summary (fused): 72 layers, 3,016,958 parameters, 0 gradients, 8.1 GFLOPs
+val: Fast image access  (ping: 0.00.0 ms, read: 600.4224.8 MB/s, size: 67.3 KB)
+val: Scanning F:\kltn-prj\datasets\vietnam-traffic-sign-detection\valid\labels.cache... 784 images, 169 backgrounds, 0 corrupt: 100%|██████████| 784/784 [00:00<?, ?it/s]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 49/49 [00:55<00:00,  1.13s/it]
+                   all        784       1249      0.516      0.427      0.446      0.367
+                DP.135          4          4      0.756       0.75       0.87      0.779
+                 P.102         48         50      0.662       0.72      0.721      0.558
+                P.103a         10         10      0.265        0.5      0.458      0.392
+                P.103b          1          1          1          0          0          0
+                P.103c         15         18      0.481        0.5      0.526      0.471
+                 P.104          9          9      0.584      0.111      0.146      0.125
+                P.106a         19         19      0.527      0.789      0.781      0.685
+                P.106b         15         23      0.714       0.87      0.904      0.754
+                 P.112          4          4      0.214        0.5      0.546      0.429
+                 P.115          3          3          1          0     0.0328     0.0301
+                 P.117         21         27      0.748      0.519      0.642      0.453
+                P.123a          4          4      0.373       0.25      0.132      0.119
+                P.123b         15         18      0.478      0.358      0.543      0.477
+                P.124a         16         16      0.605      0.812      0.838        0.7
+                P.124c          5          5          1          0     0.0176     0.0162
+                 P.125          1          1          0          0          0          0
+                 P.127        125        249      0.824      0.839      0.867      0.666
+                 P.130        143        171      0.827      0.877      0.908      0.729
+                P.131a        150        155      0.739      0.974      0.942      0.771
+                 P.137          3          3          0          0     0.0958      0.067
+                R.301c          3          3          1          0     0.0857     0.0514
+                R.301d          3          3      0.491          1      0.995      0.929
+                R.301e          5          5      0.721        0.2      0.208      0.184
+                R.302a         49         49      0.692      0.531      0.678      0.499
+                R.302b          6          6      0.512        0.5      0.556      0.495
+                 R.303         10         11      0.725      0.818      0.817      0.718
+                R.407a         11         11      0.775      0.818      0.857      0.734
+                 R.409         10         10       0.98        0.7      0.698      0.571
+                 R.425          1          1          0          0      0.199      0.199
+                 R.434         17         17      0.258      0.294      0.152      0.109
+                S.509a         19         19      0.226      0.368      0.346       0.27
+                W.201a         28         30      0.548        0.7      0.567       0.41
+                W.201b         13         16      0.105      0.472      0.312      0.217
+                W.202a          7          7          0          0        0.1     0.0803
+                W.202b          7          7      0.244      0.286      0.231      0.203
+                W.203b          3          3          1          0    0.00976    0.00339
+                W.203c          7          7          0          0     0.0649     0.0552
+                W.205a         12         12      0.897      0.728      0.803      0.651
+                W.205b          1          1      0.484          1      0.995      0.995
+                W.205d         15         15      0.146      0.133      0.145     0.0912
+                W.207a         13         13      0.176      0.462      0.218      0.185
+                W.207b         45         46      0.537      0.543      0.583      0.434
+                W.207c         17         17      0.328      0.518      0.354      0.289
+                 W.208          9          9      0.751      0.667      0.775      0.592
+                 W.209          3          3          1      0.392      0.863      0.641
+                 W.210          5          6          0          0     0.0235     0.0165
+                 W.219          2          2          1          0          0          0
+                W.221b          1          1          0          0          0          0
+                 W.224         66         66      0.489      0.894      0.833      0.668
+                 W.225         15         15      0.144      0.467      0.354      0.323
+                 W.227          5          5          1          0      0.199       0.14
+                 W.233          6          6          0          0      0.042     0.0304
+                W.245a         37         37       0.33      0.757      0.589      0.449
+Speed: 1.3ms preprocess, 63.4ms inference, 0.0ms loss, 0.6ms postprocess per image
+Results saved to runs\detect\val10
+2025-05-25 18:56:50,044 - train_qat - INFO - Evaluation results:
+2025-05-25 18:56:50,044 - train_qat - INFO -   mAP50: 0.4457
+2025-05-25 18:56:50,044 - train_qat - INFO -   mAP50-95: 0.3671
+2025-05-25 18:56:50,045 - train_qat - INFO - Exporting model to models/exported\onnx\quantized_model.onnx
+2025-05-25 18:56:50,045 - yolov8_qat - INFO - Exporting model to onnx format...
+Ultralytics 8.3.131  Python-3.8.10 torch-2.4.1+cpu CPU (11th Gen Intel Core(TM) i5-11400H 2.70GHz)
+
+PyTorch: starting from 'models\checkpoints\qat\phase4_fine_tuning\weights\best.pt' with input shape (1, 3, 640, 640) BCHW and output shape(s) (1, 62, 8400) (6.0 MB)
+
+ONNX: starting export with onnx 1.17.0 opset 12...
+ONNX: slimming with onnxslim 0.1.53...
+ONNX: export success  1.3s, saved as 'models\checkpoints\qat\phase4_fine_tuning\weights\best.onnx' (11.7 MB)
+
+Export complete (1.5s)
+Results saved to F:\kltn-prj\models\checkpoints\qat\phase4_fine_tuning\weights
+Predict:         yolo predict task=detect model=models\checkpoints\qat\phase4_fine_tuning\weights\best.onnx imgsz=640
+Validate:        yolo val task=detect model=models\checkpoints\qat\phase4_fine_tuning\weights\best.onnx imgsz=640 data=datasets/vietnam-traffic-sign-detection/dataset.yaml
+Visualize:       https://netron.app
+2025-05-25 18:56:51,502 - yolov8_qat - INFO - Model exported to models\checkpoints\qat\phase4_fine_tuning\weights\best.onnx
+2025-05-25 18:56:51,503 - train_qat - INFO - Export to onnx completed successfully
+2025-05-25 18:56:51,503 - train_qat - INFO - YOLOv8 QAT training completed
+2025-05-25 18:56:51,503 - train_qat - INFO - Quantized model saved to models/checkpoints/qat\quantized_model.pt
+(venv) PS F:\kltn-prj>
