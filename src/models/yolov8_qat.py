@@ -18,9 +18,6 @@ import copy
 # Import PyTorch quantization modules
 from torch.quantization import prepare_qat, convert, get_default_qconfig
 
-# Import PyTorch quantization modules
-from torch.quantization import prepare_qat, convert, get_default_qconfig
-
 # Setup logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
