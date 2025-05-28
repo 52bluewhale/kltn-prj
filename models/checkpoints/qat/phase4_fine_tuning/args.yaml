@@ -2,10 +2,10 @@ task: detect
 mode: train
 model: models/checkpoints/qat\phase3_full_quant\weights\best.pt
 data: datasets/vietnam-traffic-sign-detection/dataset.yaml
-epochs: 1
+epochs: -1
 time: null
 patience: 100
-batch: 16
+batch: 8
 imgsz: 640
 save: true
 save_period: -1

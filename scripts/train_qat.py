@@ -190,6 +190,9 @@ def parse_args():
                       help='output model name')
     parser.add_argument('--log-dir', type=str, default='logs/qat',
                       help='directory to save logs')
+    # ADD this new argument
+    parser.add_argument('--no-convert', action='store_true',
+                      help='skip INT8 conversion, keep QAT model only')
     
     # Hardware parameters
     parser.add_argument('--device', type=str, default=DEVICE,
@@ -451,6 +454,82 @@ def analyze_mixed_precision_model(model):
         'total_layers': sum(bit_width_counts.values())
     }
 
+# ==============================================================================
+# ADD verification function before main()
+# ==============================================================================
+
+def verify_qat_model_file(model_path):
+    """Verify that a saved model file contains quantization."""
+    logger.info(f"Verifying QAT model file: {model_path}")
+    
+    if not os.path.exists(model_path):
+        logger.error(f"❌ Model file does not exist: {model_path}")
+        return False
+    
+    try:
+        saved_data = torch.load(model_path, map_location='cpu')
+        
+        if isinstance(saved_data, dict):
+            # Check for our QAT format
+            if 'fake_quant_count' in saved_data:
+                count = saved_data['fake_quant_count']
+                method = saved_data.get('save_method', 'unknown')
+                
+                logger.info(f"✅ QAT model verified:")
+                logger.info(f"  - FakeQuantize modules: {count}")
+                logger.info(f"  - Save method: {method}")
+                logger.info(f"  - Quantization preserved: {saved_data.get('quantization_preserved', False)}")
+                
+                return count > 0
+            
+            # Check if it has model structure
+            elif 'model' in saved_data:
+                # Try to count FakeQuantize modules in the model
+                try:
+                    fake_quant_count = sum(1 for n, m in saved_data['model'].named_modules() 
+                                          if 'FakeQuantize' in type(m).__name__)
+                    
+                    logger.info(f"✅ Model structure found with {fake_quant_count} FakeQuantize modules")
+                    return fake_quant_count > 0
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not analyze model structure: {e}")
+                    return False
+            
+            else:
+                logger.warning("⚠️ Model file format not recognized as QAT")
+                return False
+        else:
+            logger.warning("⚠️ Model file is not in dictionary format")
+            return False
+    
+    except Exception as e:
+        logger.error(f"❌ Error verifying model file: {e}")
+        return False
+
+def test_qat_fixes():
+    """Test that the QAT fixes work correctly."""
+    logger.info("Testing QAT fixes...")
+    
+    try:
+        # Create a simple QAT model for testing
+        qat_model = QuantizedYOLOv8('yolov8n.pt', skip_detection_head=True)
+        qat_model.prepare_for_qat()
+        
+        # Test the quantization preservation
+        test_result = qat_model.test_quantization_preservation()
+        
+        if test_result:
+            logger.info("✅ QAT fixes test PASSED")
+            return True
+        else:
+            logger.error("❌ QAT fixes test FAILED")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ QAT fixes test exception: {e}")
+        return False
+
 def main():
     """Main function for QAT training with phased approach."""
     # Parse arguments
@@ -665,6 +744,148 @@ def main():
         logger.error("QAT training failed. Exiting.")
         return None
     
+    # # After QAT training completes:
+    # try:
+    #     if phased_training:
+    #         logger.info("Using phased QAT training approach")
+    #         results = qat_model.train_model(
+    #             data_yaml=data_path,
+    #             epochs=epochs,
+    #             batch_size=batch_size,
+    #             img_size=img_size,
+    #             lr=lr,
+    #             device=args.device,
+    #             save_dir=args.save_dir,
+    #             log_dir=args.log_dir,
+    #             use_distillation=use_distillation
+    #         )
+    #     else:
+    #         logger.info("Using standard QAT training approach (non-phased)")
+    #         results = qat_model.train_standard(
+    #             data_yaml=data_path,
+    #             epochs=epochs,
+    #             batch_size=batch_size,
+    #             img_size=img_size,
+    #             lr=lr,
+    #             device=args.device,
+    #             save_dir=args.save_dir,
+    #             log_dir=args.log_dir,
+    #             use_distillation=use_distillation
+    #         )
+        
+    #     logger.info("✓ QAT training completed successfully")
+        
+        # CRITICAL FIX: Verify quantization is still present after training
+        logger.info("Verifying quantization preservation after training...")
+        if not qat_model.verify_quantization_preserved():
+            logger.error("❌ Quantization was lost during training!")
+            logger.error("   This suggests an issue with the training process")
+            return None
+        
+        # CRITICAL FIX: Save QAT model BEFORE any conversion
+        qat_save_path = os.path.join(args.save_dir, "qat_model_with_fakequant.pt")
+        logger.info(f"Saving QAT model with FakeQuantize modules to {qat_save_path}")
+        
+        save_success = qat_model.save(qat_save_path, preserve_qat=True)
+        if not save_success:
+            logger.error("❌ Failed to save QAT model!")
+            logger.error("   Training results may be lost")
+            return None
+        
+        # Verify the saved QAT model
+        logger.info("Verifying saved QAT model...")
+        try:
+            # Quick verification by loading the saved model
+            saved_data = torch.load(qat_save_path, map_location='cpu')
+            if 'fake_quant_count' in saved_data:
+                saved_count = saved_data['fake_quant_count']
+                logger.info(f"✅ QAT model saved successfully with {saved_count} FakeQuantize modules")
+            else:
+                logger.warning("⚠️ QAT model saved but verification format unexpected")
+        except Exception as verify_error:
+            logger.error(f"❌ Failed to verify saved QAT model: {verify_error}")
+        
+    except Exception as training_error:
+        logger.error(f"❌ QAT training failed: {training_error}")
+        logger.error("Full error traceback:")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Provide helpful error guidance
+        if "pickle" in str(training_error).lower():
+            logger.error("This appears to be a serialization/pickling error.")
+            logger.error("Try reducing the complexity of quantization or using simpler QConfig.")
+        elif "cuda" in str(training_error).lower():
+            logger.error("This appears to be a CUDA/device error.")
+            logger.error("Try using --device cpu or check your GPU setup.")
+        elif "memory" in str(training_error).lower():
+            logger.error("This appears to be a memory error.")
+            logger.error("Try reducing --batch-size or using a smaller model.")
+        
+        logger.error("QAT training failed. Exiting.")
+        return None
+    
+    # Save QAT model FIRST with corrected method
+    qat_save_path = os.path.join(args.save_dir, "qat_model_fixed.pt")
+    logger.info(f"Saving QAT model with corrected method to {qat_save_path}")
+
+    # Use the FIXED save method
+    save_success = qat_model.save(qat_save_path, preserve_qat=True)
+    if not save_success:
+        logger.error("❌ Failed to save QAT model with corrected method!")
+        return None
+
+    # Verify the corrected save
+    logger.info("Verifying corrected QAT model save...")
+    try:
+        # Quick verification by loading the saved model
+        test_load = torch.load(qat_save_path, map_location='cpu')
+        if 'model' in test_load and 'qat_info' in test_load:
+            qat_info = test_load['qat_info']
+            fake_quant_count = test_load.get('fake_quant_count', 0)
+            
+            logger.info(f"✅ QAT model saved successfully:")
+            logger.info(f"  - Classes: {qat_info.get('num_classes', 'unknown')}")
+            logger.info(f"  - FakeQuantize modules: {fake_quant_count}")
+            logger.info(f"  - Architecture: {qat_info.get('qconfig_name', 'unknown')}")
+            logger.info(f"  - ONNX ready: {test_load.get('onnx_ready', False)}")
+        else:
+            logger.error("❌ QAT model save verification failed - incorrect format")
+            
+    except Exception as verify_error:
+        logger.error(f"❌ QAT model save verification failed: {verify_error}")
+
+    # Now convert to INT8 if requested
+    convert_to_int8 = not getattr(args, 'no_convert', False)
+    save_path = os.path.join(args.save_dir, args.output)
+
+    if convert_to_int8:
+        try:
+            logger.info("Converting QAT model to quantized INT8 model...")
+            quantized_model = qat_model.convert_to_quantized(save_path)
+            
+            if quantized_model is not None:
+                logger.info("✅ Model conversion completed successfully")
+            else:
+                logger.error("❌ Model conversion failed")
+                # Use QAT model for further operations
+                quantized_model = qat_model.model
+                
+        except Exception as conversion_error:
+            logger.error(f"❌ Model conversion failed: {conversion_error}")
+            logger.error("Full conversion error traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            logger.warning("Conversion failed, but QAT model is available for ONNX export")
+            quantized_model = qat_model.model
+    else:
+        logger.info("Skipping INT8 conversion - using QAT model")
+        quantized_model = qat_model.model
+
+    # Use the corrected QAT model for analysis and evaluation
+    analysis_model = quantized_model
+    
     # Convert and save quantized model
     save_path = os.path.join(args.save_dir, args.output)
 
@@ -759,20 +980,44 @@ def main():
     
     return results
 
-if __name__ == "__main__":
-    main()
-
-# if __name__ == "__main__":
-#     # Test basic quantization support
-#     quantization_working = test_basic_quantization()
-#     if not quantization_working:
-#         print("WARNING: Basic quantization test failed - environment issues may prevent QAT")
-#         print("You can continue but QAT may not work correctly")
-#         response = input("Continue despite quantization issues? (y/n): ")
-#         if response.lower() != 'y':
-#             print("Exiting due to quantization issues")
-#             import sys
-#             sys.exit(1)
+    # Final verification of saved models
+    logger.info("\n" + "="*80)
+    logger.info("FINAL MODEL VERIFICATION")
+    logger.info("="*80)
     
-#     # Call the main function
-#     main()
+    # Verify QAT model
+    qat_model_path = os.path.join(args.save_dir, "qat_model_with_fakequant.pt")
+    if os.path.exists(qat_model_path):
+        logger.info("Verifying saved QAT model...")
+        qat_valid = verify_qat_model_file(qat_model_path)
+        if qat_valid:
+            logger.info("✅ QAT model verification PASSED")
+        else:
+            logger.error("❌ QAT model verification FAILED")
+    else:
+        logger.error("❌ QAT model file not found")
+    
+    # Verify INT8 model if it was created
+    if convert_to_int8:
+        int8_model_path = save_path.replace('.pt', '_int8_final.pt')
+        if os.path.exists(int8_model_path):
+            logger.info("✅ INT8 quantized model found")
+        else:
+            logger.warning("⚠️ INT8 quantized model not found")
+    
+    logger.info("="*80)
+    logger.info(f"QAT TRAINING COMPLETE")
+    logger.info(f"QAT model (for continued training): {qat_model_path}")
+    if convert_to_int8:
+        logger.info(f"INT8 model (for deployment): {int8_model_path}")
+    logger.info("="*80)
+    
+    return results
+
+
+if __name__ == "__main__":
+    # ADD option to run test mode
+    if len(sys.argv) > 1 and sys.argv[1] == '--test-fixes':
+        test_qat_fixes()
+    else:
+        main()

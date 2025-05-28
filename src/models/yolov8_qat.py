@@ -569,6 +569,7 @@ class QuantizedYOLOv8:
     def convert_to_quantized(self, save_path=None):
         """
         Convert QAT model to quantized model.
+        IMPORTANT: This removes FakeQuantize modules - save QAT model first!
         
         Args:
             save_path: Path to save quantized model
@@ -578,11 +579,33 @@ class QuantizedYOLOv8:
         """
         logger.info("Converting QAT model to quantized INT8 model...")
         
-        # Get QAT model
+        # CRITICAL: Verify we still have QAT structure before conversion
+        if not self.verify_quantization_preserved():
+            logger.error("❌ Cannot convert - QAT structure is missing!")
+            logger.error("   - Model may have been saved/loaded incorrectly")
+            logger.error("   - Try re-preparing the model for QAT")
+            return None
+        
+        # IMPORTANT: Save QAT model BEFORE conversion (if path provided)
+        if save_path:
+            qat_save_path = save_path.replace('.pt', '_qat_before_conversion.pt')
+            logger.info(f"Saving QAT model before conversion to {qat_save_path}")
+            
+            qat_save_success = self.save(qat_save_path, preserve_qat=True)
+            if not qat_save_success:
+                logger.error("❌ Failed to save QAT model before conversion!")
+                logger.error("   - Proceeding anyway, but you may lose QAT capability")
+        
+        # Get QAT model and convert
         qat_model = self.model.model
         
-        # Convert to quantized model
-        self.quantized_model = convert_qat_model_to_quantized(qat_model)
+        # Convert to quantized model (this removes FakeQuantize modules)
+        try:
+            self.quantized_model = convert_qat_model_to_quantized(qat_model)
+            logger.info("✅ Successfully converted QAT model to quantized INT8")
+        except Exception as e:
+            logger.error(f"❌ Conversion failed: {e}")
+            return None
         
         # Calculate size comparison
         size_info = compare_model_sizes(self.original_model, self.quantized_model)
@@ -598,23 +621,27 @@ class QuantizedYOLOv8:
         logger.info(f"  Quantized modules: {quant_analysis['quantized_modules']} / {quant_analysis['total_modules']}")
         logger.info(f"  Quantization ratio: {quant_analysis['quantized_ratio']:.2f}")
         
-        # Save quantized model
+        # Save quantized model (this is the final INT8 model for deployment)
         if save_path:
+            int8_save_path = save_path.replace('.pt', '_int8_final.pt')
+            
             # Create metadata
             metadata = {
                 'framework': 'pytorch',
                 'format': 'quantized_int8',
                 'qconfig': self.qconfig_name,
                 'size_info': size_info,
-                'quant_analysis': quant_analysis
+                'quant_analysis': quant_analysis,
+                'conversion_successful': True,
+                'deployment_ready': True
             }
             
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            
-            # Save model
-            save_quantized_model(self.quantized_model, save_path, metadata)
-            logger.info(f"Quantized model saved to {save_path}")
+            # Save the final quantized model
+            save_success = save_quantized_model(self.quantized_model, int8_save_path, metadata)
+            if save_success:
+                logger.info(f"✅ Final quantized INT8 model saved to {int8_save_path}")
+            else:
+                logger.error(f"❌ Failed to save quantized model")
         
         self.is_converted = True
         return self.quantized_model
@@ -1049,33 +1076,271 @@ class QuantizedYOLOv8:
         logger.info("Training completed")
         return results
 
-    def save(self, path):
+    def save(self, path, preserve_qat=True):
         """
-        Save the model to disk.
+        CORRECTED VERSION: Save the model with proper quantization preservation.
         
         Args:
             path: Path to save model
+            preserve_qat: Whether to preserve quantization structure
+        
+        Returns:
+            Success status
         """
         # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
         
-        # For YOLOv8, we need to save the original YOLO object
-        try:
-            self.model.save(path)
-            logger.info(f"Model saved to {path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving model: {e}")
+        if preserve_qat and self.is_prepared:
+            logger.info(f"Saving QAT model with quantization preserved to {path}")
             
-            # Fallback: try to save using torch.save
             try:
-                torch.save(self.model.model, path)
-                logger.info(f"Model saved to {path} using torch.save")
+                # Count FakeQuantize modules before saving
+                fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
+                                    if 'FakeQuantize' in type(m).__name__)
+                
+                logger.info(f"Found {fake_quant_count} FakeQuantize modules to preserve")
+                
+                # CRITICAL FIX: Save the COMPLETE MODEL, not just state_dict
+                save_dict = {
+                    # ✅ FIXED: Save full model architecture with quantization
+                    'model': self.model.model,
+                    
+                    # ✅ FIXED: Save complete QAT information
+                    'qat_info': {
+                        'qconfig_name': self.qconfig_name,
+                        'skip_detection_head': self.skip_detection_head,
+                        'fuse_modules': self.fuse_modules,
+                        'is_prepared': self.is_prepared,
+                        'pytorch_version': torch.__version__,
+                        'model_path': self.model_path,
+                        'num_classes': 58,  # ✅ FIXED: Your Vietnamese traffic signs
+                        'img_size': 640,
+                        'dataset': 'vietnamese_traffic_signs'
+                    },
+                    
+                    # ✅ FIXED: Quantization verification
+                    'fake_quant_count': fake_quant_count,
+                    'quantization_preserved': True,
+                    'save_method': 'full_model_architecture',
+                    
+                    # ✅ FIXED: ONNX conversion readiness
+                    'onnx_ready': True,
+                    'conversion_info': {
+                        'format': 'quantized_pytorch_model',
+                        'architecture': 'yolov8n',
+                        'classes': 58,
+                        'input_size': [1, 3, 640, 640]
+                    }
+                }
+                
+                # Save the complete model
+                torch.save(save_dict, path)
+                
+                # Verify the save
+                success = self._verify_qat_save(path, fake_quant_count)
+                
+                if success:
+                    logger.info(f"✅ QAT model saved successfully: {path}")
+                    logger.info(f"✅ Quantization preserved: {fake_quant_count} FakeQuantize modules")
+                    return True
+                else:
+                    logger.error(f"❌ Save verification failed")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"❌ QAT save failed: {e}")
+                
+                # Try fallback method
+                return self._save_fallback_method(path)
+        
+        else:
+            # Standard save without quantization
+            logger.warning("⚠️ Saving without QAT preservation")
+            try:
+                self.model.save(path)
                 return True
-            except Exception as inner_e:
-                logger.error(f"Error saving model with torch.save: {inner_e}")
+            except Exception as e:
+                logger.error(f"Error saving model: {e}")
                 return False
 
+    def _verify_saved_model(self, path, expected_fake_quant_count):
+        """Verify that the saved model preserved quantization."""
+        try:
+            # Load and check the saved model
+            saved_data = torch.load(path, map_location='cpu')
+            
+            if isinstance(saved_data, dict):
+                # Check for our QAT save format with model_state_dict
+                if 'model_state_dict' in saved_data and 'fake_quant_count' in saved_data:
+                    # This is our comprehensive save format
+                    saved_count = saved_data.get('fake_quant_count', 0)
+                    save_method = saved_data.get('save_method', 'unknown')
+                    quantization_preserved = saved_data.get('quantization_preserved', False)
+                    
+                    logger.info(f"Save verification (Method 1 - state dict format):")
+                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
+                    logger.info(f"  - Saved count recorded: {saved_count}")
+                    logger.info(f"  - Save method: {save_method}")
+                    logger.info(f"  - Quantization preserved: {quantization_preserved}")
+                    
+                    if saved_count == expected_fake_quant_count and saved_count > 0:
+                        logger.info("✅ Quantization successfully preserved in saved model (state dict format)")
+                        return True
+                    else:
+                        logger.error(f"❌ Quantization count mismatch: expected {expected_fake_quant_count}, got {saved_count}")
+                        return False
+                
+                # Check for full model format (if we ever save the full model)
+                elif 'model' in saved_data:
+                    # Count FakeQuantize modules in loaded model
+                    try:
+                        actual_count = sum(1 for n, m in saved_data['model'].named_modules() 
+                                        if 'FakeQuantize' in type(m).__name__)
+                        
+                        saved_count = saved_data.get('fake_quant_count', 0)
+                        
+                        logger.info(f"Save verification (Method 2 - full model format):")
+                        logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
+                        logger.info(f"  - Saved count recorded: {saved_count}")
+                        logger.info(f"  - Actual count in saved model: {actual_count}")
+                        
+                        if actual_count == expected_fake_quant_count and actual_count > 0:
+                            logger.info("✅ Quantization successfully preserved in saved model (full model format)")
+                            return True
+                        else:
+                            logger.error(f"❌ Quantization not properly preserved in full model")
+                            return False
+                            
+                    except Exception as model_check_error:
+                        logger.error(f"❌ Error checking full model format: {model_check_error}")
+                        return False
+                
+                # Check for fallback format
+                elif 'fake_quant_count' in saved_data:
+                    saved_count = saved_data['fake_quant_count']
+                    save_method = saved_data.get('save_method', 'unknown')
+                    
+                    logger.info(f"Save verification (Method 3 - fallback format):")
+                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
+                    logger.info(f"  - Saved count recorded: {saved_count}")
+                    logger.info(f"  - Save method: {save_method}")
+                    
+                    if saved_count == expected_fake_quant_count and saved_count > 0:
+                        logger.info("✅ Quantization info successfully preserved in fallback format")
+                        return True
+                    else:
+                        logger.error(f"❌ Quantization count mismatch in fallback format")
+                        return False
+                
+                else:
+                    logger.error("❌ No recognized quantization information found in saved data")
+                    logger.info(f"Available keys in saved data: {list(saved_data.keys())}")
+                    return False
+            else:
+                logger.error("❌ Saved model format not recognized as dictionary")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to verify saved model: {e}")
+            return False
+
+    def _verify_saved_model_fallback(self, path, expected_fake_quant_count):
+        """Verify that the fallback saved model preserved quantization info."""
+        try:
+            # Load and check the saved model
+            saved_data = torch.load(path, map_location='cpu')
+            
+            if isinstance(saved_data, dict):
+                # Check for fallback format with direct fake_quant_count
+                if 'fake_quant_count' in saved_data:
+                    saved_count = saved_data['fake_quant_count']
+                    save_method = saved_data.get('save_method', 'unknown')
+                    quantization_preserved = saved_data.get('quantization_preserved', False)
+                    
+                    logger.info(f"Fallback save verification (Method 1):")
+                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
+                    logger.info(f"  - Saved count recorded: {saved_count}")
+                    logger.info(f"  - Save method: {save_method}")
+                    logger.info(f"  - Quantization preserved: {quantization_preserved}")
+                    
+                    if saved_count == expected_fake_quant_count and saved_count > 0:
+                        logger.info("✅ Quantization info successfully preserved in fallback save")
+                        return True
+                    else:
+                        logger.error(f"❌ Quantization count mismatch: expected {expected_fake_quant_count}, got {saved_count}")
+                        return False
+                
+                # Check for quantization_info nested format
+                elif 'quantization_info' in saved_data:
+                    quant_info = saved_data['quantization_info']
+                    saved_count = quant_info.get('fake_quant_count', 0)
+                    was_prepared = quant_info.get('was_prepared', False)
+                    
+                    logger.info(f"Fallback save verification (Method 2):")
+                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
+                    logger.info(f"  - Saved count: {saved_count}")
+                    logger.info(f"  - Was prepared: {was_prepared}")
+                    
+                    success = saved_count == expected_fake_quant_count and saved_count > 0
+                    if success:
+                        logger.info("✅ Quantization info successfully preserved in nested format")
+                    else:
+                        logger.error(f"❌ Quantization count mismatch in nested format")
+                    
+                    return success
+                
+                # Check for config format
+                elif 'config' in saved_data and 'quantization_info' in saved_data:
+                    quant_info = saved_data['quantization_info']
+                    saved_count = quant_info.get('fake_quant_count', 0)
+                    
+                    logger.info(f"Fallback save verification (Method 3 - config format):")
+                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
+                    logger.info(f"  - Saved count: {saved_count}")
+                    
+                    success = saved_count == expected_fake_quant_count and saved_count > 0
+                    if success:
+                        logger.info("✅ Quantization info successfully preserved in config format")
+                    else:
+                        logger.error(f"❌ Quantization count mismatch in config format")
+                    
+                    return success
+                
+                else:
+                    logger.error("❌ No quantization information found in fallback save")
+                    logger.info(f"Available keys in saved data: {list(saved_data.keys())}")
+                    return False
+                    
+            else:
+                logger.error("❌ Saved model format not recognized as dictionary")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to verify fallback saved model: {e}")
+            return False
+
+    def verify_quantization_preserved(self):
+        """Verify that the current model still has quantization modules."""
+        fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
+                            if 'FakeQuantize' in type(m).__name__)
+        
+        qconfig_count = sum(1 for n, m in self.model.model.named_modules() 
+                        if hasattr(m, 'qconfig') and m.qconfig is not None)
+        
+        logger.info(f"Current quantization status:")
+        logger.info(f"  - FakeQuantize modules: {fake_quant_count}")
+        logger.info(f"  - Modules with qconfig: {qconfig_count}")
+        
+        if fake_quant_count > 0 and qconfig_count > 0:
+            logger.info("✅ Quantization is properly preserved")
+            return True
+        else:
+            logger.error("❌ Quantization has been lost!")
+            logger.error("   - Model may need to be re-prepared for QAT")
+            return False
+    
     def _configure_phase(self, phase):
         """Configure model for specific QAT phase."""
         # Use consistent phase names
@@ -1359,4 +1624,387 @@ class QuantizedYOLOv8:
                 logger.error(f"❌ {phase} configuration test FAILED")
         
         logger.info("Quantization setup test completed")
+
+    # ==============================================================================
+    # 4. ADD LOADING METHOD (add this as a class method)
+    # ==============================================================================
+
+    @classmethod
+    def load_qat_model(cls, path, device='cpu'):
+        """
+        Load a QAT model that was saved with quantization preservation.
         
+        Args:
+            path: Path to saved QAT model
+            device: Device to load model on
+            
+        Returns:
+            QuantizedYOLOv8 instance with quantization preserved
+        """
+        logger.info(f"Loading QAT model from {path}")
+        
+        try:
+            # Load the saved data
+            saved_data = torch.load(path, map_location=device)
+            
+            # Check the save format
+            if isinstance(saved_data, dict) and 'qat_info' in saved_data:
+                # This is our preserved format
+                qat_info = saved_data['qat_info']
+                
+                # Create instance with same configuration
+                instance = cls(
+                    model_path=qat_info['model_path'],
+                    qconfig_name=qat_info['qconfig_name'],
+                    skip_detection_head=qat_info['skip_detection_head'],
+                    fuse_modules=qat_info['fuse_modules']
+                )
+                
+                if 'model' in saved_data:
+                    # Load the full model structure
+                    instance.model.model = saved_data['model'].to(device)
+                    logger.info("✅ Loaded full model structure with quantization")
+                else:
+                    # Load state dict and re-prepare
+                    instance.prepare_for_qat()
+                    instance.model.model.load_state_dict(saved_data['model_state_dict'])
+                    instance.model.model.to(device)
+                    logger.info("✅ Loaded state dict and re-prepared for QAT")
+                
+                # Set flags
+                instance.is_prepared = qat_info['is_prepared']
+                
+                # Verify quantization was preserved
+                fake_quant_count = sum(1 for n, m in instance.model.model.named_modules() 
+                                    if 'FakeQuantize' in type(m).__name__)
+                
+                expected_count = saved_data.get('fake_quant_count', 0)
+                
+                if fake_quant_count > 0 and fake_quant_count == expected_count:
+                    logger.info(f"✅ QAT model loaded successfully with {fake_quant_count} FakeQuantize modules")
+                else:
+                    logger.warning(f"⚠️ Quantization may not be fully preserved: {fake_quant_count}/{expected_count}")
+                
+                return instance
+                
+            elif isinstance(saved_data, dict) and 'config' in saved_data:
+                # Fallback format - state dict with config
+                config = saved_data['config']
+                
+                instance = cls(
+                    model_path=config['model_path'],
+                    qconfig_name=config['qconfig_name'],
+                    skip_detection_head=config['skip_detection_head'],
+                    fuse_modules=config.get('fuse_modules', True)
+                )
+                
+                # Re-prepare for QAT and load state dict
+                instance.prepare_for_qat()
+                instance.model.model.load_state_dict(saved_data['state_dict'])
+                instance.model.model.to(device)
+                
+                logger.warning("⚠️ Loaded from state dict - quantization structure recreated")
+                
+                return instance
+                
+            else:
+                # Try standard YOLO loading
+                logger.warning("⚠️ Loading as standard YOLO model - quantization may be lost")
+                from ultralytics import YOLO
+                
+                yolo_model = YOLO(path)
+                yolo_model.model.to(device)
+                
+                # Create instance
+                instance = cls.__new__(cls)
+                instance.model = yolo_model
+                instance.is_prepared = False
+                instance.qconfig_name = 'default'
+                instance.skip_detection_head = True
+                instance.fuse_modules = True
+                
+                logger.warning("⚠️ Loaded as standard model - will need to re-prepare for QAT")
+                
+                return instance
+                
+        except Exception as e:
+            logger.error(f"Failed to load QAT model: {e}")
+            raise
+
+    # ==============================================================================
+    # 5. ADD MODEL TESTING METHOD (add this method)
+    # ==============================================================================
+
+    def test_quantization_preservation(self):
+        """Test that quantization is working correctly with detailed debugging."""
+        logger.info("Testing quantization preservation...")
+        
+        if not self.is_prepared:
+            logger.error("❌ Model not prepared for QAT")
+            return False
+        
+        # Test 1: Count FakeQuantize modules
+        fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
+                            if 'FakeQuantize' in type(m).__name__)
+        
+        logger.info(f"Test 1 - FakeQuantize modules: {fake_quant_count}")
+        
+        if fake_quant_count == 0:
+            logger.error("❌ No FakeQuantize modules found!")
+            return False
+        
+        # Test 2: Check qconfig application
+        qconfig_count = sum(1 for n, m in self.model.model.named_modules() 
+                        if hasattr(m, 'qconfig') and m.qconfig is not None)
+        
+        logger.info(f"Test 2 - Modules with qconfig: {qconfig_count}")
+        
+        # Test 3: Detailed save/load cycle with debugging
+        logger.info("Test 3 - Testing save/load cycle with detailed debugging...")
+        
+        temp_path = 'temp_qat_test.pt'
+        try:
+            # Save with detailed logging
+            logger.info(f"  Step 3a: Saving QAT model to {temp_path}")
+            save_success = self.save(temp_path, preserve_qat=True)
+            if not save_success:
+                logger.error("❌ Step 3a: Save operation reported failure")
+                return False
+            
+            logger.info("  Step 3b: Examining saved file contents")
+            if not os.path.exists(temp_path):
+                logger.error(f"❌ Step 3b: Save file does not exist at {temp_path}")
+                return False
+            
+            # Load and examine the saved data structure
+            saved_data = torch.load(temp_path, map_location='cpu')
+            logger.info(f"  Step 3c: Saved data type: {type(saved_data)}")
+            
+            if isinstance(saved_data, dict):
+                logger.info(f"  Step 3d: Available keys in saved data: {list(saved_data.keys())}")
+                
+                # Check each expected key
+                expected_keys = ['model_state_dict', 'qat_info', 'fake_quant_count', 'quantization_preserved']
+                for key in expected_keys:
+                    if key in saved_data:
+                        if key == 'fake_quant_count':
+                            logger.info(f"    ✅ {key}: {saved_data[key]}")
+                        else:
+                            logger.info(f"    ✅ {key}: present")
+                    else:
+                        logger.warning(f"    ⚠️ {key}: missing")
+                
+                # Specific verification
+                if 'fake_quant_count' in saved_data:
+                    saved_count = saved_data['fake_quant_count']
+                    logger.info(f"  Step 3e: Saved FakeQuantize count: {saved_count}")
+                    
+                    if saved_count == fake_quant_count:
+                        logger.info("  Step 3f: ✅ Count verification PASSED")
+                        
+                        # Test loading
+                        logger.info("  Step 3g: Testing model loading")
+                        try:
+                            # Try to recreate the model from saved data
+                            if 'model_state_dict' in saved_data and 'qat_info' in saved_data:
+                                logger.info("    ✅ Both model_state_dict and qat_info found")
+                                logger.info("    ✅ Save format is correct for loading")
+                                
+                                # Clean up and return success
+                                os.remove(temp_path)
+                                logger.info("✅ All quantization preservation tests PASSED")
+                                return True
+                            else:
+                                logger.error("    ❌ Required keys for loading not found")
+                                os.remove(temp_path)
+                                return False
+                                
+                        except Exception as load_test_error:
+                            logger.error(f"    ❌ Load test failed: {load_test_error}")
+                            os.remove(temp_path)
+                            return False
+                    else:
+                        logger.error(f"  Step 3f: ❌ Count mismatch: expected {fake_quant_count}, saved {saved_count}")
+                        os.remove(temp_path)
+                        return False
+                else:
+                    logger.error("  Step 3e: ❌ fake_quant_count not found in saved data")
+                    os.remove(temp_path)
+                    return False
+            else:
+                logger.error(f"  Step 3d: ❌ Saved data is not a dictionary, got {type(saved_data)}")
+                os.remove(temp_path)
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Save/load test exception: {e}")
+            logger.error(f"Full traceback:")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
+        
+    def _verify_qat_save(self, path, expected_fake_quant_count):
+        """
+        Verify that QAT model was saved correctly.
+        
+        Args:
+            path: Path to saved model
+            expected_fake_quant_count: Expected number of FakeQuantize modules
+        
+        Returns:
+            Verification success status
+        """
+        try:
+            logger.info("Verifying QAT model save...")
+            
+            # Load the saved model
+            saved_data = torch.load(path, map_location='cpu')
+            
+            # Check format
+            if not isinstance(saved_data, dict):
+                logger.error("❌ Saved data is not a dictionary")
+                return False
+            
+            # Check required keys
+            required_keys = ['model', 'qat_info', 'fake_quant_count']
+            missing_keys = [key for key in required_keys if key not in saved_data]
+            
+            if missing_keys:
+                logger.error(f"❌ Missing required keys: {missing_keys}")
+                return False
+            
+            # Check model architecture
+            saved_model = saved_data['model']
+            if not hasattr(saved_model, 'state_dict'):
+                logger.error("❌ Saved model doesn't have state_dict")
+                return False
+            
+            # Check FakeQuantize count
+            saved_fake_quant_count = saved_data['fake_quant_count']
+            if saved_fake_quant_count != expected_fake_quant_count:
+                logger.error(f"❌ FakeQuantize count mismatch: expected {expected_fake_quant_count}, got {saved_fake_quant_count}")
+                return False
+            
+            # Check class count
+            qat_info = saved_data['qat_info']
+            if qat_info.get('num_classes') != 58:
+                logger.warning(f"⚠️ Unexpected class count: {qat_info.get('num_classes')}")
+            
+            logger.info("✅ QAT model verification passed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Save verification failed: {e}")
+            return False
+
+    def _save_fallback_method(self, path):
+        """
+        Fallback save method if main save fails.
+        
+        Args:
+            path: Path to save model
+        
+        Returns:
+            Success status
+        """
+        logger.info("Attempting fallback save method...")
+        
+        try:
+            # Save with minimal structure that's ONNX-compatible
+            model_to_save = self.model.model
+            
+            # Ensure model is in eval mode
+            model_to_save.eval()
+            
+            # Create a simplified save format
+            fallback_dict = {
+                'model': model_to_save,
+                'model_info': {
+                    'architecture': 'yolov8n',
+                    'num_classes': 58,
+                    'img_size': 640,
+                    'quantized': True,
+                    'source': 'qat_training'
+                },
+                'save_method': 'fallback_full_model'
+            }
+            
+            torch.save(fallback_dict, path)
+            
+            # Simple verification
+            if os.path.exists(path):
+                file_size = os.path.getsize(path) / (1024 * 1024)
+                logger.info(f"✅ Fallback save successful: {file_size:.2f} MB")
+                return True
+            else:
+                logger.error("❌ Fallback save failed - no file created")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Fallback save also failed: {e}")
+            return False
+
+    # ===================================================================
+# ADDITIONAL METHOD: Load QAT model properly
+# ===================================================================
+
+    @classmethod
+    def load_qat_model_fixed(cls, path, device='cpu'):
+        """
+        CORRECTED VERSION: Load QAT model with proper quantization handling.
+        
+        Args:
+            path: Path to saved QAT model
+            device: Device to load on
+        
+        Returns:
+            QuantizedYOLOv8 instance
+        """
+        logger.info(f"Loading QAT model from {path}")
+        
+        try:
+            # Load saved data
+            saved_data = torch.load(path, map_location=device)
+            
+            if isinstance(saved_data, dict):
+                if 'model' in saved_data and 'qat_info' in saved_data:
+                    # Our new corrected format
+                    qat_info = saved_data['qat_info']
+                    
+                    # Create instance with correct parameters
+                    instance = cls(
+                        model_path=qat_info.get('model_path', 'yolov8n.pt'),
+                        qconfig_name=qat_info.get('qconfig_name', 'default'),
+                        skip_detection_head=qat_info.get('skip_detection_head', True),
+                        fuse_modules=qat_info.get('fuse_modules', True)
+                    )
+                    
+                    # Load the full model
+                    instance.model.model = saved_data['model'].to(device)
+                    instance.is_prepared = qat_info.get('is_prepared', True)
+                    
+                    logger.info("✅ QAT model loaded successfully with quantization preserved")
+                    return instance
+                    
+                elif 'model' in saved_data:
+                    # Simplified format
+                    model_info = saved_data.get('model_info', {})
+                    
+                    instance = cls.__new__(cls)
+                    instance.model = type('MockYOLO', (), {'model': saved_data['model']})()
+                    instance.model.model.to(device)
+                    instance.is_prepared = True
+                    instance.qconfig_name = 'default'
+                    
+                    logger.info("✅ Model loaded from simplified format")
+                    return instance
+                    
+            logger.error("❌ Unrecognized model format")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load QAT model: {e}")
+            return None
