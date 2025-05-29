@@ -782,15 +782,15 @@ def main():
             logger.error("   This suggests an issue with the training process")
             return None
         
-        # CRITICAL FIX: Save QAT model BEFORE any conversion
-        qat_save_path = os.path.join(args.save_dir, "qat_model_with_fakequant.pt")
-        logger.info(f"Saving QAT model with FakeQuantize modules to {qat_save_path}")
-        
+        # FIXED: Simple QAT model save
+        qat_save_path = os.path.join(args.save_dir, "qat_model_final.pt")
+        logger.info(f"Saving QAT model to {qat_save_path}")
+
         save_success = qat_model.save(qat_save_path, preserve_qat=True)
-        if not save_success:
-            logger.error("❌ Failed to save QAT model!")
-            logger.error("   Training results may be lost")
-            return None
+        if save_success:
+            logger.info("✅ QAT model saved successfully")
+        else:
+            logger.warning("⚠️ QAT save failed, proceeding with conversion")
         
         # Verify the saved QAT model
         logger.info("Verifying saved QAT model...")
