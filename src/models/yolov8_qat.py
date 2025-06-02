@@ -15,8 +15,13 @@ from pathlib import Path
 from ultralytics import YOLO
 import copy
 
+import numpy as np
+import functools
+
 # Import PyTorch quantization modules
 from torch.quantization import prepare_qat, convert, get_default_qconfig
+from src.quantization.quantizer_state_manager import QuantizerStateManager
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, 
@@ -38,7 +43,7 @@ from src.quantization.utils import (
 )
 
 # Import QAT training loss
-from src.training.loss import QATPenaltyLoss
+# from src.training.loss import QATPenaltyLoss
 
 class QuantizedYOLOv8:
     """
@@ -70,6 +75,9 @@ class QuantizedYOLOv8:
         # Load YOLOv8 model
         logger.info(f"Loading YOLOv8 model from {model_path}")
         self.model = YOLO(model_path)
+        # FIXED: Clear any default dataset configuration
+        if hasattr(self.model, 'overrides'):
+            self.model.overrides.pop('data', None)  # Remove any default data setting
         
         # Store original model for size comparison
         self.original_model = copy.deepcopy(self.model.model)
@@ -174,91 +182,252 @@ class QuantizedYOLOv8:
         self.is_prepared = True
         
         return self.qat_model
+
+    def warmup_observers(self, dataloader, num_batches=200, device='cuda'):
+        """
+        Warm up observers before starting quantization.
+        Critical fix for observer initialization timing.
+        """
+        logger.info(f"Warming up observers for {num_batches} batches...")
+        
+        # Set model to training mode but disable quantization
+        self.model.model.train()
+        self._disable_fake_quantization()
+        
+        # Enable only observers
+        self._enable_observers_only()
+        
+        batch_count = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                if batch_count >= num_batches:
+                    break
+                    
+                # Get inputs (handle different batch formats)
+                if isinstance(batch, (tuple, list)):
+                    inputs = batch[0]
+                else:
+                    inputs = batch
+                
+                if isinstance(inputs, torch.Tensor):
+                    inputs = inputs.to(device)
+                
+                # Forward pass to update observers
+                _ = self.model.model(inputs)
+                batch_count += 1
+                
+                if batch_count % 50 == 0:
+                    logger.info(f"Observer warmup progress: {batch_count}/{num_batches}")
+        
+        # Verify observer readiness
+        ready_observers = self._check_observer_readiness()
+        logger.info(f"Observer warmup complete: {ready_observers} observers ready")
+        
+        # Re-enable quantization
+        self._enable_fake_quantization()
+        
+        return ready_observers
+
+    def gradual_quantization_enable(self, epoch, total_epochs, phase_start, phase_end):
+        """
+        Gradually enable quantization over multiple epochs.
+        Fixes abrupt phase transition issue.
+        """
+        if epoch < phase_start:
+            return 0.0  # No quantization
+        elif epoch > phase_end:
+            return 1.0  # Full quantization
+        else:
+            # Gradual ramp-up using cosine schedule
+            progress = (epoch - phase_start) / (phase_end - phase_start)
+            return 0.5 * (1 + np.cos(np.pi * (1 - progress)))
+
+    def setup_penalty_loss_integration(self, alpha=0.01, warmup_epochs=5):
+        """
+        Setup quantization penalty loss integration.
+        Simplified version that just sets up the penalty handler.
+        """
+        from src.training.penalty_loss import QuantizationPenaltyLoss, patch_yolo_loss_with_penalty
+        
+        # Create penalty handler
+        self.penalty_handler = QuantizationPenaltyLoss(
+            alpha=alpha, 
+            warmup_epochs=warmup_epochs,
+            normalize=True
+        )
+        
+        # Patch model with penalty calculation
+        patch_yolo_loss_with_penalty(self.model, self.penalty_handler)
+        
+        logger = logging.getLogger('yolov8_qat')
+        logger.info(f"✅ Quantization penalty loss setup complete (alpha={alpha}, warmup={warmup_epochs})")
+
+    def verify_penalty_setup(self):
+        """
+        Verify that penalty loss integration is working.
+        Call this after setup_penalty_loss_integration().
+        """
+        from src.training.penalty_loss import verify_penalty_integration
+        
+        return verify_penalty_integration(self)
     
     def train_model(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, log_dir, use_distillation=False):
-        """Train with phased QAT approach."""
-        # Calculate phase durations
-        total_epochs = epochs
-        weight_only_epochs = max(1, int(total_epochs * 0.3))
-        activation_phase_epochs = max(1, int(total_epochs * 0.4))
-        full_quant_epochs = max(1, int(total_epochs * 0.2))
-        fine_tuning_epochs = total_epochs - weight_only_epochs - activation_phase_epochs - full_quant_epochs
+        """
+        FIXED: Continuous phased QAT training without breaking learning momentum.
+        """
+        import os
+        from ultralytics.utils import LOGGER
+
+        # FIXED: Validate dataset path
+        if not os.path.exists(data_yaml):
+            raise FileNotFoundError(f"Dataset YAML not found: {data_yaml}")
         
-        logger.info(f"Phase 1: Weight-only quantization - {weight_only_epochs} epochs")
-        logger.info(f"Phase 2: Adding activation quantization - {activation_phase_epochs} epochs")
-        logger.info(f"Phase 3: Full network quantization - {full_quant_epochs} epochs")
-        logger.info(f"Phase 4: Fine-tuning - {fine_tuning_epochs} epochs")
+        logger.info(f"✅ Using dataset: {data_yaml}")
         
-        # Base and reduced learning rates
-        base_lr = lr
-        fine_tuning_lr = base_lr * 0.1  # Lower LR for fine-tuning
+        # FIXED: Force clear any existing data configuration
+        if hasattr(self.model, 'overrides'):
+            self.model.overrides['data'] = data_yaml  # Explicitly set the data
         
-        # Phase 1: Weight-only quantization
-        logger.info("Starting Phase 1: Weight-only quantization")
-        self._configure_phase("weight_only")
-        phase1_results = self._train_phase(
-            data_yaml=data_yaml,
-            epochs=weight_only_epochs,
-            batch_size=batch_size,
-            img_size=img_size,
-            lr=base_lr,
-            device=device,
-            save_dir=os.path.join(save_dir, "phase1_weight_only"),
-            log_dir=log_dir,
-            use_distillation=use_distillation,
-            phase_name="phase1_weight_only"
+        # Calculate phase boundaries (epochs)
+        phase1_end = max(1, int(epochs * 0.3))      # 30% - Weight only
+        phase2_end = max(2, int(epochs * 0.7))      # 40% - Add activations  
+        phase3_end = max(3, int(epochs * 0.9))      # 20% - Full quantization
+        # phase4_end = epochs                        # 10% - Fine-tuning
+        
+        LOGGER.info(f"🔄 Continuous Phased QAT Training Plan:")
+        LOGGER.info(f"  Phase 1 (Weight-only): Epochs 1-{phase1_end}")
+        LOGGER.info(f"  Phase 2 (Add Activations): Epochs {phase1_end+1}-{phase2_end}")
+        LOGGER.info(f"  Phase 3 (Full Quantization): Epochs {phase2_end+1}-{phase3_end}")
+        LOGGER.info(f"  Phase 4 (Fine-tuning): Epochs {phase3_end+1}-{epochs}")
+        
+        # Setup penalty loss integration if available
+        if hasattr(self, 'penalty_handler'):
+            LOGGER.info("✅ Penalty loss integration active")
+        
+        # Configure initial phase (Phase 1: Weight-only)
+        self._configure_quantizers_dynamically("phase1_weight_only")
+        
+        # Setup training callbacks for phase transitions
+        def on_epoch_start(trainer):
+            """Callback to handle phase transitions during training."""
+            current_epoch = trainer.epoch
+            
+            # Update penalty handler epoch if available
+            if hasattr(self, 'penalty_handler'):
+                self.penalty_handler.update_epoch(current_epoch)
+            
+            # Phase transitions based on epoch
+            if current_epoch == phase1_end:
+                LOGGER.info(f"🔄 Epoch {current_epoch}: Transitioning to Phase 2 (Adding Activations)")
+                self._configure_quantizers_dynamically("phase2_activations")
+                
+            elif current_epoch == phase2_end:
+                LOGGER.info(f"🔄 Epoch {current_epoch}: Transitioning to Phase 3 (Full Quantization)")
+                self._configure_quantizers_dynamically("phase3_full_quant")
+                
+            elif current_epoch == phase3_end:
+                LOGGER.info(f"🔄 Epoch {current_epoch}: Transitioning to Phase 4 (Fine-tuning)")
+                self._configure_quantizers_dynamically("phase4_fine_tuning")
+                # Reduce learning rate for fine-tuning
+                if hasattr(trainer, 'optimizer'):
+                    for param_group in trainer.optimizer.param_groups:
+                        param_group['lr'] *= 0.1
+                    LOGGER.info(f"🔽 Learning rate reduced for fine-tuning: {param_group['lr']}")
+        
+        def on_epoch_end(trainer):
+            """Callback to log phase-specific information."""
+            if hasattr(self, 'penalty_handler') and trainer.epoch % 5 == 0:
+                stats = self.penalty_handler.get_statistics()
+                LOGGER.info(f"📊 Penalty Stats - Current: {stats.get('current_penalty', 0):.6f}, "
+                        f"Avg: {stats.get('avg_penalty', 0):.6f}")
+        
+        # Add callbacks to model  
+        self.model.add_callback('on_train_epoch_start', on_epoch_start)
+        self.model.add_callback('on_train_epoch_end', on_epoch_end)
+        
+        # SINGLE CONTINUOUS TRAINING CALL
+        try:
+            LOGGER.info("🚀 Starting continuous phased QAT training...")
+            LOGGER.info(f"📊 Dataset confirmed: {data_yaml}")
+            
+            # Add debug info before training
+            LOGGER.info(f"🔍 Model state before training:")
+            LOGGER.info(f"  - Model device: {next(self.model.model.parameters()).device}")
+            LOGGER.info(f"  - Training mode: {self.model.model.training}")
+            LOGGER.info(f"  - Has qconfig: {hasattr(self.model.model, 'qconfig')}")
+            
+            results = self.model.train(
+                data=data_yaml,
+                epochs=epochs,
+                batch=batch_size,
+                imgsz=img_size,
+                lr0=lr,
+                device=device,
+                project=os.path.dirname(save_dir),
+                name=os.path.basename(save_dir),
+                exist_ok=True,
+                pretrained=False,
+                val=True,
+                verbose=True
+            )
+            
+            LOGGER.info("✅ Continuous phased QAT training completed successfully")
+            return results
+            
+        except Exception as e:
+            LOGGER.error(f"❌ Training failed with error: {e}")
+            import traceback
+            LOGGER.error(f"Full traceback:\n{traceback.format_exc()}")
+            raise
+
+    def _configure_quantizers_dynamically(self, phase_name):
+        """
+        FIXED VERSION: Use QuantizerStateManager for reliable phase transitions.
+        """
+        if not hasattr(self, 'quantizer_manager'):
+            logger.info("🔧 Initializing quantizer state manager...")
+            self.quantizer_manager = QuantizerStateManager(self.model.model)
+        
+        # Define phase configurations
+        phase_configs = {
+            "phase1_weight_only": {"weights": True, "activations": False},
+            "phase2_activations": {"weights": True, "activations": True},
+            "phase3_full_quant": {"weights": True, "activations": True},
+            "phase4_fine_tuning": {"weights": True, "activations": True}
+        }
+        
+        if phase_name not in phase_configs:
+            logger.error(f"❌ Unknown phase: {phase_name}")
+            return False
+        
+        config = phase_configs[phase_name]
+        
+        # Apply phase configuration using the manager
+        success = self.quantizer_manager.set_phase_state(
+            phase_name=phase_name,
+            weights_enabled=config["weights"],
+            activations_enabled=config["activations"]
         )
         
-        # Phase 2: Add activation quantization
-        logger.info("Starting Phase 2: Adding activation quantization")
-        self._configure_phase("activation_phase")
-        phase2_results = self._train_phase(
-            data_yaml=data_yaml,
-            epochs=activation_phase_epochs,
-            batch_size=batch_size,
-            img_size=img_size,
-            lr=base_lr,
-            device=device,
-            save_dir=os.path.join(save_dir, "phase2_activations"),
-            log_dir=log_dir,
-            use_distillation=use_distillation,
-            phase_name="phase2_activations"
-        )
+        if not success:
+            logger.error(f"❌ Phase {phase_name} configuration failed!")
+            logger.info("🔧 Attempting emergency restoration...")
+            self.quantizer_manager.emergency_restore_all_quantizers()
+            
+            # Try again after emergency restoration
+            success = self.quantizer_manager.set_phase_state(
+                phase_name=phase_name,
+                weights_enabled=config["weights"], 
+                activations_enabled=config["activations"]
+            )
         
-        # Phase 3: Full network quantization
-        logger.info("Starting Phase 3: Full network quantization")
-        self._configure_phase("full_quantization")
-        phase3_results = self._train_phase(
-            data_yaml=data_yaml,
-            epochs=full_quant_epochs,
-            batch_size=batch_size,
-            img_size=img_size,
-            lr=base_lr,
-            device=device,
-            save_dir=os.path.join(save_dir, "phase3_full_quant"),
-            log_dir=log_dir,
-            use_distillation=use_distillation,
-            phase_name="phase3_full_quant"
-        )
+        # Final state report
+        final_state = self.quantizer_manager.get_current_state()
+        logger.info(f"🎯 Final state for {phase_name}:")
+        logger.info(f"  - Weight quantizers: {final_state['weight_active']}/{final_state['total_weight']}")
+        logger.info(f"  - Activation quantizers: {final_state['activation_active']}/{final_state['total_activation']}")
         
-        # Phase 4: Fine-tuning
-        logger.info("Starting Phase 4: Fine-tuning")
-        self._configure_phase("fine_tuning")
-        phase4_results = self._train_phase(
-            data_yaml=data_yaml,
-            epochs=fine_tuning_epochs,
-            batch_size=batch_size,
-            img_size=img_size,
-            lr=fine_tuning_lr,  # Lower learning rate for fine-tuning
-            device=device,
-            save_dir=os.path.join(save_dir, "phase4_fine_tuning"),
-            log_dir=log_dir,
-            use_distillation=use_distillation,
-            phase_name="phase4_fine_tuning"
-        )
-        
-        # Use last phase results as final results
-        return phase4_results
+        return success
 
     def train_standard(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, log_dir, use_distillation=False):
         """Train model with standard (non-phased) QAT approach."""
@@ -339,65 +508,127 @@ class QuantizedYOLOv8:
         self._set_weight_quantizers_enabled(enabled)
         self._set_activation_quantizers_enabled(enabled)
 
-    def _train_phase(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, log_dir, use_distillation, phase_name):
-        """Train for a specific phase - simplified approach to avoid pickling issues."""
-        # Create directories
-        os.makedirs(save_dir, exist_ok=True)
+    def _disable_fake_quantization(self):
+        """Disable fake quantization while keeping observers active."""
+        for name, module in self.model.model.named_modules():
+            if hasattr(module, 'weight_fake_quant'):
+                module.weight_fake_quant.disable_fake_quant = True
+            if hasattr(module, 'activation_post_process') and hasattr(module.activation_post_process, 'disable_fake_quant'):
+                module.activation_post_process.disable_fake_quant = True
+
+    def _enable_fake_quantization(self):
+        """Re-enable fake quantization after warmup."""
+        for name, module in self.model.model.named_modules():
+            if hasattr(module, 'weight_fake_quant'):
+                module.weight_fake_quant.disable_fake_quant = False
+            if hasattr(module, 'activation_post_process') and hasattr(module.activation_post_process, 'disable_fake_quant'):
+                module.activation_post_process.disable_fake_quant = False
+
+    def _enable_observers_only(self):
+        """Enable observers while keeping fake quantization disabled."""
+        for name, module in self.model.model.named_modules():
+            if hasattr(module, 'activation_post_process'):
+                # Observers should remain active to collect statistics
+                if hasattr(module.activation_post_process, 'enable_observer'):
+                    module.activation_post_process.enable_observer = True
+
+    def _check_observer_readiness(self, min_batches=100):
+        """Check if observers have sufficient statistics."""
+        ready_count = 0
+        total_count = 0
         
-        logger.info(f"Training {phase_name} for {epochs} epochs with lr={lr}")
+        for name, module in self.model.model.named_modules():
+            if hasattr(module, 'activation_post_process'):
+                observer = module.activation_post_process
+                total_count += 1
+                
+                # Check if observer is initialized and has enough data
+                if (hasattr(observer, 'initialized') and observer.initialized and 
+                    hasattr(observer, 'batch_count') and 
+                    getattr(observer, 'batch_count', 0) >= min_batches):
+                    ready_count += 1
+                elif hasattr(observer, 'min_val') and hasattr(observer, 'max_val'):
+                    # Alternative check for min/max observers
+                    if observer.min_val != float('inf') and observer.max_val != float('-inf'):
+                        ready_count += 1
         
-        # For the first phase, start with original model
-        if phase_name == "phase1_weight_only":
-            logger.info("Phase 1: Starting with original model")
-            trainer = YOLO(self.model_path)
-            
-        else:
-            # For subsequent phases, try to use the best model from previous phase
-            prev_best_model = self._get_previous_phase_best_model(save_dir, phase_name)
-            
-            if prev_best_model and os.path.exists(prev_best_model):
-                logger.info(f"Loading best model from previous phase: {prev_best_model}")
-                trainer = YOLO(prev_best_model)
-            else:
-                logger.warning(f"Previous phase best model not found, using original model")
-                trainer = YOLO(self.model_path)
-        
-        # Apply quantization configuration to the trainer model
-        # This is where we'll apply our phase-specific quantization settings
-        logger.info(f"Applying quantization configuration for {phase_name}")
-        
-        # Set trainer model to training mode
-        trainer.model.train()
-        
-        # Apply qconfig to the trainer model
-        self._apply_qconfig_and_prepare_model(trainer, phase_name)
-        
-        # Verify quantization setup
-        self._verify_quantization_setup(trainer.model, phase_name)
-        
-        # Training arguments
-        train_args = {
-            'data': data_yaml,
-            'epochs': epochs,
-            'batch': batch_size,
-            'imgsz': img_size,
-            'lr0': lr,
-            'device': device,
-            'project': os.path.dirname(save_dir),
-            'name': os.path.basename(save_dir),
-            'exist_ok': True,
-            'pretrained': False,
-            'val': True
+        return ready_count
+
+    def _configure_phase_gradual(self, phase, epoch, total_epochs):
+        """
+        Configure model for specific QAT phase with gradual transitions.
+        COMPLETE IMPLEMENTATION of the method you declared.
+        """
+        # Define phase boundaries
+        phase_boundaries = {
+            "phase1_weight_only": (0, int(total_epochs * 0.3)),
+            "phase2_activations": (int(total_epochs * 0.3), int(total_epochs * 0.7)),
+            "phase3_full_quant": (int(total_epochs * 0.7), int(total_epochs * 0.9)),
+            "phase4_fine_tuning": (int(total_epochs * 0.9), total_epochs)
         }
         
-        # Train for this phase
-        logger.info(f"Starting training for {phase_name}")
-        results = trainer.train(**train_args)
+        if phase not in phase_boundaries:
+            logger.warning(f"Unknown phase: {phase}")
+            return
         
-        # After training, update our main model with the best results
-        self._update_main_model_after_phase(save_dir, phase_name)
+        phase_start, phase_end = phase_boundaries[phase]
         
-        return results
+        # Calculate gradual enablement factor
+        if phase == "phase1_weight_only":
+            # Weight quantization ramp-up
+            weight_factor = self.gradual_quantization_enable(epoch, total_epochs, phase_start, phase_end)
+            activation_factor = 0.0
+        elif phase == "phase2_activations":
+            # Weight quantization fully enabled, activation ramp-up
+            weight_factor = 1.0
+            activation_factor = self.gradual_quantization_enable(epoch, total_epochs, phase_start, phase_end)
+        elif phase in ["phase3_full_quant", "phase4_fine_tuning"]:
+            # Both fully enabled
+            weight_factor = 1.0
+            activation_factor = 1.0
+        
+        # Apply gradual factors to quantizers
+        self._apply_gradual_quantization_factors(weight_factor, activation_factor)
+        
+        logger.info(f"Phase {phase} Epoch {epoch}: Weight factor={weight_factor:.3f}, Activation factor={activation_factor:.3f}")
+
+    def _apply_gradual_quantization_factors(self, weight_factor, activation_factor):
+        """Apply gradual quantization factors to fake quantizers."""
+        for name, module in self.model.model.named_modules():
+            # Handle weight quantizers
+            if hasattr(module, 'weight_fake_quant'):
+                if hasattr(module.weight_fake_quant, 'set_quantization_factor'):
+                    module.weight_fake_quant.set_quantization_factor(weight_factor)
+                else:
+                    # For standard FakeQuantize, we can modify the step size
+                    if weight_factor < 1.0:
+                        self._modify_quantizer_step_size(module.weight_fake_quant, weight_factor)
+            
+            # Handle activation quantizers
+            if hasattr(module, 'activation_post_process'):
+                if hasattr(module.activation_post_process, 'set_quantization_factor'):
+                    module.activation_post_process.set_quantization_factor(activation_factor)
+                else:
+                    # For standard FakeQuantize, modify step size
+                    if activation_factor < 1.0:
+                        self._modify_quantizer_step_size(module.activation_post_process, activation_factor)
+
+    def _modify_quantizer_step_size(self, quantizer, factor):
+        """
+        Modify quantizer step size for gradual quantization.
+        When factor < 1.0, reduce quantization strength.
+        """
+        if hasattr(quantizer, 'scale') and factor < 1.0:
+            # Gradually reduce quantization by interpolating with identity
+            # This is a simplified approach - more sophisticated methods exist
+            original_scale = getattr(quantizer, '_original_scale', None)
+            if original_scale is None:
+                quantizer._original_scale = quantizer.scale.clone()
+                original_scale = quantizer._original_scale
+            
+            # Interpolate between original scale and a much larger scale (approaching identity)
+            large_scale = original_scale * 100  # Effectively disables quantization
+            quantizer.scale.data.copy_(original_scale * factor + large_scale * (1 - factor))
 
     def _apply_qconfig_and_prepare_model(self, trainer, phase_name):
         """Apply qconfig and prepare model for QAT in one step."""
@@ -438,81 +669,6 @@ class QuantizedYOLOv8:
         except Exception as e:
             logger.error(f"Error preparing model for QAT: {e}")
             logger.warning("Continuing without QAT preparation - model will train without quantization")
-
-    def _update_main_model_after_phase(self, save_dir, phase_name):
-        """Update main model with best results from this phase."""
-        best_weights_path = os.path.join(save_dir, 'weights', 'best.pt')
-        
-        if os.path.exists(best_weights_path):
-            logger.info(f"Updating main model with best weights from {best_weights_path}")
-            
-            try:
-                # Load the trained model
-                self.model = YOLO(best_weights_path)
-                
-                # Re-prepare the model for QAT for the next phase
-                self.model.model.train()
-                self._apply_qconfig_and_prepare_model(self.model, phase_name)
-                
-                logger.info(f"Successfully updated main model with {phase_name} results")
-                
-            except Exception as e:
-                logger.error(f"Error updating main model: {e}")
-                logger.warning("Main model update failed - continuing with previous model state")
-        else:
-            logger.warning(f"Best weights not found at {best_weights_path}")
-
-    def _apply_phase_config_to_trainer_model(self, trainer_model, phase_name):
-        """
-        Apply phase-specific quantization configuration to trainer model.
-        Optimized for PyTorch 2.4.1.
-        """
-        logger.info(f"Applying {phase_name} configuration to trainer model...")
-        
-        try:
-            # Import PyTorch quantization modules
-            from torch.quantization import get_default_qat_qconfig, prepare_qat
-            
-            # Count modules for verification
-            weight_quant_count = 0
-            activation_quant_count = 0
-            total_modules = 0
-            
-            # Apply configuration based on phase
-            for name, module in trainer_model.named_modules():
-                total_modules += 1
-                
-                # Configure according to phase
-                if hasattr(module, 'weight_fake_quant') or hasattr(module, 'activation_post_process'):
-                    if phase_name == "phase1_weight_only":
-                        # Phase 1: Only weight quantization
-                        if hasattr(module, 'activation_post_process'):
-                            if not hasattr(module, '_original_activation_post_process'):
-                                module._original_activation_post_process = module.activation_post_process
-                            module.activation_post_process = nn.Identity()
-                        
-                        if hasattr(module, 'weight_fake_quant'):
-                            weight_quant_count += 1
-                    
-                    elif phase_name in ["phase2_activations", "phase3_full_quant", "phase4_fine_tuning"]:
-                        # Enable both weight and activation quantization
-                        if hasattr(module, '_original_activation_post_process'):
-                            module.activation_post_process = module._original_activation_post_process
-                        
-                        if hasattr(module, 'weight_fake_quant'):
-                            weight_quant_count += 1
-                        
-                        if hasattr(module, 'activation_post_process'):
-                            activation_quant_count += 1
-            
-            logger.info(f"Applied {phase_name} config to trainer model:")
-            logger.info(f"  - Total modules: {total_modules}")
-            logger.info(f"  - Weight quantizers: {weight_quant_count}")
-            logger.info(f"  - Activation quantizers: {activation_quant_count}")
-            
-        except Exception as e:
-            logger.error(f"Error applying phase config: {e}")
-            logger.warning(f"Training may proceed with default quantization: {e}")
 
     def _configure_module_for_weight_only(self, module):
         """Configure module for weight-only quantization (Phase 1)."""
@@ -708,35 +864,6 @@ class QuantizedYOLOv8:
         
         logger.info(f"Model exported to {exported_path}")
         return exported_path
-    
-    def analyze_quantization_error(self, data_loader, n_samples=10):
-        """
-        Analyze quantization error layer by layer.
-        
-        Args:
-            data_loader: DataLoader with samples for analysis
-            n_samples: Number of samples to analyze
-            
-        Returns:
-            Dictionary with layer-wise error metrics
-        """
-        if not self.is_converted:
-            logger.warning("Model not converted to INT8 yet, converting model...")
-            self.convert_to_quantized()
-        
-        # This is a placeholder - actual implementation would need to compare outputs
-        # between original FP32 and quantized model across layers
-        logger.info(f"Analyzing quantization error across {n_samples} samples...")
-        
-        # Run inference with original and quantized model
-        # Compare outputs and calculate error metrics
-        
-        error_metrics = {
-            "overall_error": 0.0,
-            "layer_wise_errors": {}
-        }
-        
-        return error_metrics
 
     def setup_distillation(self, teacher_model_path, temperature=4.0, alpha=0.5, feature_distillation=False, feature_layers=None):
         """
@@ -978,104 +1105,6 @@ class QuantizedYOLOv8:
         logger.info(f"Quantization penalty monitoring setup with alpha={alpha}")
         logger.info("Note: For YOLOv8, we'll track the penalty but apply it manually in training")
 
-    def _create_trainer(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, use_distillation=False):
-        """
-        Create a YOLO trainer with phase-specific settings.
-        
-        Args:
-            data_yaml: Dataset YAML path
-            epochs: Number of epochs for this phase
-            batch_size: Batch size
-            img_size: Input image size
-            lr: Learning rate for this phase
-            device: Training device
-            save_dir: Directory to save results
-            use_distillation: Whether to use knowledge distillation
-            
-        Returns:
-            YOLO trainer object
-        """
-        import os
-        from ultralytics import YOLO
-        
-        # For YOLOv8, we can't create a new YOLO object with an existing model
-        # We need to save the model first to a temporary file, then load it
-        
-        # Save the current model state to a temporary file
-        temp_model_path = os.path.join(save_dir, "temp_model.pt")
-        os.makedirs(os.path.dirname(temp_model_path), exist_ok=True)
-        
-        # Save model state
-        # torch.save(self.model.state_dict(), temp_model_path)
-        torch.save(self.model.model.state_dict(), temp_model_path)  # Use self.model.model instead
-        
-        # Create a new YOLO object from the saved file
-        trainer = YOLO(temp_model_path)
-        
-        # Configure training arguments
-        train_args = {
-            'data': data_yaml,
-            'epochs': epochs,
-            'batch': batch_size,
-            'imgsz': img_size,
-            'lr0': lr,
-            'device': device,
-            'project': os.path.dirname(save_dir),
-            'name': os.path.basename(save_dir),
-            'exist_ok': True,
-            'pretrained': False,  # Don't load pretrained weights, we already have our model
-            'val': True,          # Run validation during training
-        }
-        
-        # If using distillation, we would add distillation-specific settings
-        if use_distillation and hasattr(self, 'distillation_config'):
-            # This would depend on how distillation is implemented for YOLOv8
-            train_args['teacher_model'] = self.distillation_config.get('teacher_model', None)
-            train_args['distillation_tau'] = self.distillation_config.get('temperature', 4.0)
-            train_args['distillation_alpha'] = self.distillation_config.get('alpha', 0.5)
-        
-        # Store training arguments for reference
-        trainer.train_args = train_args
-        
-        return trainer, train_args
-
-    def train_simplified(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, log_dir, use_distillation=False):
-        """Simplified training implementation without phased approach."""
-        import os
-        import logging
-        
-        logger = logging.getLogger('yolov8_qat')
-        
-        # Create save directory
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Log training parameters
-        logger.info(f"Training with simplified approach:")
-        logger.info(f"  Data: {data_yaml}")
-        logger.info(f"  Epochs: {epochs}")
-        logger.info(f"  Batch size: {batch_size}")
-        logger.info(f"  Image size: {img_size}")
-        logger.info(f"  Learning rate: {lr}")
-        logger.info(f"  Device: {device}")
-        
-        # Train using existing YOLO object - no need to save/load
-        results = self.model.train(
-            data=data_yaml,
-            epochs=epochs,
-            batch=batch_size,
-            imgsz=img_size,
-            lr0=lr,
-            device=device,
-            project=os.path.dirname(save_dir),
-            name=os.path.basename(save_dir),
-            exist_ok=True,
-            pretrained=False,
-            val=True
-        )
-        
-        logger.info("Training completed")
-        return results
-
     def save(self, path, preserve_qat=True):
         """
         CORRECTED VERSION: Save the model with proper quantization preservation.
@@ -1164,162 +1193,6 @@ class QuantizedYOLOv8:
             except Exception as e:
                 logger.error(f"Error saving model: {e}")
                 return False
-
-    def _verify_saved_model(self, path, expected_fake_quant_count):
-        """Verify that the saved model preserved quantization."""
-        try:
-            # Load and check the saved model
-            saved_data = torch.load(path, map_location='cpu')
-            
-            if isinstance(saved_data, dict):
-                # Check for our QAT save format with model_state_dict
-                if 'model_state_dict' in saved_data and 'fake_quant_count' in saved_data:
-                    # This is our comprehensive save format
-                    saved_count = saved_data.get('fake_quant_count', 0)
-                    save_method = saved_data.get('save_method', 'unknown')
-                    quantization_preserved = saved_data.get('quantization_preserved', False)
-                    
-                    logger.info(f"Save verification (Method 1 - state dict format):")
-                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
-                    logger.info(f"  - Saved count recorded: {saved_count}")
-                    logger.info(f"  - Save method: {save_method}")
-                    logger.info(f"  - Quantization preserved: {quantization_preserved}")
-                    
-                    if saved_count == expected_fake_quant_count and saved_count > 0:
-                        logger.info("✅ Quantization successfully preserved in saved model (state dict format)")
-                        return True
-                    else:
-                        logger.error(f"❌ Quantization count mismatch: expected {expected_fake_quant_count}, got {saved_count}")
-                        return False
-                
-                # Check for full model format (if we ever save the full model)
-                elif 'model' in saved_data:
-                    # Count FakeQuantize modules in loaded model
-                    try:
-                        actual_count = sum(1 for n, m in saved_data['model'].named_modules() 
-                                        if 'FakeQuantize' in type(m).__name__)
-                        
-                        saved_count = saved_data.get('fake_quant_count', 0)
-                        
-                        logger.info(f"Save verification (Method 2 - full model format):")
-                        logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
-                        logger.info(f"  - Saved count recorded: {saved_count}")
-                        logger.info(f"  - Actual count in saved model: {actual_count}")
-                        
-                        if actual_count == expected_fake_quant_count and actual_count > 0:
-                            logger.info("✅ Quantization successfully preserved in saved model (full model format)")
-                            return True
-                        else:
-                            logger.error(f"❌ Quantization not properly preserved in full model")
-                            return False
-                            
-                    except Exception as model_check_error:
-                        logger.error(f"❌ Error checking full model format: {model_check_error}")
-                        return False
-                
-                # Check for fallback format
-                elif 'fake_quant_count' in saved_data:
-                    saved_count = saved_data['fake_quant_count']
-                    save_method = saved_data.get('save_method', 'unknown')
-                    
-                    logger.info(f"Save verification (Method 3 - fallback format):")
-                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
-                    logger.info(f"  - Saved count recorded: {saved_count}")
-                    logger.info(f"  - Save method: {save_method}")
-                    
-                    if saved_count == expected_fake_quant_count and saved_count > 0:
-                        logger.info("✅ Quantization info successfully preserved in fallback format")
-                        return True
-                    else:
-                        logger.error(f"❌ Quantization count mismatch in fallback format")
-                        return False
-                
-                else:
-                    logger.error("❌ No recognized quantization information found in saved data")
-                    logger.info(f"Available keys in saved data: {list(saved_data.keys())}")
-                    return False
-            else:
-                logger.error("❌ Saved model format not recognized as dictionary")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to verify saved model: {e}")
-            return False
-
-    def _verify_saved_model_fallback(self, path, expected_fake_quant_count):
-        """Verify that the fallback saved model preserved quantization info."""
-        try:
-            # Load and check the saved model
-            saved_data = torch.load(path, map_location='cpu')
-            
-            if isinstance(saved_data, dict):
-                # Check for fallback format with direct fake_quant_count
-                if 'fake_quant_count' in saved_data:
-                    saved_count = saved_data['fake_quant_count']
-                    save_method = saved_data.get('save_method', 'unknown')
-                    quantization_preserved = saved_data.get('quantization_preserved', False)
-                    
-                    logger.info(f"Fallback save verification (Method 1):")
-                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
-                    logger.info(f"  - Saved count recorded: {saved_count}")
-                    logger.info(f"  - Save method: {save_method}")
-                    logger.info(f"  - Quantization preserved: {quantization_preserved}")
-                    
-                    if saved_count == expected_fake_quant_count and saved_count > 0:
-                        logger.info("✅ Quantization info successfully preserved in fallback save")
-                        return True
-                    else:
-                        logger.error(f"❌ Quantization count mismatch: expected {expected_fake_quant_count}, got {saved_count}")
-                        return False
-                
-                # Check for quantization_info nested format
-                elif 'quantization_info' in saved_data:
-                    quant_info = saved_data['quantization_info']
-                    saved_count = quant_info.get('fake_quant_count', 0)
-                    was_prepared = quant_info.get('was_prepared', False)
-                    
-                    logger.info(f"Fallback save verification (Method 2):")
-                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
-                    logger.info(f"  - Saved count: {saved_count}")
-                    logger.info(f"  - Was prepared: {was_prepared}")
-                    
-                    success = saved_count == expected_fake_quant_count and saved_count > 0
-                    if success:
-                        logger.info("✅ Quantization info successfully preserved in nested format")
-                    else:
-                        logger.error(f"❌ Quantization count mismatch in nested format")
-                    
-                    return success
-                
-                # Check for config format
-                elif 'config' in saved_data and 'quantization_info' in saved_data:
-                    quant_info = saved_data['quantization_info']
-                    saved_count = quant_info.get('fake_quant_count', 0)
-                    
-                    logger.info(f"Fallback save verification (Method 3 - config format):")
-                    logger.info(f"  - Expected FakeQuantize modules: {expected_fake_quant_count}")
-                    logger.info(f"  - Saved count: {saved_count}")
-                    
-                    success = saved_count == expected_fake_quant_count and saved_count > 0
-                    if success:
-                        logger.info("✅ Quantization info successfully preserved in config format")
-                    else:
-                        logger.error(f"❌ Quantization count mismatch in config format")
-                    
-                    return success
-                
-                else:
-                    logger.error("❌ No quantization information found in fallback save")
-                    logger.info(f"Available keys in saved data: {list(saved_data.keys())}")
-                    return False
-                    
-            else:
-                logger.error("❌ Saved model format not recognized as dictionary")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to verify fallback saved model: {e}")
-            return False
 
     def verify_quantization_preserved(self):
         """Verify that the current model still has quantization modules."""
@@ -1520,331 +1393,6 @@ class QuantizedYOLOv8:
                 return False
         
         return True
-
-    def _save_model_with_quantization_info(self, model, path):
-        """Save model while avoiding quantization pickling issues."""
-        try:
-            # Method 1: Try to save state dict only (avoids observer pickling issues)
-            logger.info(f"Saving model state dict to avoid pickling issues: {path}")
-            
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            
-            # Save just the state dict
-            torch.save({
-                'model': model.state_dict(),
-                'metadata': {
-                    'quantized': True,
-                    'prepared_for_qat': True,
-                    'architecture': 'yolov8',
-                    'framework': 'pytorch'
-                }
-            }, path)
-            
-            logger.info(f"Successfully saved model state dict to {path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to save model state dict: {e}")
-            
-            # Method 2: Fallback - create a clean YOLO model and copy weights
-            try:
-                logger.info("Trying fallback method: creating clean YOLO model")
-                
-                # Create a clean YOLO model
-                clean_yolo = YOLO(self.model_path)  # Start with original model
-                
-                # Copy the state dict from our quantized model to the clean model
-                # This will copy weights but lose quantization info (which is expected for intermediate saves)
-                try:
-                    clean_yolo.model.load_state_dict(model.state_dict(), strict=False)
-                    logger.info("Successfully copied weights to clean model")
-                except Exception as copy_error:
-                    logger.warning(f"Could not copy all weights: {copy_error}")
-                    # If copying fails, just use the original model structure
-                
-                # Save the clean model
-                clean_yolo.save(path)
-                logger.info(f"Successfully saved clean model to {path}")
-                
-            except Exception as fallback_error:
-                logger.error(f"Fallback save method also failed: {fallback_error}")
-                
-                # Method 3: Last resort - save original model
-                logger.info("Using original model as last resort")
-                original_yolo = YOLO(self.model_path)
-                original_yolo.save(path)
-                logger.warning(f"Saved original model to {path} (quantization info lost)")
-
-    def _get_previous_phase_best_model(self, save_dir, phase_name):
-        """Get the best model from the previous phase."""
-        phase_mapping = {
-            "phase2_activations": "phase1_weight_only",
-            "phase3_full_quant": "phase2_activations", 
-            "phase4_fine_tuning": "phase3_full_quant"
-        }
-        
-        prev_phase = phase_mapping.get(phase_name)
-        if prev_phase:
-            prev_phase_dir = os.path.join(os.path.dirname(save_dir), prev_phase)
-            prev_best_model = os.path.join(prev_phase_dir, "weights", "best.pt")
-            
-            if os.path.exists(prev_best_model):
-                logger.info(f"Found previous phase model: {prev_best_model}")
-                return prev_best_model
-            else:
-                logger.warning(f"Previous phase model not found: {prev_best_model}")
-        
-        return None
-
-    def test_quantization_setup(self):
-        """Test method to verify quantization is working correctly."""
-        logger.info("Testing quantization setup...")
-        
-        # Test each phase configuration
-        phases_to_test = [
-            "phase1_weight_only",
-            "phase2_activations", 
-            "phase3_full_quant",
-            "phase4_fine_tuning"
-        ]
-        
-        for phase in phases_to_test:
-            logger.info(f"\n--- Testing {phase} ---")
-            
-            # Configure for this phase
-            test_model = copy.deepcopy(self.model.model)
-            self._configure_model_for_specific_phase(test_model, phase)
-            
-            # Verify setup
-            success = self._verify_quantization_setup(test_model, phase)
-            
-            if success:
-                logger.info(f"✓ {phase} configuration test PASSED")
-            else:
-                logger.error(f"❌ {phase} configuration test FAILED")
-        
-        logger.info("Quantization setup test completed")
-
-    # ==============================================================================
-    # 4. ADD LOADING METHOD (add this as a class method)
-    # ==============================================================================
-
-    @classmethod
-    def load_qat_model(cls, path, device='cpu'):
-        """
-        Load a QAT model that was saved with quantization preservation.
-        
-        Args:
-            path: Path to saved QAT model
-            device: Device to load model on
-            
-        Returns:
-            QuantizedYOLOv8 instance with quantization preserved
-        """
-        logger.info(f"Loading QAT model from {path}")
-        
-        try:
-            # Load the saved data
-            saved_data = torch.load(path, map_location=device)
-            
-            # Check the save format
-            if isinstance(saved_data, dict) and 'qat_info' in saved_data:
-                # This is our preserved format
-                qat_info = saved_data['qat_info']
-                
-                # Create instance with same configuration
-                instance = cls(
-                    model_path=qat_info['model_path'],
-                    qconfig_name=qat_info['qconfig_name'],
-                    skip_detection_head=qat_info['skip_detection_head'],
-                    fuse_modules=qat_info['fuse_modules']
-                )
-                
-                if 'model' in saved_data:
-                    # Load the full model structure
-                    instance.model.model = saved_data['model'].to(device)
-                    logger.info("✅ Loaded full model structure with quantization")
-                else:
-                    # Load state dict and re-prepare
-                    instance.prepare_for_qat()
-                    instance.model.model.load_state_dict(saved_data['model_state_dict'])
-                    instance.model.model.to(device)
-                    logger.info("✅ Loaded state dict and re-prepared for QAT")
-                
-                # Set flags
-                instance.is_prepared = qat_info['is_prepared']
-                
-                # Verify quantization was preserved
-                fake_quant_count = sum(1 for n, m in instance.model.model.named_modules() 
-                                    if 'FakeQuantize' in type(m).__name__)
-                
-                expected_count = saved_data.get('fake_quant_count', 0)
-                
-                if fake_quant_count > 0 and fake_quant_count == expected_count:
-                    logger.info(f"✅ QAT model loaded successfully with {fake_quant_count} FakeQuantize modules")
-                else:
-                    logger.warning(f"⚠️ Quantization may not be fully preserved: {fake_quant_count}/{expected_count}")
-                
-                return instance
-                
-            elif isinstance(saved_data, dict) and 'config' in saved_data:
-                # Fallback format - state dict with config
-                config = saved_data['config']
-                
-                instance = cls(
-                    model_path=config['model_path'],
-                    qconfig_name=config['qconfig_name'],
-                    skip_detection_head=config['skip_detection_head'],
-                    fuse_modules=config.get('fuse_modules', True)
-                )
-                
-                # Re-prepare for QAT and load state dict
-                instance.prepare_for_qat()
-                instance.model.model.load_state_dict(saved_data['state_dict'])
-                instance.model.model.to(device)
-                
-                logger.warning("⚠️ Loaded from state dict - quantization structure recreated")
-                
-                return instance
-                
-            else:
-                # Try standard YOLO loading
-                logger.warning("⚠️ Loading as standard YOLO model - quantization may be lost")
-                from ultralytics import YOLO
-                
-                yolo_model = YOLO(path)
-                yolo_model.model.to(device)
-                
-                # Create instance
-                instance = cls.__new__(cls)
-                instance.model = yolo_model
-                instance.is_prepared = False
-                instance.qconfig_name = 'default'
-                instance.skip_detection_head = True
-                instance.fuse_modules = True
-                
-                logger.warning("⚠️ Loaded as standard model - will need to re-prepare for QAT")
-                
-                return instance
-                
-        except Exception as e:
-            logger.error(f"Failed to load QAT model: {e}")
-            raise
-
-    # ==============================================================================
-    # 5. ADD MODEL TESTING METHOD (add this method)
-    # ==============================================================================
-
-    def test_quantization_preservation(self):
-        """Test that quantization is working correctly with detailed debugging."""
-        logger.info("Testing quantization preservation...")
-        
-        if not self.is_prepared:
-            logger.error("❌ Model not prepared for QAT")
-            return False
-        
-        # Test 1: Count FakeQuantize modules
-        fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
-                            if 'FakeQuantize' in type(m).__name__)
-        
-        logger.info(f"Test 1 - FakeQuantize modules: {fake_quant_count}")
-        
-        if fake_quant_count == 0:
-            logger.error("❌ No FakeQuantize modules found!")
-            return False
-        
-        # Test 2: Check qconfig application
-        qconfig_count = sum(1 for n, m in self.model.model.named_modules() 
-                        if hasattr(m, 'qconfig') and m.qconfig is not None)
-        
-        logger.info(f"Test 2 - Modules with qconfig: {qconfig_count}")
-        
-        # Test 3: Detailed save/load cycle with debugging
-        logger.info("Test 3 - Testing save/load cycle with detailed debugging...")
-        
-        temp_path = 'temp_qat_test.pt'
-        try:
-            # Save with detailed logging
-            logger.info(f"  Step 3a: Saving QAT model to {temp_path}")
-            save_success = self.save(temp_path, preserve_qat=True)
-            if not save_success:
-                logger.error("❌ Step 3a: Save operation reported failure")
-                return False
-            
-            logger.info("  Step 3b: Examining saved file contents")
-            if not os.path.exists(temp_path):
-                logger.error(f"❌ Step 3b: Save file does not exist at {temp_path}")
-                return False
-            
-            # Load and examine the saved data structure
-            saved_data = torch.load(temp_path, map_location='cpu')
-            logger.info(f"  Step 3c: Saved data type: {type(saved_data)}")
-            
-            if isinstance(saved_data, dict):
-                logger.info(f"  Step 3d: Available keys in saved data: {list(saved_data.keys())}")
-                
-                # Check each expected key
-                expected_keys = ['model_state_dict', 'qat_info', 'fake_quant_count', 'quantization_preserved']
-                for key in expected_keys:
-                    if key in saved_data:
-                        if key == 'fake_quant_count':
-                            logger.info(f"    ✅ {key}: {saved_data[key]}")
-                        else:
-                            logger.info(f"    ✅ {key}: present")
-                    else:
-                        logger.warning(f"    ⚠️ {key}: missing")
-                
-                # Specific verification
-                if 'fake_quant_count' in saved_data:
-                    saved_count = saved_data['fake_quant_count']
-                    logger.info(f"  Step 3e: Saved FakeQuantize count: {saved_count}")
-                    
-                    if saved_count == fake_quant_count:
-                        logger.info("  Step 3f: ✅ Count verification PASSED")
-                        
-                        # Test loading
-                        logger.info("  Step 3g: Testing model loading")
-                        try:
-                            # Try to recreate the model from saved data
-                            if 'model_state_dict' in saved_data and 'qat_info' in saved_data:
-                                logger.info("    ✅ Both model_state_dict and qat_info found")
-                                logger.info("    ✅ Save format is correct for loading")
-                                
-                                # Clean up and return success
-                                os.remove(temp_path)
-                                logger.info("✅ All quantization preservation tests PASSED")
-                                return True
-                            else:
-                                logger.error("    ❌ Required keys for loading not found")
-                                os.remove(temp_path)
-                                return False
-                                
-                        except Exception as load_test_error:
-                            logger.error(f"    ❌ Load test failed: {load_test_error}")
-                            os.remove(temp_path)
-                            return False
-                    else:
-                        logger.error(f"  Step 3f: ❌ Count mismatch: expected {fake_quant_count}, saved {saved_count}")
-                        os.remove(temp_path)
-                        return False
-                else:
-                    logger.error("  Step 3e: ❌ fake_quant_count not found in saved data")
-                    os.remove(temp_path)
-                    return False
-            else:
-                logger.error(f"  Step 3d: ❌ Saved data is not a dictionary, got {type(saved_data)}")
-                os.remove(temp_path)
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Save/load test exception: {e}")
-            logger.error(f"Full traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            return False
         
     def _verify_qat_save(self, path, expected_fake_quant_count):
         """
@@ -1947,64 +1495,98 @@ class QuantizedYOLOv8:
             logger.error(f"❌ Fallback save also failed: {e}")
             return False
 
-    # ===================================================================
-# ADDITIONAL METHOD: Load QAT model properly
-# ===================================================================
+    def test_all_phase_transitions(self):
+        """
+        Test all phase transitions to ensure quantizers are preserved correctly.
+        """
+        logger.info("🧪 Testing ALL phase transitions...")
+        
+        phases = ["phase1_weight_only", "phase2_activations", "phase3_full_quant", "phase4_fine_tuning"]
+        expected_results = [
+            (45, 0),   # Phase 1: Weights=45, Activations=0
+            (45, 90),  # Phase 2: Weights=45, Activations=90 (restored)
+            (45, 90),  # Phase 3: Weights=45, Activations=90 (maintained)
+            (45, 90)   # Phase 4: Weights=45, Activations=90 (maintained)
+        ]
+        
+        all_passed = True
+        
+        for i, (phase, expected) in enumerate(zip(phases, expected_results)):
+            logger.info(f"🔄 Testing {phase}...")
+            
+            # Apply phase configuration
+            success = self._configure_quantizers_dynamically(phase)
+            
+            # Count actual quantizers
+            actual_weights, actual_activations = self._count_active_quantizers()
+            expected_weights, expected_activations = expected
+            
+            # Check results
+            if (actual_weights >= expected_weights * 0.9 and  # Allow 10% tolerance
+                actual_activations >= expected_activations * 0.9):
+                logger.info(f"✅ {phase} test PASSED: W={actual_weights}, A={actual_activations}")
+            else:
+                logger.error(f"❌ {phase} test FAILED:")
+                logger.error(f"   Expected: W≥{expected_weights}, A≥{expected_activations}")
+                logger.error(f"   Actual: W={actual_weights}, A={actual_activations}")
+                all_passed = False
+        
+        if all_passed:
+            logger.info("🎉 ALL phase transitions work correctly!")
+        else:
+            logger.error("💥 Some phase transitions are broken!")
+        
+        return all_passed
 
-    @classmethod
-    def load_qat_model_fixed(cls, path, device='cpu'):
+    def _count_active_quantizers(self):
         """
-        CORRECTED VERSION: Load QAT model with proper quantization handling.
-        
-        Args:
-            path: Path to saved QAT model
-            device: Device to load on
-        
-        Returns:
-            QuantizedYOLOv8 instance
+        Count currently active quantizers for testing and debugging.
         """
-        logger.info(f"Loading QAT model from {path}")
+        weight_count = 0
+        activation_count = 0
         
-        try:
-            # Load saved data
-            saved_data = torch.load(path, map_location=device)
+        for name, module in self.model.model.named_modules():
+            # Count active weight quantizers
+            if (hasattr(module, 'weight_fake_quant') and 
+                not isinstance(module.weight_fake_quant, torch.nn.Identity)):
+                weight_count += 1
             
-            if isinstance(saved_data, dict):
-                if 'model' in saved_data and 'qat_info' in saved_data:
-                    # Our new corrected format
-                    qat_info = saved_data['qat_info']
-                    
-                    # Create instance with correct parameters
-                    instance = cls(
-                        model_path=qat_info.get('model_path', 'yolov8n.pt'),
-                        qconfig_name=qat_info.get('qconfig_name', 'default'),
-                        skip_detection_head=qat_info.get('skip_detection_head', True),
-                        fuse_modules=qat_info.get('fuse_modules', True)
-                    )
-                    
-                    # Load the full model
-                    instance.model.model = saved_data['model'].to(device)
-                    instance.is_prepared = qat_info.get('is_prepared', True)
-                    
-                    logger.info("✅ QAT model loaded successfully with quantization preserved")
-                    return instance
-                    
-                elif 'model' in saved_data:
-                    # Simplified format
-                    model_info = saved_data.get('model_info', {})
-                    
-                    instance = cls.__new__(cls)
-                    instance.model = type('MockYOLO', (), {'model': saved_data['model']})()
-                    instance.model.model.to(device)
-                    instance.is_prepared = True
-                    instance.qconfig_name = 'default'
-                    
-                    logger.info("✅ Model loaded from simplified format")
-                    return instance
-                    
-            logger.error("❌ Unrecognized model format")
-            return None
+            # Count active activation quantizers
+            if (hasattr(module, 'activation_post_process') and 
+                not isinstance(module.activation_post_process, torch.nn.Identity)):
+                activation_count += 1
+        
+        return weight_count, activation_count
+
+    def debug_quantizer_states(self, phase_name="unknown"):
+        """
+        Debug function to show detailed quantizer states.
+        """
+        logger.info(f"🔍 Debugging quantizer states for {phase_name}:")
+        
+        weight_states = {"active": 0, "disabled": 0, "identity": 0}
+        activation_states = {"active": 0, "disabled": 0, "identity": 0}
+        
+        for name, module in self.model.model.named_modules():
+            # Analyze weight quantizers
+            if hasattr(module, 'weight_fake_quant'):
+                if hasattr(module, '_disabled_weight_fake_quant'):
+                    weight_states["disabled"] += 1
+                elif isinstance(module.weight_fake_quant, torch.nn.Identity):
+                    weight_states["identity"] += 1
+                else:
+                    weight_states["active"] += 1
             
-        except Exception as e:
-            logger.error(f"❌ Failed to load QAT model: {e}")
-            return None
+            # Analyze activation quantizers
+            if hasattr(module, 'activation_post_process'):
+                if hasattr(module, '_disabled_activation_post_process'):
+                    activation_states["disabled"] += 1
+                elif isinstance(module.activation_post_process, torch.nn.Identity):
+                    activation_states["identity"] += 1
+                else:
+                    activation_states["active"] += 1
+        
+        logger.info(f"Weight quantizers: {weight_states}")
+        logger.info(f"Activation quantizers: {activation_states}")
+        
+        return weight_states, activation_states

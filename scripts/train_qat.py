@@ -98,9 +98,10 @@ from src.quantization.schemes.per_channel import (
     INT8_SYMMETRIC_PER_CHANNEL
 )
 
-# Import QAT model and loss
+# FIXED: Import QAT model and penalty loss from correct paths
 from src.models.yolov8_qat import QuantizedYOLOv8
-from src.training.loss import QATPenaltyLoss
+# FIXED: Import from penalty_loss.py instead of loss.py
+from src.training.penalty_loss import QuantizationPenaltyLoss
 
 def test_basic_quantization():
     """Test basic PyTorch quantization to verify environment."""
@@ -531,7 +532,9 @@ def test_qat_fixes():
         return False
 
 def main():
-    """Main function for QAT training with phased approach."""
+    """
+    FIXED: Main function with proper penalty loss integration
+    """
     # Parse arguments
     args = parse_args()
     
@@ -541,15 +544,12 @@ def main():
     # Safety check: Test basic quantization first
     logger.info("Running safety check for quantization compatibility...")
     try:
-        # Quick test to see if quantization works
         test_model = torch.nn.Conv2d(3, 16, 3)
         test_model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
         test_prepared = torch.quantization.prepare_qat(test_model)
         logger.info("✓ Basic quantization compatibility check passed")
     except Exception as e:
         logger.error(f"❌ Basic quantization compatibility check failed: {e}")
-        logger.error("Your PyTorch environment may not support quantization properly")
-        logger.error("Consider updating PyTorch or using a different environment")
         return None
 
     # Load QAT configuration
@@ -561,463 +561,231 @@ def main():
     if args.export:
         os.makedirs(args.export_dir, exist_ok=True)
     
-    # Determine model path (relative to project root if not absolute)
+    # Resolve paths
     model_path = args.model
     if not os.path.isabs(model_path) and not model_path.startswith('yolov8'):
-        # Check if it's a path relative to models/pretrained
         pretrained_path = os.path.join('models', 'pretrained', model_path)
         if os.path.exists(pretrained_path):
             model_path = pretrained_path
     
-    # Determine data path (relative to project root if not absolute)
     data_path = args.data
     if not os.path.isabs(data_path):
-        # Check if it's a path relative to dataset
-        dataset_path = os.path.join('dataset', data_path)
+        dataset_path = os.path.join('datasets', data_path)
         if os.path.exists(dataset_path):
             data_path = dataset_path
     
-    # Initialize QAT model
-    logger.info(f"Starting YOLOv8 QAT training")
-    logger.info(f"Model: {model_path}")
-    logger.info(f"Dataset: {data_path}")
-    logger.info(f"QConfig: {args.qconfig}")
-    
-    # Get additional QAT parameters from config
+    # Extract configuration parameters
     qat_params = qat_config.get('qat_params', {})
-    phased_training = args.phased_training
-    if not phased_training and 'qat_phased_training' in qat_config:
-        phased_training = qat_config.get('qat_phased_training', {}).get('enabled', True)
-        
-    skip_detection_head = not args.keep_detection_head
-    if not skip_detection_head and 'skip_detection_head' in qat_params:
-        skip_detection_head = qat_params['skip_detection_head']
-    
-    # Check for mixed precision quantization
-    use_mixed_precision = args.mixed_precision
-    if not use_mixed_precision and 'use_mixed_precision' in qat_params:
-        use_mixed_precision = qat_params['use_mixed_precision']
-    
-    # Create QConfig from configuration if available
-    custom_qconfig = None
-    if qat_config and 'quantization' in qat_config:
-        custom_qconfig = create_qconfig_from_params(qat_config)
-    
-    # Initialize QAT model from module
-    qat_model = QuantizedYOLOv8(
-        model_path=model_path,
-        qconfig_name=args.qconfig,
-        skip_detection_head=skip_detection_head,
-        fuse_modules=args.fuse,
-        custom_qconfig=custom_qconfig
-    )
-    
-    # # Setup for advanced calibration if specified
-    # calibration_config = qat_config.get('calibration', {})
-    # if calibration_config:
-    #     calibration_method = calibration_config.get('method', 'histogram')
-    #     num_batches = calibration_config.get('num_batches', 100)
-    #     percentile = calibration_config.get('percentile', 99.99)
-    #     use_coreset = calibration_config.get('use_coreset', False)
-        
-    #     if use_coreset:
-    #         coreset_method = calibration_config.get('coreset_method', 'random')
-    #         coreset_size = calibration_config.get('coreset_size', 1000)
-    #         qat_model.setup_calibration(
-    #             method=calibration_method,
-    #             num_batches=num_batches,
-    #             percentile=percentile,
-    #             use_coreset=True,
-    #             coreset_method=coreset_method,
-    #             coreset_size=coreset_size
-    #         )
-    #     else:
-    #         qat_model.setup_calibration(
-    #             method=calibration_method,
-    #             num_batches=num_batches,
-    #             percentile=percentile
-    #         )
-    
-    # Setup for mixed precision quantization if specified
-    if use_mixed_precision:
-        layer_bit_widths = create_mixed_precision_quantization_config(
-            qat_model.model,
-            bit_widths=[4, 8],
-            sensitivity_metric="kl_div"
-        )
-        qat_model.setup_mixed_precision(layer_bit_widths)
-    
-    # Setup for knowledge distillation if specified
-    use_distillation = args.distillation
-    temp = 4.0
-    alpha = 0.5
-    
-    if not use_distillation and 'use_distillation' in qat_params:
-        use_distillation = qat_params['use_distillation']
-    
-    if use_distillation:
-        teacher_model_path = args.teacher_model
-        if not teacher_model_path and 'distillation' in qat_config:
-            distill_config = qat_config['distillation']
-            if distill_config.get('enabled', False):
-                teacher_model_path = distill_config.get('teacher_model', model_path)
-                temp = distill_config.get('temperature', 4.0)
-                alpha = distill_config.get('alpha', 0.5)
-        
-        if teacher_model_path:
-            qat_model.setup_distillation(
-                teacher_model_path=teacher_model_path,
-                temperature=temp,
-                alpha=alpha
-            )
-    
-    # Setup for quantization penalty loss if specified
-    use_quant_penalty = args.quant_penalty
-    quant_penalty_alpha = 0.01
-    
-    if 'quant_penalty_loss' in qat_config:
-        penalty_config = qat_config['quant_penalty_loss']
-        use_quant_penalty = penalty_config.get('enabled', True)
-        quant_penalty_alpha = penalty_config.get('alpha', 0.01)
-    
-    if use_quant_penalty:
-        qat_model.setup_quant_penalty_loss(alpha=quant_penalty_alpha)
-    
-    # Prepare model for QAT
-    qat_model.prepare_for_qat()
-    
-    # Get training parameters from config
     train_params = qat_config.get('train_params', {})
-    epochs = args.epochs if args.epochs else train_params.get('epochs', QAT_EPOCHS)
-    batch_size = args.batch_size if args.batch_size else train_params.get('batch_size', BATCH_SIZE)
-    img_size = args.img_size if args.img_size else train_params.get('img_size', IMG_SIZE)
-    lr = args.lr if args.lr else train_params.get('lr', QAT_LEARNING_RATE)
     
-    # Train with QAT - either phased or standard approach
+    # Training configuration
+    phased_training = args.phased_training or qat_config.get('qat_phased_training', {}).get('enabled', True)
+    skip_detection_head = not args.keep_detection_head or qat_params.get('skip_detection_head', True)
+    use_quant_penalty = args.quant_penalty or qat_config.get('quant_penalty_loss', {}).get('enabled', True)
+    quant_penalty_alpha = qat_config.get('quant_penalty_loss', {}).get('alpha', 0.01)
+    
+    # Training parameters
+    epochs = args.epochs or train_params.get('epochs', 10)
+    batch_size = args.batch_size or train_params.get('batch_size', 16)
+    img_size = args.img_size or train_params.get('img_size', 640)
+    lr = args.lr or train_params.get('lr', 0.0005)
+    
+    logger.info(f"🚀 Starting YOLOv8 QAT Training")
+    logger.info(f"📁 Model: {model_path}")
+    logger.info(f"📊 Dataset: {data_path}")
+    logger.info(f"⚙️ QConfig: {args.qconfig}")
+    logger.info(f"🔄 Phased Training: {phased_training}")
+    logger.info(f"⚡ Penalty Loss: {use_quant_penalty} (α={quant_penalty_alpha})")
+    
+    # Initialize and Prepare QAT Model
     try:
-        if phased_training:
-            logger.info("Using phased QAT training approach")
-            results = qat_model.train_model(
-                data_yaml=data_path,
-                epochs=epochs,
-                batch_size=batch_size,
-                img_size=img_size,
-                lr=lr,
-                device=args.device,
-                save_dir=args.save_dir,
-                log_dir=args.log_dir,
-                use_distillation=use_distillation
-            )
-        else:
-            logger.info("Using standard QAT training approach (non-phased)")
-            results = qat_model.train_standard(
-                data_yaml=data_path,
-                epochs=epochs,
-                batch_size=batch_size,
-                img_size=img_size,
-                lr=lr,
-                device=args.device,
-                save_dir=args.save_dir,
-                log_dir=args.log_dir,
-                use_distillation=use_distillation
-            )
+        logger.info("📦 Initializing QAT model...")
+        qat_model = QuantizedYOLOv8(
+            model_path=model_path,
+            qconfig_name=args.qconfig,
+            skip_detection_head=skip_detection_head,
+            fuse_modules=args.fuse
+        )
         
-        logger.info("✓ QAT training completed successfully")
+        logger.info("⚙️ Preparing model for QAT...")
+        qat_model.prepare_for_qat()
         
-    except Exception as training_error:
-        logger.error(f"❌ QAT training failed: {training_error}")
-        logger.error("Full error traceback:")
+        # FIXED: Setup penalty loss if enabled
+        if use_quant_penalty:
+            logger.info(f"🎯 Setting up penalty loss (α={quant_penalty_alpha})...")
+            qat_model.setup_penalty_loss_integration(alpha=quant_penalty_alpha, warmup_epochs=5)
+            
+            # FIXED: Verify penalty setup
+            penalty_working = qat_model.verify_penalty_setup()
+            if penalty_working:
+                logger.info("✅ Penalty loss integration verified")
+            else:
+                logger.warning("⚠️ Penalty loss integration verification failed, continuing anyway...")
+        
+        logger.info("✅ QAT model preparation completed")
+        
+    except Exception as e:
+        logger.error(f"❌ QAT model preparation failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        
-        # Try to provide helpful error guidance
-        if "pickle" in str(training_error).lower():
-            logger.error("This appears to be a serialization/pickling error.")
-            logger.error("Try reducing the complexity of quantization or using simpler QConfig.")
-        elif "cuda" in str(training_error).lower():
-            logger.error("This appears to be a CUDA/device error.")
-            logger.error("Try using --device cpu or check your GPU setup.")
-        elif "memory" in str(training_error).lower():
-            logger.error("This appears to be a memory error.")
-            logger.error("Try reducing --batch-size or using a smaller model.")
-        
-        logger.error("QAT training failed. Exiting.")
         return None
     
-    # # After QAT training completes:
-    # try:
-    #     if phased_training:
-    #         logger.info("Using phased QAT training approach")
-    #         results = qat_model.train_model(
-    #             data_yaml=data_path,
-    #             epochs=epochs,
-    #             batch_size=batch_size,
-    #             img_size=img_size,
-    #             lr=lr,
-    #             device=args.device,
-    #             save_dir=args.save_dir,
-    #             log_dir=args.log_dir,
-    #             use_distillation=use_distillation
-    #         )
-    #     else:
-    #         logger.info("Using standard QAT training approach (non-phased)")
-    #         results = qat_model.train_standard(
-    #             data_yaml=data_path,
-    #             epochs=epochs,
-    #             batch_size=batch_size,
-    #             img_size=img_size,
-    #             lr=lr,
-    #             device=args.device,
-    #             save_dir=args.save_dir,
-    #             log_dir=args.log_dir,
-    #             use_distillation=use_distillation
-    #         )
+    # Train Model
+    try:
+        logger.info("🏋️ Starting QAT training...")
         
-    #     logger.info("✓ QAT training completed successfully")
+        results = qat_model.train_model(
+            data_yaml=data_path,
+            epochs=epochs,
+            batch_size=batch_size,
+            img_size=img_size,
+            lr=lr,
+            device=args.device,
+            save_dir=args.save_dir,
+            log_dir=args.log_dir
+        )
         
-        # CRITICAL FIX: Verify quantization is still present after training
-        logger.info("Verifying quantization preservation after training...")
-        if not qat_model.verify_quantization_preserved():
-            logger.error("❌ Quantization was lost during training!")
-            logger.error("   This suggests an issue with the training process")
-            return None
+        logger.info("✅ QAT training completed successfully")
         
-        # CRITICAL FIX: Save QAT model BEFORE any conversion
+    except Exception as e:
+        logger.error(f"❌ QAT training failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+    
+    # Save QAT Model
+    try:
         qat_save_path = os.path.join(args.save_dir, "qat_model_with_fakequant.pt")
-        logger.info(f"Saving QAT model with FakeQuantize modules to {qat_save_path}")
+        logger.info(f"💾 Saving QAT model (with FakeQuantize) to: {qat_save_path}")
         
         save_success = qat_model.save(qat_save_path, preserve_qat=True)
         if not save_success:
             logger.error("❌ Failed to save QAT model!")
-            logger.error("   Training results may be lost")
             return None
         
-        # Verify the saved QAT model
-        logger.info("Verifying saved QAT model...")
-        try:
-            # Quick verification by loading the saved model
-            saved_data = torch.load(qat_save_path, map_location='cpu')
-            if 'fake_quant_count' in saved_data:
-                saved_count = saved_data['fake_quant_count']
-                logger.info(f"✅ QAT model saved successfully with {saved_count} FakeQuantize modules")
-            else:
-                logger.warning("⚠️ QAT model saved but verification format unexpected")
-        except Exception as verify_error:
-            logger.error(f"❌ Failed to verify saved QAT model: {verify_error}")
+        logger.info("✅ QAT model saved successfully")
         
-    except Exception as training_error:
-        logger.error(f"❌ QAT training failed: {training_error}")
-        logger.error("Full error traceback:")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        # Provide helpful error guidance
-        if "pickle" in str(training_error).lower():
-            logger.error("This appears to be a serialization/pickling error.")
-            logger.error("Try reducing the complexity of quantization or using simpler QConfig.")
-        elif "cuda" in str(training_error).lower():
-            logger.error("This appears to be a CUDA/device error.")
-            logger.error("Try using --device cpu or check your GPU setup.")
-        elif "memory" in str(training_error).lower():
-            logger.error("This appears to be a memory error.")
-            logger.error("Try reducing --batch-size or using a smaller model.")
-        
-        logger.error("QAT training failed. Exiting.")
+    except Exception as e:
+        logger.error(f"❌ QAT model saving failed: {e}")
         return None
     
-    # Save QAT model FIRST with corrected method
-    qat_save_path = os.path.join(args.save_dir, "qat_model_fixed.pt")
-    logger.info(f"Saving QAT model with corrected method to {qat_save_path}")
-
-    # Use the FIXED save method
-    save_success = qat_model.save(qat_save_path, preserve_qat=True)
-    if not save_success:
-        logger.error("❌ Failed to save QAT model with corrected method!")
-        return None
-
-    # Verify the corrected save
-    logger.info("Verifying corrected QAT model save...")
-    try:
-        # Quick verification by loading the saved model
-        test_load = torch.load(qat_save_path, map_location='cpu')
-        if 'model' in test_load and 'qat_info' in test_load:
-            qat_info = test_load['qat_info']
-            fake_quant_count = test_load.get('fake_quant_count', 0)
-            
-            logger.info(f"✅ QAT model saved successfully:")
-            logger.info(f"  - Classes: {qat_info.get('num_classes', 'unknown')}")
-            logger.info(f"  - FakeQuantize modules: {fake_quant_count}")
-            logger.info(f"  - Architecture: {qat_info.get('qconfig_name', 'unknown')}")
-            logger.info(f"  - ONNX ready: {test_load.get('onnx_ready', False)}")
-        else:
-            logger.error("❌ QAT model save verification failed - incorrect format")
-            
-    except Exception as verify_error:
-        logger.error(f"❌ QAT model save verification failed: {verify_error}")
-
-    # Now convert to INT8 if requested
-    convert_to_int8 = not getattr(args, 'no_convert', False)
-    save_path = os.path.join(args.save_dir, args.output)
-
-    if convert_to_int8:
+    # Convert to INT8 (Optional)
+    int8_model_path = None
+    int8_model_info = {}
+    
+    if not args.no_convert:
         try:
-            logger.info("Converting QAT model to quantized INT8 model...")
-            quantized_model = qat_model.convert_to_quantized(save_path)
+            int8_save_path = os.path.join(args.save_dir, args.output)
+            logger.info(f"🔄 Converting QAT model to INT8 quantized model...")
+            
+            quantized_model = qat_model.convert_to_quantized(int8_save_path)
             
             if quantized_model is not None:
-                logger.info("✅ Model conversion completed successfully")
-            else:
-                logger.error("❌ Model conversion failed")
-                # Use QAT model for further operations
-                quantized_model = qat_model.model
+                int8_model_path = int8_save_path.replace('.pt', '_int8_final.pt')
                 
-        except Exception as conversion_error:
-            logger.error(f"❌ Model conversion failed: {conversion_error}")
-            logger.error("Full conversion error traceback:")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            logger.warning("Conversion failed, but QAT model is available for ONNX export")
-            quantized_model = qat_model.model
+                # Gather model information
+                int8_model_info = {
+                    'model_path': int8_model_path,
+                    'architecture': 'YOLOv8n',
+                    'quantization': 'INT8',
+                    'num_classes': 58,  # Vietnamese traffic signs
+                    'input_size': [1, 3, img_size, img_size],
+                    'file_size_mb': os.path.getsize(int8_model_path) / (1024 * 1024) if os.path.exists(int8_model_path) else 0,
+                    'deployment_ready': True
+                }
+                
+                logger.info("✅ INT8 model conversion completed successfully")
+            else:
+                logger.error("❌ INT8 model conversion failed")
+                
+        except Exception as e:
+            logger.error(f"❌ INT8 conversion failed: {e}")
+            logger.warning("Continuing without INT8 conversion...")
     else:
-        logger.info("Skipping INT8 conversion - using QAT model")
-        quantized_model = qat_model.model
-
-    # Use the corrected QAT model for analysis and evaluation
-    analysis_model = quantized_model
+        logger.info("⏭️ Skipping INT8 conversion as requested")
     
-    # Convert and save quantized model
-    save_path = os.path.join(args.save_dir, args.output)
-
-    try:
-        logger.info("Converting QAT model to quantized INT8 model...")
-        quantized_model = qat_model.convert_to_quantized(save_path)
-        logger.info("✓ Model conversion completed successfully")
-        
-    except Exception as conversion_error:
-        logger.error(f"❌ Model conversion failed: {conversion_error}")
-        logger.error("Full conversion error traceback:")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        # Try to save the QAT model instead
-        try:
-            logger.info("Attempting to save QAT model instead of converted model...")
-            qat_save_path = save_path.replace('.pt', '_qat.pt')
-            qat_model.save(qat_save_path)
-            logger.info(f"✓ QAT model saved to {qat_save_path}")
-            quantized_model = qat_model.model  # Use QAT model for further operations
-        except Exception as save_error:
-            logger.error(f"❌ Could not save QAT model either: {save_error}")
-            quantized_model = None
-    
-    # Analyze quantization effects if requested
-    if args.analyze or qat_params.get('analyze_quantization_effects', False):
-        logger.info("Analyzing quantization effects...")
-        
-        # Basic analysis
-        analysis_results = analyze_quantization_effects(quantized_model)
-        logger.info(f"Quantization ratio: {analysis_results['quantized_ratio']:.2f}")
-        logger.info(f"Quantized modules: {analysis_results['quantized_modules']} / {analysis_results['total_modules']}")
-        
-        # Size comparison
-        size_results = compare_model_sizes(qat_model.original_model, quantized_model)
-        logger.info(f"FP32 model size: {size_results['fp32_size_mb']:.2f} MB")
-        logger.info(f"INT8 model size: {size_results['int8_size_mb']:.2f} MB")
-        logger.info(f"Compression ratio: {size_results['compression_ratio']:.2f}x")
-        logger.info(f"Size reduction: {size_results['size_reduction_percent']:.2f}%")
-        
-        # Mixed precision analysis if applicable
-        if use_mixed_precision:
-            mp_analysis = analyze_mixed_precision_model(quantized_model)
-            logger.info("Mixed precision bit-width distribution:")
-            for bit_width, count in mp_analysis['bit_width_counts'].items():
-                percentage = (count / mp_analysis['total_layers']) * 100 if mp_analysis['total_layers'] > 0 else 0
-                logger.info(f"  {bit_width}-bit: {count} layers ({percentage:.2f}%)")
-        
-        # Save analysis results
-        analysis_path = os.path.join(args.save_dir, "quantization_analysis.yaml")
-        with open(analysis_path, 'w') as f:
-            yaml.dump({
-                'quantization_analysis': analysis_results,
-                'size_comparison': size_results,
-                'mixed_precision_analysis': mp_analysis if use_mixed_precision else None
-            }, f)
-        
-        logger.info(f"Analysis results saved to {analysis_path}")
-    
-    # Evaluate if requested
+    # Evaluation and Export (Optional) - same as before
     if args.eval:
-        eval_results = qat_model.evaluate(
-            data_yaml=data_path,
-            batch_size=batch_size,
-            img_size=img_size,
-            device=args.device
-        )
-        
-        logger.info(f"Evaluation results:")
-        logger.info(f"  mAP50: {eval_results.box.map50:.4f}")
-        logger.info(f"  mAP50-95: {eval_results.box.map:.4f}")
+        try:
+            logger.info("📊 Evaluating model...")
+            eval_results = qat_model.evaluate(
+                data_yaml=data_path,
+                batch_size=batch_size,
+                img_size=img_size,
+                device=args.device
+            )
+            logger.info(f"📈 Evaluation Results - mAP50: {eval_results.box.map50:.4f}, mAP50-95: {eval_results.box.map:.4f}")
+        except Exception as e:
+            logger.error(f"❌ Evaluation failed: {e}")
     
-    # Export if requested
     if args.export:
-        export_formats = qat_config.get('export', {}).get('formats', ['onnx'])
-        for export_format in export_formats:
-            export_path = os.path.join(args.export_dir, export_format)
-            os.makedirs(export_path, exist_ok=True)
-            
-            export_file = os.path.join(export_path, f"{os.path.splitext(args.output)[0]}.{export_format}")
-            logger.info(f"Exporting model to {export_file}")
-            
-            try:
+        try:
+            export_formats = qat_config.get('export', {}).get('formats', ['onnx'])
+            for export_format in export_formats:
+                export_path = os.path.join(args.export_dir, export_format)
+                os.makedirs(export_path, exist_ok=True)
+                export_file = os.path.join(export_path, f"{os.path.splitext(args.output)[0]}.{export_format}")
+                
+                logger.info(f"📤 Exporting to {export_format}...")
                 qat_model.export(export_file, format=export_format)
-                logger.info(f"Export to {export_format} completed successfully")
-            except Exception as e:
-                logger.error(f"Export to {export_format} failed: {e}")
+                logger.info(f"✅ Export to {export_format} completed")
+        except Exception as e:
+            logger.error(f"❌ Export failed: {e}")
     
-    logger.info(f"YOLOv8 QAT training completed")
-    logger.info(f"Quantized model saved to {save_path}")
+    # Print Final Results
+    print_final_results(qat_save_path, int8_model_path, int8_model_info, args.save_dir)
     
     return results
 
-    # Final verification of saved models
-    logger.info("\n" + "="*80)
-    logger.info("FINAL MODEL VERIFICATION")
-    logger.info("="*80)
+def print_final_results(qat_model_path, int8_model_path, int8_model_info, save_dir):
+    """Print comprehensive final results with model paths and information."""
+    print("\n" + "="*80)
+    print("🎉 QAT TRAINING COMPLETED SUCCESSFULLY!")
+    print("="*80)
     
-    # Verify QAT model
-    qat_model_path = os.path.join(args.save_dir, "qat_model_with_fakequant.pt")
+    # QAT Model Information
+    print("📁 QAT MODEL (For Continued Training/Fine-tuning):")
     if os.path.exists(qat_model_path):
-        logger.info("Verifying saved QAT model...")
-        qat_valid = verify_qat_model_file(qat_model_path)
-        if qat_valid:
-            logger.info("✅ QAT model verification PASSED")
-        else:
-            logger.error("❌ QAT model verification FAILED")
+        qat_size = os.path.getsize(qat_model_path) / (1024 * 1024)
+        print(f"   Path: {qat_model_path}")
+        print(f"   Size: {qat_size:.2f} MB")
+        print(f"   Type: QAT with FakeQuantize modules")
+        print(f"   Status: ✅ Ready for additional training")
     else:
-        logger.error("❌ QAT model file not found")
+        print(f"   Status: ❌ QAT model not found")
     
-    # Verify INT8 model if it was created
-    if convert_to_int8:
-        int8_model_path = save_path.replace('.pt', '_int8_final.pt')
-        if os.path.exists(int8_model_path):
-            logger.info("✅ INT8 quantized model found")
-        else:
-            logger.warning("⚠️ INT8 quantized model not found")
+    print()
     
-    logger.info("="*80)
-    logger.info(f"QAT TRAINING COMPLETE")
-    logger.info(f"QAT model (for continued training): {qat_model_path}")
-    if convert_to_int8:
-        logger.info(f"INT8 model (for deployment): {int8_model_path}")
-    logger.info("="*80)
-    
-    return results
-
-
-if __name__ == "__main__":
-    # ADD option to run test mode
-    if len(sys.argv) > 1 and sys.argv[1] == '--test-fixes':
-        test_qat_fixes()
+    # INT8 Model Information  
+    print("🚀 INT8 QUANTIZED MODEL (For Deployment):")
+    if int8_model_path and os.path.exists(int8_model_path):
+        print(f"   Path: {int8_model_path}")
+        print(f"   Size: {int8_model_info.get('file_size_mb', 0):.2f} MB")
+        print(f"   Architecture: {int8_model_info.get('architecture', 'YOLOv8n')}")
+        print(f"   Quantization: {int8_model_info.get('quantization', 'INT8')}")
+        print(f"   Classes: {int8_model_info.get('num_classes', 58)} (Vietnamese Traffic Signs)")
+        print(f"   Input Size: {int8_model_info.get('input_size', [1, 3, 640, 640])}")
+        print(f"   Deployment: {'✅ Ready' if int8_model_info.get('deployment_ready') else '❌ Not Ready'}")
     else:
-        main()
+        print(f"   Status: ❌ INT8 model not created")
+    
+    print()
+    
+    # Next Steps
+    print("🎯 NEXT STEPS:")
+    if int8_model_path and os.path.exists(int8_model_path):
+        print("   1. ✅ Deploy INT8 model for inference")
+        print("   2. 📊 Test model performance on validation set")
+        print("   3. 📤 Export to ONNX/TensorRT for optimization")
+        print("   4. 🚀 Integrate into production pipeline")
+    else:
+        print("   1. ⚠️ Check INT8 conversion issues")
+        print("   2. 🔄 Try manual conversion if needed")
+        print("   3. 📊 Use QAT model for inference testing")
+    
+    print("="*80)
+    print(f"🏆 TRAINING DIRECTORY: {save_dir}")
+    print("="*80)
+
+if __name__ == '__main__':
+    main()

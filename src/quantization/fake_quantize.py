@@ -204,6 +204,134 @@ class LSQFakeQuantize(FakeQuantize):
             x_rounded = torch.round(x_clipped)
             return x_rounded * self.step_size
 
+class AdaptiveSTE(torch.autograd.Function):
+    """
+    Adaptive Straight-Through Estimator with improved gradient scaling.
+    Fixes static grad_factor issue mentioned in PDF.
+    """
+    
+    @staticmethod
+    def forward(ctx, input, scale_factor=1.0):
+        # Store context for backward pass
+        ctx.scale_factor = scale_factor
+        
+        # Forward pass is identity
+        return input
+    
+    @staticmethod  
+    def backward(ctx, grad_output):
+        # Adaptive gradient scaling based on quantization error
+        scale_factor = ctx.scale_factor
+        
+        # Scale gradients based on quantization error magnitude
+        return grad_output * scale_factor, None
+
+class ImprovedCustomFakeQuantize(FakeQuantize):
+    """
+    Improved FakeQuantize with adaptive STE and better gradient flow.
+    """
+    
+    def __init__(self, observer, quant_min, quant_max, **observer_kwargs):
+        super().__init__(observer, quant_min, quant_max, **observer_kwargs)
+        self.adaptive_grad_scaling = True
+        self.grad_factor = 1.0
+        self.register_buffer('quantization_error_ema', torch.tensor(0.0))
+        self.ema_momentum = 0.9
+    
+    def forward(self, x):
+        """Forward pass with adaptive STE and improved gradient handling."""
+        if self.training:
+            # Update observer statistics
+            self.activation_post_process(x)
+            
+            # Get quantization parameters
+            scale, zero_point = self.calculate_qparams()
+            self.scale.copy_(scale)
+            self.zero_point.copy_(zero_point)
+            
+            # Perform quantization
+            x_q = torch.fake_quantize_per_tensor_affine(
+                x, scale.item(), int(zero_point.item()), 
+                self.quant_min, self.quant_max
+            )
+            
+            # Calculate quantization error for adaptive scaling
+            quantization_error = torch.mean(torch.abs(x - x_q))
+            
+            # Update EMA of quantization error
+            self.quantization_error_ema.data = (
+                self.ema_momentum * self.quantization_error_ema.data + 
+                (1 - self.ema_momentum) * quantization_error.detach()
+            )
+            
+            # Adaptive gradient scaling based on quantization error
+            if self.adaptive_grad_scaling:
+                # Higher error = lower gradient scaling to avoid instability
+                adaptive_factor = torch.clamp(
+                    1.0 / (1.0 + self.quantization_error_ema), 
+                    min=0.1, max=2.0
+                )
+                grad_factor = self.grad_factor * adaptive_factor
+            else:
+                grad_factor = self.grad_factor
+            
+            # Apply adaptive STE
+            x_q = AdaptiveSTE.apply(x_q, grad_factor) + x - x.detach()
+            
+            return x_q
+            
+        else:
+            # Eval mode - standard quantization
+            return torch.fake_quantize_per_tensor_affine(
+                x, self.scale.item(), int(self.zero_point.item()),
+                self.quant_min, self.quant_max
+            )
+    
+    def get_quantization_stats(self):
+        """Return quantization statistics for monitoring."""
+        return {
+            'quantization_error_ema': self.quantization_error_ema.item(),
+            'current_grad_factor': self.grad_factor,
+            'scale': self.scale.item() if hasattr(self, 'scale') else 0.0,
+            'zero_point': self.zero_point.item() if hasattr(self, 'zero_point') else 0
+        }
+
+# Enhanced LSQ with better step size learning
+class ImprovedLSQFakeQuantize(LSQFakeQuantize):
+    """
+    Improved Learned Step Size Quantization with better convergence.
+    """
+    
+    def __init__(self, observer, quant_min, quant_max, **observer_kwargs):
+        super().__init__(observer, quant_min, quant_max, **observer_kwargs)
+        self.step_size_lr_factor = 0.1  # Separate learning rate for step size
+        self.register_buffer('step_size_momentum', torch.tensor(0.0))
+        self.momentum_factor = 0.9
+    
+    def forward(self, x):
+        """Forward pass with improved LSQ and momentum-based step size updates."""
+        if self.training:
+            if not self.initialized:
+                self._initialize_step_size(x)
+            
+            # Gradient computation for step size with momentum
+            if self.step_size.grad is not None:
+                # Apply momentum to step size gradients
+                self.step_size_momentum.data = (
+                    self.momentum_factor * self.step_size_momentum.data + 
+                    (1 - self.momentum_factor) * self.step_size.grad.data
+                )
+                
+                # Update step size with momentum
+                self.step_size.data -= self.step_size_lr_factor * self.step_size_momentum
+                
+                # Ensure step size remains positive
+                self.step_size.data.clamp_(min=1e-8)
+            
+            # Standard LSQ forward pass
+            return super().forward(x)
+        else:
+            return super().forward(x)
 
 # Factory function to create fake quantizer based on configuration
 def create_fake_quantizer(observer_type, quant_min, quant_max, dtype=torch.quint8, 
