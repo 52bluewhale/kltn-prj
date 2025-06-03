@@ -1,0 +1,74 @@
+diagnosis:
+  int8_analysis:
+    contains_quantized_tensors: true
+    conversion_successful: true
+    file_exists: true
+    file_size_mb: 5.88
+    fp32_tensor_count: 400
+    quantized_ops_count: 0
+    quantized_tensor_count: 45
+    tensor_analysis:
+      fp32_examples:
+      - dtype: torch.float32
+        name: model.0.conv.scale
+        shape: []
+      - dtype: torch.int64
+        name: model.0.conv.zero_point
+        shape: []
+      - dtype: torch.float32
+        name: model.0.bn.weight
+        shape:
+        - 16
+      quantized_examples:
+      - dtype: torch.qint8
+        name: model.0.conv.weight
+        qscheme: torch.per_channel_affine
+        shape:
+        - 16
+        - 3
+        - 3
+        - 3
+      - dtype: torch.qint8
+        name: model.1.conv.weight
+        qscheme: torch.per_channel_affine
+        shape:
+        - 32
+        - 16
+        - 3
+        - 3
+      - dtype: torch.qint8
+        name: model.2.cv1.conv.weight
+        qscheme: torch.per_channel_affine
+        shape:
+        - 32
+        - 32
+        - 1
+        - 1
+      quantized_ops: []
+  issues_found: []
+  overall_status: SUCCESS
+  qat_analysis:
+    contains_fake_quantizers: true
+    fake_quantizer_count: 90
+    file_exists: true
+    file_size_mb: 12.5
+    observer_states: {}
+    preservation_info:
+      fuse_modules: true
+      has_preservation: true
+      is_prepared: true
+      model_path: yolov8n.pt
+      pytorch_version: !!python/object/new:torch.torch_version.TorchVersion
+      - 2.4.1+cu121
+      qconfig_name: lsq
+      skip_detection_head: true
+    ready_for_conversion: false
+  recommendations: []
+diagnosis_timestamp: '2025-06-03 18:48:16'
+int8_model_path: models/checkpoints/qat_full_features_1/qat_yolov8n_full_int8_final.pt
+qat_model_path: models/checkpoints/qat_full_features_1/qat_model_with_fakequant.pt
+recommendations:
+- "\u2705 Both models appear correct"
+- "\U0001F680 The issue may be in model loading/inference"
+- "\U0001F50D Try the fixed test script for proper INT8 handling"
+- "\U0001F4E4 Consider exporting to ONNX for deployment"

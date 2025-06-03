@@ -1,0 +1,43 @@
+creation_time: Tue Jun  3 17:58:17 2025
+dict_keys:
+- state_dict
+- metadata
+file_size_mb: 5.88
+metadata:
+  conversion_successful: true
+  deployment_ready: true
+  format: quantized_int8
+  framework: pytorch
+  preserved_quantizers: 90
+  qconfig: lsq
+  size_info:
+    compression_ratio: 3.453759891151004
+    fp32_size_mb: 12.084602355957031
+    int8_size_mb: 3.4989700317382812
+    size_reduction_percent: 71.04604745216557
+model_file: models/checkpoints/qat_full_features_1/qat_yolov8n_full_int8_final.pt
+modification_time: Tue Jun  3 17:58:17 2025
+parameters:
+  parameter_names:
+  - model.0.conv.weight
+  - model.0.conv.bias
+  - model.0.conv.scale
+  - model.0.conv.zero_point
+  - model.0.bn.weight
+  - model.0.bn.bias
+  - model.0.bn.running_mean
+  - model.0.bn.running_var
+  - model.0.bn.num_batches_tracked
+  - model.1.conv.weight
+  - '...'
+  total_parameters: 490
+  total_size_mb: 5.65
+quantization_parameters:
+  count: 90
+  examples:
+  - model.0.conv.scale
+  - model.0.conv.zero_point
+  - model.1.conv.scale
+  - model.1.conv.zero_point
+  - model.2.cv1.conv.scale
+save_format: dictionary

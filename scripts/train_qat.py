@@ -520,6 +520,57 @@ def test_qat_fixes():
         logger.error(f"❌ QAT fixes test exception: {e}")
         return False
 
+def verify_qat_model_file_detailed(model_path):
+    """Enhanced verification that checks for quantization preservation."""
+    logger.info(f"🔍 Detailed verification of: {model_path}")
+    
+    if not os.path.exists(model_path):
+        logger.error(f"❌ Model file does not exist: {model_path}")
+        return False
+    
+    try:
+        saved_data = torch.load(model_path, map_location='cpu')
+        
+        if isinstance(saved_data, dict):
+            # Check for our new save format
+            if 'fake_quant_count' in saved_data:
+                count = saved_data['fake_quant_count']
+                save_method = saved_data.get('save_method', 'unknown')
+                has_preservation = saved_data.get('qat_info', {}).get('has_preservation', False)
+                
+                logger.info(f"✅ QAT model verification:")
+                logger.info(f"  - FakeQuantize modules: {count}")
+                logger.info(f"  - Save method: {save_method}")
+                logger.info(f"  - Has preservation: {has_preservation}")
+                
+                if count > 0:
+                    logger.info(f"🎉 VERIFICATION PASSED: Model contains {count} quantizers")
+                    return True
+                else:
+                    logger.error(f"❌ VERIFICATION FAILED: No quantizers found")
+                    return False
+            
+            elif 'model_state_dict' in saved_data:
+                # Check state dict for quantization parameters
+                state_dict = saved_data['model_state_dict']
+                quant_params = sum(1 for key in state_dict.keys() 
+                                 if any(q in key for q in ['fake_quant', 'observer', 'scale', 'zero_point']))
+                
+                logger.info(f"✅ State dict contains {quant_params} quantization parameters")
+                return quant_params > 0
+            
+            else:
+                logger.warning("❌ Unknown save format - cannot verify quantization")
+                return False
+        else:
+            logger.warning("❌ Model file is not in dictionary format")
+            return False
+    
+    except Exception as e:
+        logger.error(f"❌ Verification failed: {e}")
+        return False
+
+
 def main():
     """FIXED: Main function with proper quantization preservation."""
     # Parse arguments
@@ -569,8 +620,8 @@ def main():
             fuse_modules=args.fuse
         )
         
-        logger.info("⚙️ Preparing model for QAT...")
-        qat_model.prepare_for_qat()
+        logger.info("⚙️ Preparing model for QAT with preservation...")
+        qat_model.prepare_for_qat_with_preservation()
         
         # Setup penalty loss if enabled
         if args.quant_penalty:
@@ -596,7 +647,18 @@ def main():
     try:
         logger.info("🏋️ Starting QAT training...")
         
-        results = qat_model.train_model(
+        # results = qat_model.train_model(
+        #     data_yaml=data_path,
+        #     epochs=args.epochs,
+        #     batch_size=args.batch_size,
+        #     img_size=args.img_size,
+        #     lr=args.lr,
+        #     device=args.device,
+        #     save_dir=args.save_dir,
+        #     log_dir=args.log_dir
+        # )
+
+        results = qat_model.train_model_with_preservation(
             data_yaml=data_path,
             epochs=args.epochs,
             batch_size=args.batch_size,
@@ -626,14 +688,36 @@ def main():
             logger.error("❌ Failed to save QAT model!")
             return None
         
-        # Verify save
-        if verify_qat_model_file(qat_save_path):
+        # Enhanced verification
+        if verify_qat_model_file_detailed(qat_save_path):
             qat_model_path = qat_save_path
-            logger.info("✅ QAT model saved and verified")
+            logger.info("✅ QAT model saved and verified with quantization preserved")
         else:
             logger.error("❌ QAT model verification failed!")
-            return None
-        
+            logger.info("🔧 Attempting emergency save...")
+            
+            # Try alternative save method
+            emergency_path = qat_save_path.replace('.pt', '_emergency.pt')
+            try:
+                # Save using PyTorch's basic save
+                torch.save({
+                    'model': qat_model.model.model,
+                    'qat_info': {
+                        'qconfig_name': qat_model.qconfig_name,
+                        'emergency_save': True
+                    }
+                }, emergency_path)
+                
+                if verify_qat_model_file_detailed(emergency_path):
+                    qat_model_path = emergency_path
+                    logger.info("✅ Emergency save successful")
+                else:
+                    logger.error("❌ Emergency save also failed")
+                    
+            except Exception as e:
+                logger.error(f"❌ Emergency save failed: {e}")
+                return None
+            
     except Exception as e:
         logger.error(f"❌ QAT model saving failed: {e}")
         return None
@@ -645,7 +729,7 @@ def main():
             int8_save_path = os.path.join(args.save_dir, args.output)
             logger.info(f"🔄 Converting to INT8 model...")
             
-            quantized_model = qat_model.convert_to_quantized(int8_save_path)
+            quantized_model = qat_model.convert_to_quantized_with_preservation(int8_save_path)
             
             if quantized_model is not None:
                 int8_model_path = int8_save_path.replace('.pt', '_int8_final.pt')

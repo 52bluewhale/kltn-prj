@@ -1,0 +1,42 @@
+analysis_timestamp: '2025-06-03 18:44:55'
+functionality_test:
+  error: null
+  forward_pass: true
+  input_shape:
+  - 1
+  - 3
+  - 640
+  - 640
+  loadable: true
+  loading_method: quantized_wrapper
+  model_type: <class '__main__.QuantizedModelWrapper'>
+  output_shape:
+  - 1
+  - 8400
+  - 63
+  quantized_tensors_found: 45
+model_comparison:
+  compression_ratio: 2.12
+  int8_model:
+    path: models/checkpoints/qat_full_features_1/qat_yolov8n_full_int8_final.pt
+    size_mb: 5.88
+    type: INT8 Quantized
+  original_model:
+    path: models\checkpoints\qat_full_features_1\qat_model_with_fakequant.pt
+    size_mb: 12.5
+    type: FP32/QAT
+  speed_comparison: null
+model_info: null
+model_path: models/checkpoints/qat_full_features_1/qat_yolov8n_full_int8_final.pt
+performance_benchmark:
+  fps: 290.0544936516279
+  max_time_ms: 4.993677139282227
+  mean_time_ms: 3.4476280212402344
+  median_time_ms: 3.1157732009887695
+  min_time_ms: 2.982616424560547
+  model_type: quantized
+  p95_time_ms: 4.505801200866699
+  p99_time_ms: 4.89610195159912
+  runs: 20
+  std_time_ms: 0.5822007542191531
+  successful_runs: 20

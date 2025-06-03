@@ -1115,8 +1115,8 @@ class QuantizedYOLOv8:
 
     def save(self, path, preserve_qat=True):
         """
-        FIXED: Save model with proper quantization preservation using state_dict.
-        This fixes the pickle error with FakeQuantize modules.
+        FIXED: Save model with proper quantization preservation.
+        The issue was looking for quantizers in the wrong model object.
         """
         # Create directory if needed
         dirname = os.path.dirname(path)
@@ -1127,19 +1127,55 @@ class QuantizedYOLOv8:
             logger.info(f"Saving QAT model with quantization preserved to {path}")
             
             try:
-                # Count FakeQuantize modules
-                fake_quant_count = self._count_fake_quantize_modules()
-                logger.info(f"Found {fake_quant_count} FakeQuantize modules to preserve")
+                # FIXED: Count FakeQuantize modules using the preservation system
+                if hasattr(self, 'quantizer_preserver'):
+                    stats = self.quantizer_preserver.get_quantizer_stats()
+                    fake_quant_count = stats['total_fake_quantizers']
+                    logger.info(f"Found {fake_quant_count} FakeQuantize modules to preserve (via preserver)")
+                else:
+                    # Fallback: Count directly in the model
+                    fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
+                                        if 'FakeQuantize' in type(m).__name__)
+                    logger.info(f"Found {fake_quant_count} FakeQuantize modules to preserve (direct count)")
                 
                 if fake_quant_count == 0:
                     logger.error("❌ No FakeQuantize modules found!")
+                    
+                    # DIAGNOSTIC: Check where the quantizers might be
+                    logger.info("🔍 Diagnostic - checking model structure...")
+                    
+                    # Check if quantizers are in the training model
+                    if hasattr(self, 'quantizer_preserver'):
+                        self.quantizer_preserver.debug_quantizer_states()
+                    
+                    # Check all possible model locations
+                    logger.info("Checking self.model.model for quantizers...")
+                    direct_count = sum(1 for n, m in self.model.model.named_modules() 
+                                    if 'FakeQuantize' in type(m).__name__)
+                    logger.info(f"Direct count in self.model.model: {direct_count}")
+                    
+                    if direct_count == 0:
+                        logger.info("Checking self.model for quantizers...")
+                        model_count = sum(1 for n, m in self.model.named_modules() 
+                                        if 'FakeQuantize' in type(m).__name__)
+                        logger.info(f"Count in self.model: {model_count}")
+                    
                     return False
                 
-                # FIXED: Save using state_dict instead of full model object
-                model_state_dict = self.model.model.state_dict()
+                # FIXED: Save using state_dict from the correct model object
+                # Use the model that actually has the quantizers
+                if hasattr(self, 'quantizer_preserver'):
+                    # Save from the model that the preserver is tracking
+                    model_to_save = self.quantizer_preserver.model
+                    model_state_dict = model_to_save.state_dict()
+                    logger.info("Using quantizer_preserver.model for saving")
+                else:
+                    # Fallback to standard model
+                    model_state_dict = self.model.model.state_dict()
+                    logger.info("Using self.model.model for saving")
                 
                 save_dict = {
-                    'model_state_dict': model_state_dict,  # Use state_dict instead of full model
+                    'model_state_dict': model_state_dict,
                     'qat_info': {
                         'qconfig_name': self.qconfig_name,
                         'skip_detection_head': self.skip_detection_head,
@@ -1147,18 +1183,21 @@ class QuantizedYOLOv8:
                         'is_prepared': self.is_prepared,
                         'pytorch_version': torch.__version__,
                         'model_path': self.model_path,
+                        'has_preservation': hasattr(self, 'quantizer_preserver'),
                     },
                     'fake_quant_count': fake_quant_count,
                     'quantization_preserved': True,
-                    'save_method': 'state_dict_fixed'
+                    'save_method': 'state_dict_with_preservation',
+                    'preservation_stats': stats if hasattr(self, 'quantizer_preserver') else None
                 }
                 
                 # Save using torch.save
                 torch.save(save_dict, path)
                 
-                # Simple verification
-                if os.path.exists(path) and os.path.getsize(path) > 1000:  # Basic check
+                # Verify save
+                if os.path.exists(path) and os.path.getsize(path) > 1000:
                     logger.info(f"✅ QAT model saved successfully: {path}")
+                    logger.info(f"✅ Quantization preserved: {fake_quant_count} FakeQuantize modules")
                     return True
                 else:
                     logger.error(f"❌ Save verification failed")
@@ -1166,6 +1205,8 @@ class QuantizedYOLOv8:
                     
             except Exception as e:
                 logger.error(f"❌ QAT save failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 return False
         
         else:
@@ -1177,6 +1218,92 @@ class QuantizedYOLOv8:
             except Exception as e:
                 logger.error(f"Error saving model: {e}")
                 return False
+
+    def convert_to_quantized_with_preservation(self, save_path=None):
+        """
+        FIXED: Convert QAT model to INT8 using the preserved quantizers.
+        """
+        logger.info("Converting QAT model to quantized INT8 model...")
+        
+        # Use the preservation system to verify quantizers
+        if hasattr(self, 'quantizer_preserver'):
+            stats = self.quantizer_preserver.get_quantizer_stats()
+            fake_quant_count = stats['total_fake_quantizers']
+            logger.info(f"Pre-conversion: {fake_quant_count} FakeQuantize modules (via preserver)")
+            
+            if fake_quant_count == 0:
+                logger.error("❌ Cannot convert - no FakeQuantize modules in preserver!")
+                return None
+            
+            # Get the model with quantizers from the preserver
+            qat_model = self.quantizer_preserver.model
+        else:
+            # Fallback to counting directly
+            fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
+                                if 'FakeQuantize' in type(m).__name__)
+            logger.info(f"Pre-conversion: {fake_quant_count} FakeQuantize modules (direct count)")
+            
+            if fake_quant_count == 0:
+                logger.error("❌ Cannot convert - no FakeQuantize modules!")
+                return None
+            
+            qat_model = self.model.model
+        
+        # Set to eval mode for conversion
+        qat_model.eval()
+        
+        # Convert to quantized model
+        try:
+            logger.info("Converting QAT model to INT8...")
+            from src.quantization.utils import convert_qat_model_to_quantized
+            
+            self.quantized_model = convert_qat_model_to_quantized(qat_model, inplace=False)
+            
+            if self.quantized_model is None:
+                logger.error("❌ Conversion returned None")
+                return None
+            
+            logger.info("✅ Successfully converted to INT8")
+            
+            # Calculate size comparison
+            from src.quantization.utils import compare_model_sizes
+            size_info = compare_model_sizes(self.original_model, self.quantized_model)
+            
+            logger.info(f"Model size comparison:")
+            logger.info(f"  Original: {size_info['fp32_size_mb']:.2f} MB")
+            logger.info(f"  Quantized: {size_info['int8_size_mb']:.2f} MB")
+            logger.info(f"  Compression: {size_info['compression_ratio']:.2f}x")
+            
+            # Save quantized model
+            if save_path:
+                int8_save_path = save_path.replace('.pt', '_int8_final.pt')
+                
+                metadata = {
+                    'framework': 'pytorch',
+                    'format': 'quantized_int8',
+                    'qconfig': self.qconfig_name,
+                    'size_info': size_info,
+                    'conversion_successful': True,
+                    'deployment_ready': True,
+                    'preserved_quantizers': fake_quant_count
+                }
+                
+                from src.quantization.utils import save_quantized_model
+                save_success = save_quantized_model(self.quantized_model, int8_save_path, metadata)
+                
+                if save_success:
+                    logger.info(f"✅ INT8 model saved to {int8_save_path}")
+                else:
+                    logger.error(f"❌ Failed to save INT8 model")
+            
+            self.is_converted = True
+            return self.quantized_model
+            
+        except Exception as e:
+            logger.error(f"❌ Conversion failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
 
     def verify_quantization_preserved(self):
         """Verify that the current model still has quantization modules."""
@@ -1544,3 +1671,207 @@ class QuantizedYOLOv8:
         logger.info(f"Activation quantizers: {activation_states}")
         
         return weight_states, activation_states
+
+    def _apply_qconfig_to_all_modules(self, model):
+        """Apply qconfig to all relevant modules."""
+        logger.info("Applying qconfig to model modules...")
+        
+        count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                if "model.0.conv" in name:
+                    from src.quantization.qconfig import get_first_layer_qconfig
+                    module.qconfig = get_first_layer_qconfig()
+                    logger.info(f"Applied first layer qconfig to {name}")
+                else:
+                    from src.quantization.qconfig import get_default_qat_qconfig
+                    module.qconfig = get_default_qat_qconfig()
+                count += 1
+        
+        logger.info(f"Applied qconfig to {count} modules")
+        
+        # Skip detection head if requested
+        if self.skip_detection_head:
+            detection_count = 0
+            for name, module in model.named_modules():
+                if 'detect' in name or 'model.22' in name:
+                    module.qconfig = None
+                    detection_count += 1
+            logger.info(f"Disabled quantization for {detection_count} detection modules")
+        
+        # Apply YOLOv8-specific handling
+        self._handle_yolov8_specific_modules(model)
+        
+        return model
+
+    # ADD THIS METHOD TO YOUR EXISTING QuantizedYOLOv8 CLASS
+    def prepare_for_qat_with_preservation(self):
+        """FIXED: Prepare model for QAT with quantizer preservation."""
+        logger.info("🔧 Preparing model for QAT with preservation...")
+        
+        # Get base model
+        base_model = self.model.model
+        base_model.train()
+        
+        # Optionally fuse modules
+        if self.fuse_modules:
+            logger.info("Fusing modules for better quantization...")
+            from src.quantization.fusion import fuse_yolov8_modules
+            base_model = fuse_yolov8_modules(base_model)
+        
+        # Apply qconfig (reuse your existing logic)
+        self._apply_qconfig_to_all_modules(base_model)
+        
+        # Prepare for QAT (creates FakeQuantize modules)
+        logger.info("⚙️ Calling prepare_qat with PyTorch...")
+        qat_model = torch.quantization.prepare_qat(base_model, inplace=True)
+        
+        # CRITICAL FIX: Add preservation capabilities
+        from src.quantization.quantizer_preservation import QuantizerPreserver
+        self.quantizer_preserver = QuantizerPreserver(qat_model)
+        
+        # Update model
+        self.model.model = qat_model
+        self.is_prepared = True
+        
+        # Verify preparation
+        stats = self.quantizer_preserver.get_quantizer_stats()
+        logger.info(f"✅ QAT preparation complete:")
+        logger.info(f"  - Total FakeQuantize modules: {stats['total_fake_quantizers']}")
+        logger.info(f"  - Weight quantizers: {stats['weight_quantizers_total']}")
+        logger.info(f"  - Activation quantizers: {stats['activation_quantizers_total']}")
+        
+        if stats['total_fake_quantizers'] == 0:
+            logger.error("❌ No FakeQuantize modules created!")
+            return None
+        
+        return qat_model
+
+    def _configure_quantizers_with_preservation(self, phase_name):
+        """FIXED: Configure quantizers using preservation instead of replacement."""
+        if not hasattr(self, 'quantizer_preserver'):
+            logger.error("❌ Quantizer preserver not initialized!")
+            return False
+        
+        # Use preservation approach
+        logger.info(f"🔄 Setting phase: {phase_name} (with preservation)")
+        self.quantizer_preserver.set_phase_by_name(phase_name)
+        
+        # Verify preservation
+        stats = self.quantizer_preserver.get_quantizer_stats()
+        if stats['preservation_active']:
+            logger.info(f"✅ Phase {phase_name} set with preservation:")
+            logger.info(f"  - {stats['total_fake_quantizers']} FakeQuantize modules preserved")
+            logger.info(f"  - Weight quantizers: {stats['weight_quantizers_enabled']}/{stats['weight_quantizers_total']}")
+            logger.info(f"  - Activation quantizers: {stats['activation_quantizers_enabled']}/{stats['activation_quantizers_total']}")
+            return True
+        else:
+            logger.error(f"❌ Quantizer preservation failed for {phase_name}")
+            return False
+
+                
+    def train_model_with_preservation(self, data_yaml, epochs, batch_size, img_size, lr, device, save_dir, log_dir):
+        """
+        FIXED: Training with quantizer preservation.
+        Replaces your existing train_model method.
+        """
+        import os
+        from ultralytics.utils import LOGGER
+        
+        # Validate dataset
+        if not os.path.exists(data_yaml):
+            raise FileNotFoundError(f"Dataset YAML not found: {data_yaml}")
+        
+        logger.info(f"✅ Using dataset: {data_yaml}")
+        
+        # Calculate phase boundaries
+        phase1_end = max(1, int(epochs * 0.3))
+        phase2_end = max(2, int(epochs * 0.7))
+        phase3_end = max(3, int(epochs * 0.9))
+        
+        LOGGER.info(f"🔄 Preserved Phased QAT Training Plan:")
+        LOGGER.info(f"  Phase 1 (Weight-only): Epochs 1-{phase1_end}")
+        LOGGER.info(f"  Phase 2 (Add Activations): Epochs {phase1_end+1}-{phase2_end}")
+        LOGGER.info(f"  Phase 3 (Full Quantization): Epochs {phase2_end+1}-{phase3_end}")
+        LOGGER.info(f"  Phase 4 (Fine-tuning): Epochs {phase3_end+1}-{epochs}")
+        
+        # Set initial phase with preservation
+        self._configure_quantizers_with_preservation("phase1_weight_only")
+        
+        # Setup callbacks for phase transitions
+        def on_epoch_start(trainer):
+            current_epoch = trainer.epoch
+            
+            # Phase transitions with preservation
+            if current_epoch == phase1_end:
+                LOGGER.info(f"🔄 Epoch {current_epoch}: Transitioning to Phase 2 (Preserved)")
+                success = self._configure_quantizers_with_preservation("phase2_activations")
+                if not success:
+                    LOGGER.error("❌ Phase 2 transition failed!")
+                    
+            elif current_epoch == phase2_end:
+                LOGGER.info(f"🔄 Epoch {current_epoch}: Transitioning to Phase 3 (Preserved)")
+                success = self._configure_quantizers_with_preservation("phase3_full_quant")
+                if not success:
+                    LOGGER.error("❌ Phase 3 transition failed!")
+                    
+            elif current_epoch == phase3_end:
+                LOGGER.info(f"🔄 Epoch {current_epoch}: Transitioning to Phase 4 (Preserved)")
+                success = self._configure_quantizers_with_preservation("phase4_fine_tuning")
+                if not success:
+                    LOGGER.error("❌ Phase 4 transition failed!")
+        
+        def on_epoch_end(trainer):
+            """Monitor preservation after each epoch."""
+            if hasattr(self, 'quantizer_preserver'):
+                stats = self.quantizer_preserver.get_quantizer_stats()
+                LOGGER.info(f"📊 End of epoch {trainer.epoch}: {stats['total_fake_quantizers']} FakeQuantize modules preserved")
+                
+                if stats['total_fake_quantizers'] == 0:
+                    LOGGER.error(f"❌ CRITICAL: All quantizers lost at epoch {trainer.epoch}!")
+                else:
+                    LOGGER.info(f"✅ Preservation successful: {stats['weight_quantizers_enabled']} weights, {stats['activation_quantizers_enabled']} activations enabled")
+        
+        # Add callbacks
+        self.model.add_callback('on_train_epoch_start', on_epoch_start)
+        self.model.add_callback('on_train_epoch_end', on_epoch_end)
+        
+        # Train with preservation
+        try:
+            LOGGER.info("🚀 Starting preserved phased QAT training...")
+            
+            results = self.model.train(
+                data=data_yaml,
+                epochs=epochs,
+                batch=batch_size,
+                imgsz=img_size,
+                lr0=lr,
+                device=device,
+                project=os.path.dirname(save_dir),
+                name=os.path.basename(save_dir),
+                exist_ok=True,
+                pretrained=False,
+                val=True,
+                verbose=True
+            )
+            
+            # Final verification
+            if hasattr(self, 'quantizer_preserver'):
+                final_stats = self.quantizer_preserver.get_quantizer_stats()
+                LOGGER.info(f"🎯 Training complete with preservation:")
+                LOGGER.info(f"  - Total FakeQuantize modules: {final_stats['total_fake_quantizers']}")
+                LOGGER.info(f"  - Preservation success: {final_stats['preservation_active']}")
+                
+                if final_stats['preservation_active']:
+                    LOGGER.info("🎉 SUCCESS: Quantizers preserved through training!")
+                else:
+                    LOGGER.error("💥 FAILURE: Quantizers lost during training!")
+            
+            self.is_trained = True
+            return results
+            
+        except Exception as e:
+            LOGGER.error(f"❌ Training failed: {e}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+            raise
