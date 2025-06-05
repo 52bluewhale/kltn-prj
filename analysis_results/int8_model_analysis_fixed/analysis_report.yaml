@@ -1,4 +1,4 @@
-analysis_timestamp: '2025-06-03 18:44:55'
+analysis_timestamp: '2025-06-04 18:31:05'
 functionality_test:
   error: null
   forward_pass: true
@@ -29,14 +29,14 @@ model_comparison:
 model_info: null
 model_path: models/checkpoints/qat_full_features_1/qat_yolov8n_full_int8_final.pt
 performance_benchmark:
-  fps: 290.0544936516279
-  max_time_ms: 4.993677139282227
-  mean_time_ms: 3.4476280212402344
-  median_time_ms: 3.1157732009887695
-  min_time_ms: 2.982616424560547
+  fps: 278.15992704965595
+  max_time_ms: 4.4689178466796875
+  mean_time_ms: 3.5950541496276855
+  median_time_ms: 3.5294294357299805
+  min_time_ms: 2.5146007537841797
   model_type: quantized
-  p95_time_ms: 4.505801200866699
-  p99_time_ms: 4.89610195159912
+  p95_time_ms: 4.228603839874268
+  p99_time_ms: 4.4208550453186035
   runs: 20
-  std_time_ms: 0.5822007542191531
+  std_time_ms: 0.5067091494230379
   successful_runs: 20

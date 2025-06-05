@@ -64,7 +64,7 @@ diagnosis:
       skip_detection_head: true
     ready_for_conversion: false
   recommendations: []
-diagnosis_timestamp: '2025-06-03 18:48:16'
+diagnosis_timestamp: '2025-06-04 18:46:58'
 int8_model_path: models/checkpoints/qat_full_features_1/qat_yolov8n_full_int8_final.pt
 qat_model_path: models/checkpoints/qat_full_features_1/qat_model_with_fakequant.pt
 recommendations:
