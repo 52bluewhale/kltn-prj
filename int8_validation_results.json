@@ -1,0 +1,28 @@
+{
+  "structure": {
+    "total_params": 490,
+    "quantized_params": 45,
+    "file_size_mb": 5.884368896484375,
+    "param_types": {
+      "torch.qint8": 45,
+      "torch.float32": 298,
+      "torch.int64": 102
+    },
+    "metadata": {
+      "framework": "pytorch",
+      "format": "quantized_int8",
+      "qconfig": "lsq",
+      "size_info": {
+        "fp32_size_mb": 12.084602355957031,
+        "int8_size_mb": 3.4989700317382812,
+        "compression_ratio": 3.453759891151004,
+        "size_reduction_percent": 71.04604745216557
+      },
+      "conversion_successful": true,
+      "deployment_ready": true,
+      "preserved_quantizers": 90
+    }
+  },
+  "speed": {},
+  "memory": {}
+}

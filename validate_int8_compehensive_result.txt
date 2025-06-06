@@ -1,0 +1,70 @@
+python .\scripts\validate_int8_compehensive.py
+(venv) PS F:\kltn-prj> python .\scripts\validate_int8_compehensive.py                                                                                                                
+⚠️ Ultralytics not available, using basic validation
+📊 Dataset loaded: 58 classes
+📁 Classes: ['DP.135', 'P.102', 'P.103a', 'P.103b', 'P.103c']...
+🔧 Loading INT8 model: models/checkpoints/qat_full_features_4/qat_yolov8n_full_int8_final.pt
+F:\kltn-prj\venv\lib\site-packages\torch\_utils.py:404: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. 
+This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()                        device=storage.device,
+✅ INT8 model loaded successfully
+📊 Metadata: {'framework': 'pytorch', 'format': 'quantized_int8', 'qconfig': 'lsq', 'size_info': {'fp32_size_mb': 12.084602355957031, 'int8_size_mb': 3.4989700317382812, 'compressio
+n_ratio': 3.453759891151004, 'size_reduction_percent': 71.04604745216557}, 'conversion_successful': True, 'deployment_ready': True, 'preserved_quantizers': 90}                      ❌ Ultralytics not available, cannot create full validation
+🔧 Loading baseline model: models/checkpoints/qat_full_features_4/weights/best.pt
+❌ Ultralytics not available
+
+================================================================================
+🚀 COMPREHENSIVE INT8 MODEL VALIDATION
+================================================================================
+
+📊 MODEL STRUCTURE ANALYSIS
+--------------------------------------------------
+📦 Total parameters: 490
+🔥 Quantized parameters: 45
+📏 File size: 5.88 MB
+📋 Parameter types: {'torch.qint8': 45, 'torch.float32': 298, 'torch.int64': 102}
+
+📄 Metadata:
+   framework: pytorch
+   format: quantized_int8
+   qconfig: lsq
+   size_info: {'fp32_size_mb': 12.084602355957031, 'int8_size_mb': 3.4989700317382812, 'compression_ratio': 3.453759891151004, 'size_reduction_percent': 71.04604745216557}
+   conversion_successful: True
+   deployment_ready: True
+   preserved_quantizers: 90
+
+⏱️ INFERENCE SPEED BENCHMARK
+--------------------------------------------------
+❌ No model loaded
+
+💾 MEMORY USAGE ANALYSIS
+--------------------------------------------------
+⚠️ Skipping accuracy validation (Ultralytics not available)
+
+📋 COMPREHENSIVE VALIDATION REPORT
+================================================================================
+🏗️ MODEL STRUCTURE:
+   File: qat_yolov8n_full_int8_final.pt
+   Size: 5.88 MB
+   Quantized params: 45/490
+
+🎯 ACCURACY METRICS:
+   mAP@0.5: 0.0000
+   mAP@0.5:0.95: 0.0000
+   F1-Score: 0.0000
+
+⚡ PERFORMANCE METRICS:
+   Average inference: 0.00 ms
+   FPS: 0.0
+   95th percentile: 0.00 ms
+
+🏆 QUALITY ASSESSMENT:
+   Accuracy: 🔴 Poor (mAP@0.5: 0.000)
+   Speed: 🔴 Slow (0.0 FPS)
+
+🚀 DEPLOYMENT READINESS:
+   Status: 🟠 Needs Optimization
+   Score: 1/3
+
+💾 Results saved to: int8_validation_results.json
+
+🎉 Validation completed successfully!
