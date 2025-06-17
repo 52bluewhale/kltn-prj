@@ -1114,110 +1114,48 @@ class QuantizedYOLOv8:
         logger.info("Note: For YOLOv8, we'll track the penalty but apply it manually in training")
 
     def save(self, path, preserve_qat=True):
-        """
-        FIXED: Save model with proper quantization preservation.
-        The issue was looking for quantizers in the wrong model object.
-        """
-        # Create directory if needed
-        dirname = os.path.dirname(path)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
+        """Save model in Ultralytics-compatible format while preserving QAT."""
         
         if preserve_qat and self.is_prepared:
-            logger.info(f"Saving QAT model with quantization preserved to {path}")
+            logger.info(f"Saving QAT model with Ultralytics compatibility to {path}")
             
-            try:
-                # FIXED: Count FakeQuantize modules using the preservation system
-                if hasattr(self, 'quantizer_preserver'):
-                    stats = self.quantizer_preserver.get_quantizer_stats()
-                    fake_quant_count = stats['total_fake_quantizers']
-                    logger.info(f"Found {fake_quant_count} FakeQuantize modules to preserve (via preserver)")
-                else:
-                    # Fallback: Count directly in the model
-                    fake_quant_count = sum(1 for n, m in self.model.model.named_modules() 
-                                        if 'FakeQuantize' in type(m).__name__)
-                    logger.info(f"Found {fake_quant_count} FakeQuantize modules to preserve (direct count)")
+            # Get the model with quantizers
+            if hasattr(self, 'quantizer_preserver'):
+                model_to_save = self.quantizer_preserver.model
+                stats = self.quantizer_preserver.get_quantizer_stats()
+                fake_quant_count = stats['total_fake_quantizers']
+            else:
+                model_to_save = self.model.model
+                fake_quant_count = self._count_fake_quantize_modules()
+            
+            # Create Ultralytics-compatible save format
+            save_dict = {
+                'model': model_to_save,  # ✅ Correct key name
+                'epoch': getattr(self.model, 'epoch', 0),
+                'best_fitness': getattr(self.model, 'best_fitness', 0),
+                'optimizer': None,  # Don't save optimizer for inference
                 
-                if fake_quant_count == 0:
-                    logger.error("❌ No FakeQuantize modules found!")
-                    
-                    # DIAGNOSTIC: Check where the quantizers might be
-                    logger.info("🔍 Diagnostic - checking model structure...")
-                    
-                    # Check if quantizers are in the training model
-                    if hasattr(self, 'quantizer_preserver'):
-                        self.quantizer_preserver.debug_quantizer_states()
-                    
-                    # Check all possible model locations
-                    logger.info("Checking self.model.model for quantizers...")
-                    direct_count = sum(1 for n, m in self.model.model.named_modules() 
-                                    if 'FakeQuantize' in type(m).__name__)
-                    logger.info(f"Direct count in self.model.model: {direct_count}")
-                    
-                    if direct_count == 0:
-                        logger.info("Checking self.model for quantizers...")
-                        model_count = sum(1 for n, m in self.model.named_modules() 
-                                        if 'FakeQuantize' in type(m).__name__)
-                        logger.info(f"Count in self.model: {model_count}")
-                    
-                    return False
-                
-                # FIXED: Save using state_dict from the correct model object
-                # Use the model that actually has the quantizers
-                if hasattr(self, 'quantizer_preserver'):
-                    # Save from the model that the preserver is tracking
-                    model_to_save = self.quantizer_preserver.model
-                    model_state_dict = model_to_save.state_dict()
-                    logger.info("Using quantizer_preserver.model for saving")
-                else:
-                    # Fallback to standard model
-                    model_state_dict = self.model.model.state_dict()
-                    logger.info("Using self.model.model for saving")
-                
-                save_dict = {
-                    'model_state_dict': model_state_dict,
-                    'qat_info': {
-                        'qconfig_name': self.qconfig_name,
-                        'skip_detection_head': self.skip_detection_head,
-                        'fuse_modules': self.fuse_modules,
-                        'is_prepared': self.is_prepared,
-                        'pytorch_version': torch.__version__,
-                        'model_path': self.model_path,
-                        'has_preservation': hasattr(self, 'quantizer_preserver'),
-                    },
+                # Your QAT metadata (preserved)
+                'qat_info': {
+                    'qconfig_name': self.qconfig_name,
+                    'skip_detection_head': self.skip_detection_head,
+                    'fuse_modules': self.fuse_modules,
+                    'is_prepared': self.is_prepared,
+                    'pytorch_version': torch.__version__,
+                    'model_path': self.model_path,
+                    'has_preservation': hasattr(self, 'quantizer_preserver'),
                     'fake_quant_count': fake_quant_count,
                     'quantization_preserved': True,
-                    'save_method': 'state_dict_with_preservation',
-                    'preservation_stats': stats if hasattr(self, 'quantizer_preserver') else None
+                    'save_method': 'ultralytics_compatible_with_qat'
                 }
-                
-                # Save using torch.save
-                torch.save(save_dict, path)
-                
-                # Verify save
-                if os.path.exists(path) and os.path.getsize(path) > 1000:
-                    logger.info(f"✅ QAT model saved successfully: {path}")
-                    logger.info(f"✅ Quantization preserved: {fake_quant_count} FakeQuantize modules")
-                    return True
-                else:
-                    logger.error(f"❌ Save verification failed")
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"❌ QAT save failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                return False
-        
+            }
+            
+            torch.save(save_dict, path)
+            logger.info(f"✅ QAT model saved in Ultralytics-compatible format")
+            return True
         else:
-            # Standard save (fallback)
-            logger.warning("⚠️ Saving without QAT preservation")
-            try:
-                self.model.save(path)
-                return True
-            except Exception as e:
-                logger.error(f"Error saving model: {e}")
-                return False
+            # Fallback to standard save
+            return self.model.save(path)
 
     def convert_to_quantized_with_preservation(self, save_path=None):
         """

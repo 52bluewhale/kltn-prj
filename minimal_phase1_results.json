@@ -1,0 +1,77 @@
+{
+  "model_info": {
+    "path": "models/checkpoints/qat_full_features_6/qat_yolov8n_full_int8_final.pt",
+    "device": "cuda",
+    "file_size_mb": 5.884368896484375
+  },
+  "data_loading": {
+    "success": true,
+    "metadata": {
+      "framework": "pytorch",
+      "format": "quantized_int8",
+      "qconfig": "lsq",
+      "size_info": {
+        "fp32_size_mb": 12.084602355957031,
+        "int8_size_mb": 3.4989700317382812,
+        "compression_ratio": 3.453759891151004,
+        "size_reduction_percent": 71.04604745216557
+      },
+      "conversion_successful": true,
+      "deployment_ready": true,
+      "preserved_quantizers": 90
+    }
+  },
+  "model_creation": {
+    "success": true
+  },
+  "inference_test": {
+    "success": true,
+    "results": {
+      "avg_time_ms": 0.24919509887695312,
+      "std_time_ms": 0.49892204453927647,
+      "min_time_ms": 0.0,
+      "max_time_ms": 1.2974739074707031,
+      "fps": 4012.920015308075,
+      "all_times": [
+        0.0,
+        0.0,
+        0.0,
+        1.2974739074707031,
+        0.0,
+        0.0,
+        1.1944770812988281,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "batch_benchmark": {
+    "1": {
+      "avg_time_s": 0.0017486095428466796,
+      "fps": 571.8829592866298,
+      "time_per_image_ms": 1.7486095428466797
+    },
+    "2": {
+      "avg_time_s": 0.003401637077331543,
+      "fps": 587.9521990537936,
+      "time_per_image_ms": 1.7008185386657715
+    },
+    "4": {
+      "avg_time_s": 0.006110560894012451,
+      "fps": 654.6043921957272,
+      "time_per_image_ms": 1.5276402235031128
+    },
+    "8": {
+      "avg_time_s": 0.011792194843292237,
+      "fps": 678.4148418774344,
+      "time_per_image_ms": 1.4740243554115295
+    }
+  },
+  "memory_usage": {
+    "baseline_memory_mb": 629.68359375,
+    "model_memory_mb": 0.03958892822265625,
+    "current_memory_mb": 629.6953125,
+    "gpu_memory_mb": 8.166015625
+  }
+}
